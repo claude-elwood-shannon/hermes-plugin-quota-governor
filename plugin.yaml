@@ -1,0 +1,12 @@
+name: quota-governor
+version: 0.1.0
+description: "Self-governance by quota — observe kanban lifecycle, query provider quota, and coordinate the daemon accordingly."
+author: "claude-elwood-shannon + Hermes Agent"
+license: MIT
+platforms: [linux, macos]
+hooks:
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
+  - post_tool_call
+  - on_session_end
