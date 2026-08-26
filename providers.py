@@ -108,6 +108,33 @@ def _read_env_file(path: str, key: str) -> Optional[str]:
     return None
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _no_proxy():
+    """Temporarily disable HTTP/HTTPS proxy env vars.
+
+    The profile .env sets ``https_proxy`` for GitHub Tor enforcement, but
+    Ollama Cloud (and NanoGPT/OpenRouter) reject connections from Tor exit
+    nodes. This context manager unsets the proxy vars for the duration of
+    the HTTP call so urllib goes direct.
+
+    Verified Aug 2026: Ollama returns ``501 Tor is not an HTTP Proxy``
+    when the proxy is active; unsetting it fixes the call.
+    """
+    saved = {}
+    proxy_vars = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                  "all_proxy", "ALL_PROXY"]
+    for var in proxy_vars:
+        if var in os.environ:
+            saved[var] = os.environ.pop(var)
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
 def query_ollama() -> dict:
     """Query Ollama Cloud /api/usage.
 
@@ -122,8 +149,9 @@ def query_ollama() -> dict:
         "https://ollama.com/api/usage",
         headers={"Authorization": f"Bearer {api_key}"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
+    with _no_proxy():
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
 
     session = data.get("limits", {}).get("session", {})
     weekly = data.get("limits", {}).get("weekly", {})
@@ -150,8 +178,9 @@ def query_nanogpt() -> dict:
         "https://nano-gpt.com/api/subscription/v1/usage",
         headers={"Authorization": f"Bearer {api_key}"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
+    with _no_proxy():
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
 
     daily = data.get("daily", {})
     weekly = data.get("weeklyInputTokens", {})
@@ -174,8 +203,9 @@ def query_openrouter() -> dict:
         "https://openrouter.ai/api/v1/key",
         headers={"Authorization": f"Bearer {api_key}"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode()).get("data", {})
+    with _no_proxy():
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode()).get("data", {})
 
     return {
         "usage_weekly_usd": float(data.get("usage_weekly", 0)) or None,
