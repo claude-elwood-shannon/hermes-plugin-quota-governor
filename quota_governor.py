@@ -252,7 +252,7 @@ def format_status() -> str:
         f"({snapshot.ollama_weekly_requests} requests)",
     ]
 
-    if snapshot.nanogpt_daily_pct is not None:
+    if snapshot.nanogpt_daily_pct is not None or snapshot.nanogpt_state is not None:
         lines.append("")
         lines.append("NanoGPT (informational):")
         lines.append(f"  Daily:          {snapshot.nanogpt_daily_pct:5.1f}%")
@@ -262,6 +262,10 @@ def format_status() -> str:
             )
         if snapshot.nanogpt_state:
             lines.append(f"  State:          {snapshot.nanogpt_state}")
+    else:
+        lines.append("")
+        lines.append("NanoGPT (informational):")
+        lines.append("  Not configured — set NANO_GPT_API_KEY in profile .env")
 
     if snapshot.openrouter_usage_weekly_usd is not None:
         lines.append("")

@@ -207,9 +207,11 @@ def query_openrouter() -> dict:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode()).get("data", {})
 
+    weekly = data.get("usage_weekly")
+    monthly = data.get("usage_monthly")
     return {
-        "usage_weekly_usd": float(data.get("usage_weekly", 0)) or None,
-        "usage_monthly_usd": float(data.get("usage_monthly", 0)) or None,
+        "usage_weekly_usd": float(weekly) if weekly is not None else None,
+        "usage_monthly_usd": float(monthly) if monthly is not None else None,
     }
 
 
