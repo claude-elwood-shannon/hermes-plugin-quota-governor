@@ -67,12 +67,16 @@ def _on_kanban_task_claimed(
             assignee=assignee,
             snapshot=snapshot,
         )
-        decision = planner.decide(snapshot)
+        spending_limit = gov.get_spending_limit()
+        previous_cost = gov.get_previous_cost()
+        decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
+                                  spending_limit=spending_limit)
         if decision.action == "stop":
-            gov.write_stop_signal(
-                reason=f"quota critical: session={snapshot.session_pct:.0f}% "
-                f"weekly={snapshot.weekly_pct:.0f}%",
-            )
+            reason = f"quota critical: session={snapshot.session_pct:.0f}% weekly={snapshot.weekly_pct:.0f}%"
+            if snapshot.ollama_activity_cost > 0 and spending_limit > 0 and snapshot.ollama_activity_cost >= spending_limit:
+                reason = (f"spending limit reached "
+                          f"(${snapshot.ollama_activity_cost:.2f} >= ${spending_limit:.2f})")
+            gov.write_stop_signal(reason=reason)
     except Exception as exc:
         logger.debug("quota-governor kanban_task_claimed failed: %s", exc)
 
@@ -100,12 +104,16 @@ def _on_kanban_task_completed(
             summary=summary,
         )
         # After a task completes, re-evaluate: if quota dropped, write signal
-        decision = planner.decide(snapshot)
+        spending_limit = gov.get_spending_limit()
+        previous_cost = gov.get_previous_cost()
+        decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
+                                  spending_limit=spending_limit)
         if decision.action == "stop":
-            gov.write_stop_signal(
-                reason=f"quota critical after task: "
-                f"session={snapshot.session_pct:.0f}%",
-            )
+            reason = f"quota critical after task: session={snapshot.session_pct:.0f}%"
+            if snapshot.ollama_activity_cost > 0 and spending_limit > 0 and snapshot.ollama_activity_cost >= spending_limit:
+                reason = (f"spending limit reached "
+                          f"(${snapshot.ollama_activity_cost:.2f} >= ${spending_limit:.2f})")
+            gov.write_stop_signal(reason=reason)
     except Exception as exc:
         logger.debug("quota-governor kanban_task_completed failed: %s", exc)
 
@@ -199,6 +207,9 @@ Subcommands:
   daemon-start    Start the kanban daemon with quota-aware --max
   daemon-stop     Stop the kanban daemon (graceful)
   clear-signals   Remove stop-signal files
+  set-limit [V]   Show or set the spending limit (USD)
+                  With value: persist limit (0 = unlimited / disable cap)
+                  Without value: show current limit
 
 The governor observes kanban lifecycle and quota state.
 It does NOT veto spawns — it records and signals.
@@ -222,7 +233,10 @@ def _handle_slash(raw_args: str) -> Optional[str]:
 
     if sub == "decision":
         snapshot = gov.query_quota()
-        decision = planner.decide(snapshot)
+        spending_limit = gov.get_spending_limit()
+        previous_cost = gov.get_previous_cost()
+        decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
+                                  spending_limit=spending_limit)
         return gov.format_decision(snapshot, decision)
 
     if sub == "daemon":
@@ -230,7 +244,10 @@ def _handle_slash(raw_args: str) -> Optional[str]:
 
     if sub == "daemon-start":
         snapshot = gov.query_quota()
-        decision = planner.decide(snapshot)
+        spending_limit = gov.get_spending_limit()
+        previous_cost = gov.get_previous_cost()
+        decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
+                                  spending_limit=spending_limit)
         if decision.action == "stop":
             return (
                 f"Refusing to start daemon: quota critical "
@@ -243,6 +260,21 @@ def _handle_slash(raw_args: str) -> Optional[str]:
 
     if sub == "clear-signals":
         return gov.clear_stop_signals()
+
+    if sub == "set-limit":
+        if len(argv) < 2:
+            # Show current limit
+            current = gov.get_spending_limit()
+            if current == 0:
+                return "Current spending limit: unlimited (cap disabled)"
+            return f"Current spending limit: ${current:.2f}"
+        try:
+            value = float(argv[1])
+            if value < 0:
+                return "Invalid limit: must be >= 0 (0 = unlimited)"
+            return gov.set_spending_limit(value)
+        except ValueError:
+            return f"Invalid limit value: {argv[1]!r} — expected a number (e.g. 10.00 or 0)"
 
     return f"Unknown subcommand: {sub}\n\n{_HELP_TEXT}"
 

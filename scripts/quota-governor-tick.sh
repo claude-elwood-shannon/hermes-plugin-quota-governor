@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # quota-governor-tick.sh — cron no_agent tick: query quota, decide, adjust daemon.
 # Zero tokens (pure bash + inline python3). Silent stdout = no change.
+#
+# Three-state model (Aug 2026): run / paying / stop.
+# paying = session exhausted but pay-as-you-go balance is being consumed (warn).
+# stop  = balance exhausted, spending limit hit, or weekly quota critical (halt).
 set -euo pipefail
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/profiles/pr-ollama}"
@@ -10,6 +14,7 @@ LOG_FILE="$LOG_DIR/quota-governor-tick.log"
 STOP_FILE="$HERMES_HOME/quota-governor/STOP"
 PIDFILE="$HERMES_HOME/quota-governor-daemon.pid"
 MAX_FILE="$HERMES_HOME/quota-governor-daemon.max"
+OBS_FILE="$HERMES_HOME/quota-governor/observations.jsonl"
 
 mkdir -p "$LOG_DIR"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
@@ -30,6 +35,32 @@ if [[ -z "${OLLAMA_API_KEY:-}" ]]; then
     exit 0
 fi
 
+# Spending limit for pay-as-you-go (matches quota_planner.py / design doc §4.1)
+SPENDING_LIMIT="${QUOTA_GOVERNOR_MAX_SPEND:-5.00}"
+export SPENDING_LIMIT
+
+# Read previous activity.cost from observations.jsonl (for cost-delta detection)
+PREV_COST=$(python3 -c "
+import json, os
+obs = os.path.join(os.environ.get('HERMES_HOME', ''), 'quota-governor', 'observations.jsonl')
+try:
+    with open(obs) as f:
+        lines = f.readlines()
+    if lines:
+        d = json.loads(lines[-1])
+        q = d.get('quota', {})
+        # Prefer canonical 'activity_cost' (design §5.4), fall back to legacy 'ollama_activity_cost'
+        cost = q.get('activity_cost')
+        if cost is None:
+            cost = q.get('ollama_activity_cost', 0)
+        print(cost or 0)
+    else:
+        print(0)
+except Exception:
+    print(0)
+" 2>/dev/null) || PREV_COST="0"
+export PREV_COST
+
 # Check STOP signal
 if [[ -f "$STOP_FILE" ]]; then
     log "STOP signal active — not touching daemon"
@@ -46,6 +77,7 @@ if [[ -f "$STOP_FILE" ]]; then
 fi
 
 # Query + decide in one python3 call (avoids proxy issues with curl)
+# Output: action|max_workers|session_pct|weekly_pct|session_reqs|weekly_reqs|cost|write_stop|reason
 RESULT=$(python3 -c "
 import json, os, urllib.request, sys
 
@@ -55,7 +87,7 @@ for v in ['http_proxy','https_proxy','HTTP_PROXY','HTTPS_PROXY','all_proxy','ALL
 
 api_key = os.environ.get('OLLAMA_API_KEY', '')
 if not api_key:
-    print('ERROR|0|0|0|0|0|no API key')
+    print('ERROR|0|0|0|0|0|0.0000|0|no API key')
     sys.exit(0)
 
 try:
@@ -66,7 +98,7 @@ try:
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 except Exception as e:
-    print(f'ERROR|0|0|0|0|0|{e}')
+    print(f'ERROR|0|0|0|0|0|0.0000|0|{e}')
     sys.exit(0)
 
 s = data.get('limits',{}).get('session',{})
@@ -76,39 +108,75 @@ wp = float(w.get('usage',0))*100
 sr = sum(m.get('request_count',0) for m in s.get('models',[]))
 wr = sum(m.get('request_count',0) for m in w.get('models',[]))
 
+# Pay-as-you-go cost (activity.cost from /api/usage)
+try:
+    cost = float(data.get('activity',{}).get('cost', 0))
+except (TypeError, ValueError):
+    cost = 0.0
+
+prev_cost = float(os.environ.get('PREV_COST', 0) or 0)
+spending_limit = float(os.environ.get('SPENDING_LIMIT', 5.0) or 0)
+
+# ── Three-state heuristic (matches quota_planner.py decide(), design §3.2, §6) ──
+write_stop = 0
+
+# Weekly override (most restrictive wins)
 if wp > 90:
     act, mw, rsn = 'stop', 0, f'weekly critical ({wp:.0f}%)'
 elif wp > 75:
     if sp > 80:
         act, mw, rsn = 'stop', 0, f'both critical (s={sp:.0f}% w={wp:.0f}%)'
     else:
-        act, mw, rsn = 'caution', 1, f'weekly high ({wp:.0f}%)'
+        act, mw, rsn = 'run', 1, f'weekly high ({wp:.0f}%)'
+# Pay-as-you-go detection: session EXACTLY 100% + balance being consumed
+elif sp >= 100 and cost > 0 and cost > prev_cost:
+    if spending_limit > 0 and cost >= spending_limit:
+        act, mw, rsn = 'stop', 0, f'spending limit reached (\${cost:.2f} >= \${spending_limit:.2f})'
+        write_stop = 1
+    else:
+        act, mw, rsn = 'paying', 1, f'session exhausted, pay-as-you-go active (\${cost:.2f} spent)'
+# Session at 100% but cost flat (no balance, or balance exhausted)
+elif sp >= 100 and not (cost > 0 and cost > prev_cost):
+    act, mw, rsn = 'stop', 0, f'session exhausted, no pay-as-you-go (s={sp:.0f}% cost={cost:.4f})'
+# Session >95% but <100%: still in run, heavily throttled (was 'stop' in old script)
 elif sp > 95:
-    act, mw, rsn = 'stop', 0, f'session exhausted ({sp:.0f}%)'
+    act, mw, rsn = 'run', 1, f'session near limit ({sp:.0f}%)'
 elif sp > 80:
-    act, mw, rsn = 'caution', 1, f'session very high ({sp:.0f}%)'
+    act, mw, rsn = 'run', 1, f'session very high ({sp:.0f}%)'
 elif sp > 60:
-    act, mw, rsn = 'caution', 1, f'session high ({sp:.0f}%)'
+    act, mw, rsn = 'run', 1, f'session high ({sp:.0f}%)'
 elif sp > 30:
     act, mw, rsn = 'run', 1, f'session moderate ({sp:.0f}%)'
 else:
     mw = 2 if wp < 50 else 1
     act, rsn = 'run', f'healthy'
 
-print(f'{act}|{mw}|{sp:.1f}|{wp:.1f}|{sr}|{wr}|{rsn}')
+print(f'{act}|{mw}|{sp:.1f}|{wp:.1f}|{sr}|{wr}|{cost:.4f}|{write_stop}|{rsn}')
 " 2>&1) || {
     log "ERROR: python3 query/decide failed"
     exit 0
 }
 
-IFS='|' read -r ACTION DESIRED_MAX SESSION_PCT WEEKLY_PCT SESSION_REQS WEEKLY_REQS REASON <<< "$RESULT"
+IFS='|' read -r ACTION DESIRED_MAX SESSION_PCT WEEKLY_PCT SESSION_REQS WEEKLY_REQS COST WRITE_STOP REASON <<< "$RESULT"
 
 if [[ "$ACTION" == "ERROR" ]]; then
     log "ERROR: $REASON"
     exit 0
 fi
 
-log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY_REQS} -> ${ACTION} max=${DESIRED_MAX} -- ${REASON}"
+log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY_REQS} cost=\$${COST} -> ${ACTION} max=${DESIRED_MAX} -- ${REASON}"
+
+# Paying-mode warning
+if [[ "$ACTION" == "paying" ]]; then
+    log "⚠ PAY-AS-YOU-GO: spending balance at \$${COST} (limit \$${SPENDING_LIMIT})"
+fi
+
+# Write STOP signal for spending-limit stop (keeps daemon halted until manual clear)
+if [[ "$ACTION" == "stop" && "$WRITE_STOP" == "1" ]]; then
+    mkdir -p "$(dirname "$STOP_FILE")"
+    echo "spending limit reached: ${REASON}" > "$STOP_FILE"
+    log "STOP signal written (spending limit: \$${COST} >= \$${SPENDING_LIMIT})"
+fi
 
 # Daemon management
 DAEMON_NEEDS_ACTION=false
@@ -122,7 +190,7 @@ if [[ -f "$PIDFILE" ]]; then
             kill "$OLDPID" 2>/dev/null || true
             rm -f "$PIDFILE" "$MAX_FILE"
             log "Killed daemon (quota stop, PID $OLDPID)"
-            echo "Tick: stopped daemon — quota critical (s=${SESSION_PCT}% w=${WEEKLY_PCT}%)"
+            echo "Tick: stopped daemon — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}% cost=\$${COST})"
             exit 0
         elif [[ "$CURRENT_MAX" != "$DESIRED_MAX" ]]; then
             kill "$OLDPID" 2>/dev/null || true
@@ -156,7 +224,7 @@ if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
             --force > /dev/null 2>&1 &
         echo "$DESIRED_MAX" > "$MAX_FILE"
         log "Daemon started (PID $!, --max $DESIRED_MAX)"
-        echo "Tick: ${ACTION} workers=${DESIRED_MAX} — ${REASON}"
+        echo "Tick: ${ACTION} workers=${DESIRED_MAX} — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}% cost=\$${COST})"
     else
         log "ERROR: hermes binary not found"
     fi

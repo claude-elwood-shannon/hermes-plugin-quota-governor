@@ -35,6 +35,7 @@ class QuotaSnapshot:
     ollama_weekly_pct: float = 0.0     # 0-100
     ollama_session_requests: int = 0
     ollama_weekly_requests: int = 0
+    ollama_activity_cost: float = 0.0   # pay-as-you-go spend (activity.cost from /api/usage)
 
     # NanoGPT (informational)
     nanogpt_daily_pct: Optional[float] = None
@@ -156,6 +157,14 @@ def query_ollama() -> dict:
     session = data.get("limits", {}).get("session", {})
     weekly = data.get("limits", {}).get("weekly", {})
 
+    # Pay-as-you-go spend (activity.cost — a string like "0.24" when present)
+    activity = data.get("activity")
+    activity_cost = 0.0
+    if activity and isinstance(activity, dict):
+        cost = activity.get("cost")
+        if cost is not None:
+            activity_cost = float(cost)
+
     return {
         "session_pct": float(session.get("usage", 0)) * 100,
         "weekly_pct": float(weekly.get("usage", 0)) * 100,
@@ -165,6 +174,7 @@ def query_ollama() -> dict:
         "weekly_requests": sum(
             m.get("request_count", 0) for m in weekly.get("models", [])
         ),
+        "activity_cost": activity_cost,
     }
 
 
@@ -237,6 +247,7 @@ def query_all() -> QuotaSnapshot:
         snapshot.ollama_weekly_pct = ollama["weekly_pct"]
         snapshot.ollama_session_requests = ollama["session_requests"]
         snapshot.ollama_weekly_requests = ollama["weekly_requests"]
+        snapshot.ollama_activity_cost = ollama.get("activity_cost", 0.0)
     except Exception as exc:
         snapshot.errors.append(f"ollama: {exc}")
         logger.debug("ollama quota query failed: %s", exc)
