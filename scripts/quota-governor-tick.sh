@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
-# quota-governor-tick.sh — cron no_agent tick: query quota, decide action, adjust daemon.
+# quota-governor-tick.sh — cron no_agent tick: query quota, decide, adjust daemon.
 # Zero tokens (pure bash + inline python3). Silent stdout = no change.
-# One-line stdout = something changed (for cron no_agent watchdogs).
-#
-# Runs every 15-30 min via cron job with no_agent=True.
-# Hermes cron jobs don't run as login shells, so env vars may not be set.
-
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/profiles/pr-ollama}"
 ENV_FILE="$HOME/.hermes/profiles/pr-ollama/.env"
 LOG_DIR="$HOME/.hermes/logs"
@@ -20,60 +12,70 @@ PIDFILE="$HERMES_HOME/quota-governor-daemon.pid"
 MAX_FILE="$HERMES_HOME/quota-governor-daemon.max"
 
 mkdir -p "$LOG_DIR"
-
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
-# ---------------------------------------------------------------------------
-# Step 1: Source credentials from profile .env
-# ---------------------------------------------------------------------------
 if [[ ! -f "$ENV_FILE" ]]; then
     log "ERROR: no .env at $ENV_FILE"
-    exit 1
+    exit 0  # exit 0 so cron doesn't alert
 fi
-# shellcheck disable=SC1090
 source "$ENV_FILE"
 
-# Disable proxy for Ollama API calls — the proxy is for GitHub enforcement,
-# not for Ollama. Ollama rejects connections from Tor exit nodes.
-unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY 2>/dev/null || true
+# Export key vars so python3 subprocesses can see them
+# (the .env uses VAR=value without export, so source loads them as shell
+# variables but they don't reach child processes via os.environ)
+export OLLAMA_API_KEY 2>/dev/null || true
 
 if [[ -z "${OLLAMA_API_KEY:-}" ]]; then
     log "ERROR: OLLAMA_API_KEY not set in $ENV_FILE"
-    exit 1
+    exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Step 2: Query Ollama Cloud API
-# ---------------------------------------------------------------------------
-RAW=$(curl -s --max-time 15 \
-    -H "Authorization: Bearer $OLLAMA_API_KEY" \
-    https://ollama.com/api/usage) || {
-    log "ERROR: curl failed"
-    exit 1
-}
-if [[ -z "$RAW" ]]; then
-    log "ERROR: empty response from Ollama API"
-    exit 1
+# Check STOP signal
+if [[ -f "$STOP_FILE" ]]; then
+    log "STOP signal active — not touching daemon"
+    # Try to kill daemon if running
+    if [[ -f "$PIDFILE" ]]; then
+        OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+        if [[ -n "$OLDPID" ]] && kill -0 "$OLDPID" 2>/dev/null; then
+            kill "$OLDPID" 2>/dev/null || true
+            log "Killed daemon (STOP signal, PID $OLDPID)"
+        fi
+        rm -f "$PIDFILE"
+    fi
+    exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Step 3-4: Parse JSON + apply heuristic (matches quota_planner.py exactly)
-# ---------------------------------------------------------------------------
-# Output: action|max_workers|session_pct|weekly_pct|session_reqs|weekly_reqs|reason
-RESULT=$(echo "$RAW" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-s = d.get('limits', {}).get('session', {})
-w = d.get('limits', {}).get('weekly', {})
+# Query + decide in one python3 call (avoids proxy issues with curl)
+RESULT=$(python3 -c "
+import json, os, urllib.request, sys
 
-sp = float(s.get('usage', 0)) * 100  # 0-100
-wp = float(w.get('usage', 0)) * 100
-sr = sum(m.get('request_count', 0) for m in s.get('models', []))
-wr = sum(m.get('request_count', 0) for m in w.get('models', []))
+# Disable ALL proxy vars — Ollama rejects Tor
+for v in ['http_proxy','https_proxy','HTTP_PROXY','HTTPS_PROXY','all_proxy','ALL_PROXY']:
+    os.environ.pop(v, None)
 
-# ── Heuristic from quota_planner.py (Aug 2026) ──
+api_key = os.environ.get('OLLAMA_API_KEY', '')
+if not api_key:
+    print('ERROR|0|0|0|0|0|no API key')
+    sys.exit(0)
 
-# Weekly overrides (most restrictive wins)
+try:
+    req = urllib.request.Request(
+        'https://ollama.com/api/usage',
+        headers={'Authorization': f'Bearer {api_key}'}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+except Exception as e:
+    print(f'ERROR|0|0|0|0|0|{e}')
+    sys.exit(0)
+
+s = data.get('limits',{}).get('session',{})
+w = data.get('limits',{}).get('weekly',{})
+sp = float(s.get('usage',0))*100
+wp = float(w.get('usage',0))*100
+sr = sum(m.get('request_count',0) for m in s.get('models',[]))
+wr = sum(m.get('request_count',0) for m in w.get('models',[]))
+
 if wp > 90:
     act, mw, rsn = 'stop', 0, f'weekly critical ({wp:.0f}%)'
 elif wp > 75:
@@ -94,102 +96,70 @@ else:
     act, rsn = 'run', f'healthy'
 
 print(f'{act}|{mw}|{sp:.1f}|{wp:.1f}|{sr}|{wr}|{rsn}')
-") || {
-    log "ERROR: python3 parse/decide failed"
-    exit 1
+" 2>&1) || {
+    log "ERROR: python3 query/decide failed"
+    exit 0
 }
 
 IFS='|' read -r ACTION DESIRED_MAX SESSION_PCT WEEKLY_PCT SESSION_REQS WEEKLY_REQS REASON <<< "$RESULT"
 
-log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY_REQS} → ${ACTION} max=${DESIRED_MAX} — ${REASON}"
-
-# ---------------------------------------------------------------------------
-# Step 6: Check STOP signal
-# ---------------------------------------------------------------------------
-if [[ -f "$STOP_FILE" ]]; then
-    log "STOP signal active — not touching daemon"
-    # Kill daemon if still running (shouldn't be, but guard)
-    if [[ -f "$PIDFILE" ]]; then
-        OLD_PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
-        if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-            kill "$OLD_PID" 2>/dev/null || true
-            rm -f "$PIDFILE" "$MAX_FILE"
-            log "Killed daemon (STOP signal present)"
-            echo "STOP: daemon halted (session=${SESSION_PCT}% weekly=${WEEKLY_PCT}%)"
-        fi
-    fi
+if [[ "$ACTION" == "ERROR" ]]; then
+    log "ERROR: $REASON"
     exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Step 5 (cont): Handle "stop" decision — kill daemon if running
-# ---------------------------------------------------------------------------
-if [[ "$ACTION" == "stop" ]]; then
-    if [[ -f "$PIDFILE" ]]; then
-        OLD_PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
-        if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-            kill "$OLD_PID" 2>/dev/null || true
-            rm -f "$PIDFILE" "$MAX_FILE"
-            log "Stopped daemon (quota exhausted: ${REASON})"
-            echo "STOP: daemon halted — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}%)"
-        fi
-    fi
-    exit 0
-fi
+log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY_REQS} -> ${ACTION} max=${DESIRED_MAX} -- ${REASON}"
 
-# ---------------------------------------------------------------------------
-# Step 5 (main): Adjust or start daemon
-# ---------------------------------------------------------------------------
+# Daemon management
 DAEMON_NEEDS_ACTION=false
 
 if [[ -f "$PIDFILE" ]]; then
-    OLD_PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
-    if [[ -z "$OLD_PID" ]] || ! kill -0 "$OLD_PID" 2>/dev/null; then
-        # Stale pidfile — clean and restart
-        rm -f "$PIDFILE" "$MAX_FILE"
-        log "Stale pidfile cleaned (PID ${OLD_PID:-unknown})"
-        DAEMON_NEEDS_ACTION=true
-    else
-        # Running — check if --max changed
-        if [[ -f "$MAX_FILE" ]]; then
-            OLD_MAX=$(cat "$MAX_FILE" 2>/dev/null || echo "")
-            if [[ "$OLD_MAX" != "$DESIRED_MAX" ]]; then
-                kill "$OLD_PID" 2>/dev/null || true
-                rm -f "$PIDFILE"
-                log "--max changed: ${OLD_MAX:-?} → ${DESIRED_MAX}, restarting"
-                DAEMON_NEEDS_ACTION=true
-            fi
+    OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+    if [[ -n "$OLDPID" ]] && kill -0 "$OLDPID" 2>/dev/null; then
+        # Daemon running — check if max needs change
+        CURRENT_MAX=$(cat "$MAX_FILE" 2>/dev/null || echo "0")
+        if [[ "$ACTION" == "stop" ]]; then
+            kill "$OLDPID" 2>/dev/null || true
+            rm -f "$PIDFILE" "$MAX_FILE"
+            log "Killed daemon (quota stop, PID $OLDPID)"
+            echo "Tick: stopped daemon — quota critical (s=${SESSION_PCT}% w=${WEEKLY_PCT}%)"
+            exit 0
+        elif [[ "$CURRENT_MAX" != "$DESIRED_MAX" ]]; then
+            kill "$OLDPID" 2>/dev/null || true
+            rm -f "$PIDFILE"
+            DAEMON_NEEDS_ACTION=true
         fi
+    else
+        rm -f "$PIDFILE" "$MAX_FILE"
+        DAEMON_NEEDS_ACTION=true
     fi
 else
-    DAEMON_NEEDS_ACTION=true
+    if [[ "$ACTION" != "stop" ]]; then
+        DAEMON_NEEDS_ACTION=true
+    fi
 fi
 
-if $DAEMON_NEEDS_ACTION; then
-    # Store desired max BEFORE starting (so a concurrent tick sees intent)
-    echo "$DESIRED_MAX" > "$MAX_FILE"
-
+if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
     HERMES_BIN="${HERMES_BIN:-$(command -v hermes)}"
-    nohup "$HERMES_BIN" kanban daemon \
-        --interval 60 \
-        --max "$DESIRED_MAX" \
-        --pidfile "$PIDFILE" \
-        --verbose \
-        --force >/dev/null 2>&1 &
-    disown
-
-    # Wait for pidfile to appear (daemon writes it on start)
-    slept=0
-    while [[ ! -f "$PIDFILE" && $slept -lt 5 ]]; do
-        sleep 1
-        ((slept++)) || true
-    done
-
-    NEW_PID=$(cat "$PIDFILE" 2>/dev/null || echo "unknown")
-    log "Daemon started (PID ${NEW_PID}, --max ${DESIRED_MAX})"
-
-    # Output: one-line change summary (cron no_agent delivery)
-    echo "Tick: ${ACTION} workers=${DESIRED_MAX} — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}%)"
+    if [[ -z "$HERMES_BIN" ]]; then
+        # Try common locations
+        for p in "$HOME/.local/bin/hermes" "~/.local/bin/hermes"; do
+            if [[ -x "$p" ]]; then HERMES_BIN="$p"; break; fi
+        done
+    fi
+    if [[ -n "$HERMES_BIN" ]]; then
+        nohup "$HERMES_BIN" kanban daemon \
+            --interval 60 \
+            --max "$DESIRED_MAX" \
+            --pidfile "$PIDFILE" \
+            --verbose \
+            --force > /dev/null 2>&1 &
+        echo "$DESIRED_MAX" > "$MAX_FILE"
+        log "Daemon started (PID $!, --max $DESIRED_MAX)"
+        echo "Tick: ${ACTION} workers=${DESIRED_MAX} — ${REASON}"
+    else
+        log "ERROR: hermes binary not found"
+    fi
 fi
 
-# If nothing changed, stdout is empty → silent tick
+exit 0
