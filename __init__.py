@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 
 from . import quota_governor as gov
 from . import quota_planner as planner
+from . import health_checks
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,7 @@ Subcommands:
   set-limit [V]   Show or set the spending limit (USD)
                   With value: persist limit (0 = unlimited / disable cap)
                   Without value: show current limit
+  health          Run health checks (fast burn, zombie workers, silent plugin)
 
 The governor observes kanban lifecycle and quota state.
 It does NOT veto spawns — it records and signals.
@@ -260,6 +262,14 @@ def _handle_slash(raw_args: str) -> Optional[str]:
 
     if sub == "clear-signals":
         return gov.clear_stop_signals()
+
+    if sub == "health":
+        alerts = health_checks.run_all_health_checks()
+        if not alerts:
+            return "Health checks: all clear — no alerts."
+        lines = ["Health checks — " + str(len(alerts)) + " alert(s):", ""]
+        lines.append(health_checks.format_alerts_for_stdout(alerts))
+        return "\n".join(lines)
 
     if sub == "set-limit":
         if len(argv) < 2:

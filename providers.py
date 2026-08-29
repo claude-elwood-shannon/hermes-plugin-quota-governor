@@ -79,11 +79,15 @@ def _get_env(key: str, env_file: Optional[str] = None) -> Optional[str]:
         return val
 
     if env_file is None:
-        # Try profile .env, then global .env
-        for path in (
-            os.path.expanduser("~/.hermes/profiles/pr-ollama/.env"),
-            os.path.expanduser("~/.hermes/.env"),
-        ):
+        # Try the active profile's .env first (HERMES_HOME), then
+        # pr-ollama as a legacy fallback, then the global .env.
+        hermes_home = os.environ.get("HERMES_HOME", "").strip()
+        candidates = []
+        if hermes_home:
+            candidates.append(os.path.join(hermes_home, ".env"))
+        candidates.append(os.path.expanduser("~/.hermes/profiles/pr-ollama/.env"))
+        candidates.append(os.path.expanduser("~/.hermes/.env"))
+        for path in candidates:
             if os.path.isfile(path):
                 val = _read_env_file(path, key)
                 if val:

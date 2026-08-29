@@ -230,4 +230,26 @@ if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
     fi
 fi
 
+# ── Health checks (OBJ-09): fast burn, zombie workers, silent plugin ──
+# Runs the three health detections and includes any new alerts in stdout.
+# Alerts are also persisted to ~/.hermes/logs/quota-governor-alerts.log.
+PLUGIN_DIR="${PLUGIN_DIR:-REPO}"
+HEALTH_OUTPUT=$(HERMES_HOME="$HERMES_HOME" python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'REPO'))
+try:
+    from health_checks import run_all_health_checks, format_alerts_for_stdout
+    alerts = run_all_health_checks()
+    if alerts:
+        print(format_alerts_for_stdout(alerts))
+except Exception as e:
+    # Health checks should never break the tick
+    print(f'Health check error: {e}', file=sys.stderr)
+" 2>/dev/null) || true
+
+if [[ -n "$HEALTH_OUTPUT" ]]; then
+    echo "$HEALTH_OUTPUT"
+    log "Health alerts: $(echo "$HEALTH_OUTPUT" | wc -l) alert(s) detected"
+fi
+
 exit 0
