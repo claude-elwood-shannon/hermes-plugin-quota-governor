@@ -29,6 +29,12 @@ sys.path.insert(0, PLUGIN_DIR)
 TEST_HOME = tempfile.mkdtemp(prefix="qg-health-test-")
 os.environ["HERMES_HOME"] = TEST_HOME
 
+# CRITICAL: isolate the kanban DB too. get_kanban_db_path() resolves to the
+# real ~/.hermes/kanban.db when it exists (it does in production), so without
+# this override the test's setup_kanban_db() would INSERT fake tasks into the
+# real shared DB, causing false zombie_worker alerts on every tick.
+os.environ["HERMES_KANBAN_DB"] = os.path.join(TEST_HOME, "kanban.db")
+
 # Now import
 from health_checks import (
     check_fast_burn,
