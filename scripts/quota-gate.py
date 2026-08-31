@@ -4,6 +4,18 @@
 Queries all configured providers (Ollama Cloud, NanoGPT, OpenRouter) and
 outputs a recommended profile with the most available quota.
 
+Privacy routing (Phase 2):
+  Tasks may carry a ``privacy:`` tag in their body (public|sensitive|
+  confidential).  When present, the gate filters providers by their
+  privacy capability before applying the normal availability scoring.
+
+    public       → any provider (no filtering)
+    sensitive    → zero-retention providers only (no training on data)
+    confidential → local model only (data never leaves the host)
+
+  The privacy level is read from the ``QUOTA_GATE_PRIVACY`` env var or
+  from the ``privacy:`` field of a JSON object piped on stdin.
+
 Output (last line, JSON):
   {"wakeAgent": false}  — skip this tick, all providers exhausted
   {"wakeAgent": true, "context": {
@@ -12,6 +24,7 @@ Output (last line, JSON):
       "recommended_model": "...",
       "max_task_cost": "medium|small|tiny|micro|any",
       "max_workers": N,
+      "privacy_level": "public|sensitive|confidential|none",
       "warning": null
   }}
 
@@ -19,7 +32,10 @@ The JSON context is consumed by the autonomous-task-creator cron prompt.
 The agent reads recommended_profile and recommended_model to decide which
 profile to assign tasks to, instead of hardcoding pr-ollama.
 
-Design reference: ~/.hermes/profiles/pr-ollama/docs/multi-provider-design.md
+Design references:
+  - ~/.hermes/profiles/pr-ollama/docs/multi-provider-design.md
+  - ~/.hermes/profiles/pr-ollama/docs/privacy-by-provider-design.md §7
+  - ~/.hermes/profiles/pr-ollama/docs/autonomous-objectives.md §8.6
 """
 import json
 import os
@@ -30,6 +46,39 @@ import urllib.request
 # Guardrail G1: only these profiles may receive auto-created tasks.
 # The autonomous task creator must NEVER assign to any other profile.
 ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt"}
+
+# ---------------------------------------------------------------------------
+# Privacy capability mapping (Phase 2 — privacy-by-provider-design.md §4, §7)
+# ---------------------------------------------------------------------------
+# Each privacy level maps to the set of provider names (as they appear in the
+# ProviderStatus["provider"] field) that are *capable* of handling tasks at
+# that level.  The profile must also be in ALLOWED_PROFILES.
+#
+# public       — no restriction; any cloud or local provider qualifies.
+# sensitive    — provider must have a no-training / zero-retention policy
+#                 for API data.  Ollama Cloud and NanoGPT qualify (they do
+#                 not train on API data).  OpenRouter *passes through* to
+#                 sub-providers with their own policies, so it is excluded
+#                 for sensitive data unless data_collection:deny is set.
+#                 (Per design doc §4.1, OpenRouter does not retain prompt
+#                 content, but the sub-provider might — safer to exclude.)
+# confidential — data must never leave the host.  Only local providers
+#                 (custom/ollama-local) qualify.  On this host there is no
+#                 local profile configured, so confidential tasks get
+#                 wakeAgent:false with a warning.
+PRIVACY_CAPABILITIES = {
+    "public": {"ollama-cloud", "nanogpt", "openrouter", "custom"},
+    "sensitive": {"ollama-cloud", "nanogpt", "custom"},
+    "confidential": {"custom"},
+}
+
+# Reverse: provider name → set of privacy levels it can handle
+_PROVIDER_PRIVACY = {}
+for _level, _providers in PRIVACY_CAPABILITIES.items():
+    for _prov in _providers:
+        _PROVIDER_PRIVACY.setdefault(_prov, set()).add(_level)
+
+VALID_PRIVACY_LEVELS = {"public", "sensitive", "confidential"}
 
 # Try to import the plugin's providers module for query functions.
 # If import fails, we fall back to inline implementations.
@@ -453,10 +502,77 @@ def bottleneck_to_max_workers(bottleneck_pct):
     return 0
 
 
-def select_provider(providers_list):
+def parse_privacy_tag(text):
+    """Extract the privacy level from a task body or arbitrary text.
+
+    Looks for ``privacy: <level>`` where <level> is one of
+    public, sensitive, or confidential.  The tag may appear anywhere in
+    the text and is case-insensitive.  Returns the normalised level
+    string, or None if no valid tag is found.
+
+    Examples:
+      "privacy:sensitive\\nrest of body"  →  "sensitive"
+      "Some text\\nprivacy: confidential"  →  "confidential"
+      "no tag here"                        →  None
+    """
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip().lower()
+        if stripped.startswith("privacy:"):
+            value = stripped[len("privacy:"):].strip()
+            # Remove surrounding quotes if present
+            value = value.strip("'\"")
+            if value in VALID_PRIVACY_LEVELS:
+                return value
+            # Also accept abbreviations
+            if value in ("pub", "publico"):
+                return "public"
+            if value in ("sens", "selectivo"):
+                return "sensitive"
+            if value in ("conf", "intimo", "confidential"):
+                return "confidential"
+    return None
+
+
+def parse_privacy_level():
+    """Determine the privacy level for this gate run.
+
+    Resolution order:
+      1. QUOTA_GATE_PRIVACY env var (set by the cron prompt or caller).
+      2. JSON object on stdin with a "privacy" or "privacy_level" field.
+      3. None (no privacy constraint — normal behaviour).
+    """
+    # 1. Env var
+    env_val = os.environ.get("QUOTA_GATE_PRIVACY", "").strip().lower()
+    if env_val in VALID_PRIVACY_LEVELS:
+        return env_val
+
+    # 2. stdin JSON
+    try:
+        if not sys.stdin.isatty():
+            stdin_data = sys.stdin.read().strip()
+            if stdin_data:
+                obj = json.loads(stdin_data)
+                if isinstance(obj, dict):
+                    val = obj.get("privacy") or obj.get("privacy_level")
+                    if val and val.strip().lower() in VALID_PRIVACY_LEVELS:
+                        return val.strip().lower()
+    except (json.JSONDecodeError, OSError, ValueError):
+        pass
+
+    return None
+
+
+def select_provider(providers_list, privacy_level=None):
     """Pick the provider with the most available quota.
 
-    Returns the best ProviderStatus dict, or None if all exhausted.
+    If *privacy_level* is given (public|sensitive|confidential), providers
+    are first filtered to those capable of handling that privacy level
+    before the normal availability scoring is applied.
+
+    Returns the best ProviderStatus dict, or None if all exhausted
+    (or if no provider satisfies the privacy constraint).
     """
     candidates = []
     for p in providers_list:
@@ -465,6 +581,11 @@ def select_provider(providers_list):
             continue
         if p["availability"] <= 0:
             continue
+        # Privacy filtering: skip providers that can't handle this level
+        if privacy_level:
+            capable = _PROVIDER_PRIVACY.get(p["provider"], set())
+            if privacy_level not in capable:
+                continue
         candidates.append(p)
 
     if not candidates:
@@ -494,6 +615,9 @@ def select_provider(providers_list):
 def main():
     providers_list = []
     warnings = []
+
+    # --- Parse privacy level (Phase 2) ---
+    privacy_level = parse_privacy_level()
 
     # --- Query each provider ---
     # Ollama
@@ -550,8 +674,17 @@ def main():
             warnings.append(f"openrouter: {exc}")
     # else: not configured — skip silently
 
-    # --- Select recommended provider ---
-    recommended = select_provider(providers_list)
+    # --- Select recommended provider (with privacy filtering) ---
+    recommended = select_provider(providers_list, privacy_level=privacy_level)
+
+    # If privacy filtering eliminated all candidates, warn
+    if recommended is None and privacy_level:
+        capable_providers = PRIVACY_CAPABILITIES.get(privacy_level, set())
+        available_names = [p["provider"] for p in providers_list if not p["error"]]
+        warnings.append(
+            f"privacy:{privacy_level} excludes all available providers "
+            f"(available: {available_names}, capable: {sorted(capable_providers)})"
+        )
 
     # --- Guardrail G1: validate the recommended profile against the host ---
     existing_profiles = get_existing_profiles()
@@ -577,7 +710,8 @@ def main():
             )
 
     if recommended is None:
-        # All providers exhausted/errored, or no allowed profile exists
+        # All providers exhausted/errored, or no allowed profile exists,
+        # or privacy filtering eliminated all candidates
         output = {
             "wakeAgent": False,
             "context": {
@@ -586,6 +720,7 @@ def main():
                 "recommended_model": None,
                 "max_task_cost": None,
                 "max_workers": 0,
+                "privacy_level": privacy_level or "none",
                 "valid_profiles": valid_profiles,
                 "warning": "; ".join(warnings) if warnings else "all providers exhausted",
             },
@@ -618,6 +753,7 @@ def main():
             "recommended_model": recommended["model"],
             "max_task_cost": max_cost,
             "max_workers": max_workers,
+            "privacy_level": privacy_level or "none",
             "valid_profiles": valid_profiles,
             "warning": warning,
         },
