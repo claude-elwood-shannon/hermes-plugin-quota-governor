@@ -378,20 +378,93 @@ def check_zombie_workers() -> List[Dict[str, Any]]:
 # 3. Silent plugin detection
 # ---------------------------------------------------------------------------
 
-def check_silent_plugin() -> Optional[Dict[str, Any]]:
+def _profile_has_running_tasks(profile_name: str) -> bool:
+    """Check if a profile has any running tasks in the kanban DB.
+
+    Used to distinguish an idle profile (no work → no observations is
+    expected) from a genuinely silent plugin (has work but producing no
+    observations).
+    """
+    db_path = get_kanban_db_path()
+    if not db_path.exists():
+        return False
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = ? AND status = 'running'",
+            (profile_name,),
+        ).fetchone()
+        return row[0] > 0
+    except Exception as exc:
+        logger.debug("running-tasks check failed: %s", exc)
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _find_profile_observations() -> List[tuple]:
+    """Discover all profiles with observations.jsonl files.
+
+    Returns a list of (profile_name, observations_path) tuples for every
+    profile directory under ~/.hermes/profiles/ that has a
+    quota-governor/observations.jsonl file.
+    """
+    home = Path.home()
+    profiles_dir = home / ".hermes" / "profiles"
+    results: List[tuple] = []
+
+    if not profiles_dir.is_dir():
+        return results
+
+    for entry in sorted(profiles_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        obs_path = entry / "quota-governor" / "observations.jsonl"
+        if obs_path.exists():
+            results.append((entry.name, obs_path))
+
+    return results
+
+
+def check_silent_plugin(
+    observations_path: Optional[Path] = None,
+    profile_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Detect if the plugin has been silent (no observations) for >1h.
+
+    If ``observations_path`` is provided, checks that file instead of the
+    default HERMES_HOME-scoped one.  If ``profile_name`` is provided, the
+    check is suppressed when the profile has no running tasks (idle
+    profiles are expected to be silent — this avoids false positives from
+    cross-profile detection).
 
     If observations.jsonl doesn't exist or the most recent observation
     is older than 1h, emit an alert.
 
     Returns an alert dict if silent, else None.
     """
-    obs_path = get_observations_file()
+    obs_path = observations_path if observations_path is not None else get_observations_file()
+
+    # Idle-profile suppression: if we know the profile name and it has no
+    # running tasks, silence is expected — don't alert.  This prevents the
+    # false positive where an on-demand profile (e.g. pr-nanogpt) that
+    # only runs when tasks are assigned is flagged as "silent" during idle
+    # periods.
+    if profile_name is not None:
+        if not _profile_has_running_tasks(profile_name):
+            logger.debug(
+                "silent_plugin: profile %s is idle (no running tasks) — suppressing alert",
+                profile_name,
+            )
+            return None
+
     if not obs_path.exists():
         return write_alert(
             "silent_plugin",
-            "Plugin silent: no observations file found — plugin may not be loaded",
-            extra={"hours_silent": None},
+            f"Plugin silent ({profile_name or 'unknown'}): no observations file found — plugin may not be loaded",
+            extra={"hours_silent": None, "profile": profile_name},
         )
 
     try:
@@ -399,15 +472,15 @@ def check_silent_plugin() -> Optional[Dict[str, Any]]:
     except OSError:
         return write_alert(
             "silent_plugin",
-            "Plugin silent: cannot read observations file",
-            extra={"hours_silent": None},
+            f"Plugin silent ({profile_name or 'unknown'}): cannot read observations file",
+            extra={"hours_silent": None, "profile": profile_name},
         )
 
     if not text:
         return write_alert(
             "silent_plugin",
-            "Plugin silent: observations file is empty — plugin may not be loaded",
-            extra={"hours_silent": None},
+            f"Plugin silent ({profile_name or 'unknown'}): observations file is empty — plugin may not be loaded",
+            extra={"hours_silent": None, "profile": profile_name},
         )
 
     # Find the most recent observation timestamp
@@ -427,8 +500,8 @@ def check_silent_plugin() -> Optional[Dict[str, Any]]:
     if last_ts is None:
         return write_alert(
             "silent_plugin",
-            "Plugin silent: no valid timestamps in observations — plugin may not be loaded",
-            extra={"hours_silent": None},
+            f"Plugin silent ({profile_name or 'unknown'}): no valid timestamps in observations — plugin may not be loaded",
+            extra={"hours_silent": None, "profile": profile_name},
         )
 
     now = datetime.now(timezone.utc)
@@ -437,13 +510,13 @@ def check_silent_plugin() -> Optional[Dict[str, Any]]:
 
     if hours_silent > SILENT_PLUGIN_HOURS:
         msg = (
-            f"Plugin silent: no observations in {hours_silent:.1f}h "
+            f"Plugin silent ({profile_name or 'unknown'}): no observations in {hours_silent:.1f}h "
             f"(threshold: {SILENT_PLUGIN_HOURS}h) — plugin may not be loaded"
         )
         return write_alert(
             "silent_plugin",
             msg,
-            extra={"hours_silent": round(hours_silent, 1)},
+            extra={"hours_silent": round(hours_silent, 1), "profile": profile_name},
         )
 
     return None
@@ -457,6 +530,12 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
     """Run all three health checks and return the list of new alerts.
 
     Each alert is also written to the alert log file.
+
+    For silent_plugin, this iterates over ALL profiles that have
+    observations.jsonl files (not just the HERMES_HOME-scoped one).
+    This ensures a genuinely silent plugin in any profile is detected,
+    while idle profiles (no running tasks) are suppressed by
+    ``check_silent_plugin``'s idle-profile logic.
     """
     alerts: List[Dict[str, Any]] = []
 
@@ -469,10 +548,47 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
     zw = check_zombie_workers()
     alerts.extend(zw)
 
-    # 3. Silent plugin
-    sp = check_silent_plugin()
+    # 3. Silent plugin — check ALL profiles, not just HERMES_HOME
+    #
+    # The HERMES_HOME-scoped profile (the "tick profile", e.g. pr-ollama)
+    # runs the tick script itself, so it must always be producing
+    # observations.  It is checked WITHOUT idle-suppression.
+    #
+    # Other profiles are checked WITH idle-suppression: if they have no
+    # running tasks, silence is expected and no alert is emitted.
+    default_obs = get_observations_file()
+    checked_paths: set = set()
+
+    # 3a. Tick profile — no idle suppression (must always be alive)
+    sp = check_silent_plugin(observations_path=default_obs)
     if sp:
         alerts.append(sp)
+    checked_paths.add(str(default_obs.resolve()))
+
+    # 3b. Other profiles — with idle suppression.
+    # Skip multi-profile discovery in test mode (when HERMES_HOME is a
+    # temp directory outside ~/.hermes/profiles/, _find_profile_observations
+    # would discover real production profiles and pollute the test).
+    hermes_home = _get_hermes_home()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    in_production = False
+    try:
+        hermes_home.relative_to(profiles_root)
+        in_production = True
+    except ValueError:
+        pass
+
+    if in_production:
+        for profile_name, obs_path in _find_profile_observations():
+            if str(obs_path.resolve()) in checked_paths:
+                continue
+            sp = check_silent_plugin(
+                observations_path=obs_path,
+                profile_name=profile_name,
+            )
+            if sp:
+                alerts.append(sp)
+            checked_paths.add(str(obs_path.resolve()))
 
     return alerts
 
