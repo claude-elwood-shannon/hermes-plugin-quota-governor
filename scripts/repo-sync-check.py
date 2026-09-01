@@ -130,16 +130,19 @@ def get_db_path():
     return os.environ.get("HERMES_KANBAN_DB", KANBAN_DB)
 
 def has_pending_sync_task(conn):
-    """Check if there's already a pending (non-done) sync task on the board.
+    """Check if there's already an active (non-done, non-blocked) sync task.
 
-    We look for tasks whose title starts with 'OBJ-13:' and are not done.
-    This prevents duplicate sync task creation across ticks.
+    We look for tasks whose title starts with 'OBJ-13:' and are in an
+    active state (todo, ready, running). Blocked tasks are excluded
+    because a blocked sync task indicates a push failure that needs
+    human intervention — a new sync task should be created for any
+    new changes detected.
     """
     rows = conn.execute(
         """
         SELECT id, title, status FROM tasks
         WHERE title LIKE 'OBJ-13: Repo sync%'
-          AND status IN ('todo', 'ready', 'running', 'blocked')
+          AND status IN ('todo', 'ready', 'running')
         ORDER BY created_at DESC
         LIMIT 1
         """,
