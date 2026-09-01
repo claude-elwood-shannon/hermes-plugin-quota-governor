@@ -502,16 +502,61 @@ def bottleneck_to_max_workers(bottleneck_pct):
     return 0
 
 
+def _normalise_privacy_value(value):
+    """Normalise a raw privacy tag value to a canonical level.
+
+    Accepts the three canonical levels (public, sensitive, confidential)
+    plus the high/medium/low aliases and legacy abbreviations.
+
+    Aliases:
+      high     → sensitive   (strictest cloud-capable level)
+      medium   → sensitive   (conservative: same as high)
+      low      → public      (no restriction)
+      pub      → public
+      publico  → public
+      sens     → sensitive
+      selectivo→ sensitive
+      conf     → confidential
+      intimo   → confidential
+
+    Returns the canonical level string, or None if the value is not
+    a recognised privacy level or alias.
+    """
+    if not value:
+        return None
+    value = value.strip().lower()
+    if value in VALID_PRIVACY_LEVELS:
+        return value
+    # high/medium/low aliases (OBJ-18)
+    if value in ("high",):
+        return "sensitive"
+    if value in ("medium",):
+        return "sensitive"
+    if value in ("low",):
+        return "public"
+    # Legacy abbreviations and Spanish aliases
+    if value in ("pub", "publico"):
+        return "public"
+    if value in ("sens", "selectivo"):
+        return "sensitive"
+    if value in ("conf", "intimo", "confidential"):
+        return "confidential"
+    return None
+
+
 def parse_privacy_tag(text):
     """Extract the privacy level from a task body or arbitrary text.
 
     Looks for ``privacy: <level>`` where <level> is one of
-    public, sensitive, or confidential.  The tag may appear anywhere in
-    the text and is case-insensitive.  Returns the normalised level
-    string, or None if no valid tag is found.
+    public, sensitive, or confidential — or the high/medium/low
+    aliases.  The tag may appear anywhere in the text and is
+    case-insensitive.  Returns the normalised level string, or
+    None if no valid tag is found.
 
     Examples:
       "privacy:sensitive\\nrest of body"  →  "sensitive"
+      "privacy:high\\nrest of body"        →  "sensitive"
+      "privacy:low"                        →  "public"
       "Some text\\nprivacy: confidential"  →  "confidential"
       "no tag here"                        →  None
     """
@@ -523,15 +568,7 @@ def parse_privacy_tag(text):
             value = stripped[len("privacy:"):].strip()
             # Remove surrounding quotes if present
             value = value.strip("'\"")
-            if value in VALID_PRIVACY_LEVELS:
-                return value
-            # Also accept abbreviations
-            if value in ("pub", "publico"):
-                return "public"
-            if value in ("sens", "selectivo"):
-                return "sensitive"
-            if value in ("conf", "intimo", "confidential"):
-                return "confidential"
+            return _normalise_privacy_value(value)
     return None
 
 
@@ -543,12 +580,13 @@ def parse_privacy_level():
       2. JSON object on stdin with a "privacy" or "privacy_level" field.
       3. None (no privacy constraint — normal behaviour).
     """
-    # 1. Env var
-    env_val = os.environ.get("QUOTA_GATE_PRIVACY", "").strip().lower()
-    if env_val in VALID_PRIVACY_LEVELS:
-        return env_val
+    # 1. Env var (accepts canonical levels and high/medium/low aliases)
+    env_val = os.environ.get("QUOTA_GATE_PRIVACY", "").strip()
+    normalised = _normalise_privacy_value(env_val)
+    if normalised:
+        return normalised
 
-    # 2. stdin JSON
+    # 2. stdin JSON (accepts canonical levels and high/medium/low aliases)
     try:
         if not sys.stdin.isatty():
             stdin_data = sys.stdin.read().strip()
@@ -556,8 +594,10 @@ def parse_privacy_level():
                 obj = json.loads(stdin_data)
                 if isinstance(obj, dict):
                     val = obj.get("privacy") or obj.get("privacy_level")
-                    if val and val.strip().lower() in VALID_PRIVACY_LEVELS:
-                        return val.strip().lower()
+                    if val:
+                        normalised = _normalise_privacy_value(val)
+                        if normalised:
+                            return normalised
     except (json.JSONDecodeError, OSError, ValueError):
         pass
 
