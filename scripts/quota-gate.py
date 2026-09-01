@@ -80,6 +80,36 @@ for _level, _providers in PRIVACY_CAPABILITIES.items():
 
 VALID_PRIVACY_LEVELS = {"public", "sensitive", "confidential"}
 
+# ---------------------------------------------------------------------------#
+# Privacy-level provider preference override (OBJ-18 Phase 3)
+# ---------------------------------------------------------------------------#
+# When a privacy level is active, this dict overrides PROVIDER_PREFERENCE
+# and changes select_provider() to *preference-first* sorting: the provider
+# with the lowest preference number wins, availability is only a tie-breaker.
+#
+# Rationale (OBJ-18 completion criterion):
+#   "privacy:high va a NanoGPT, privacy:low va a Ollama"
+#
+# With availability-first routing the criterion is NOT guaranteed: if Ollama
+# has more spare quota than NanoGPT, Ollama wins even for sensitive tasks.
+# Preference-first ensures NanoGPT is always chosen for sensitive tasks as
+# long as it has *any* availability > 0.
+#
+# For `public` we keep availability-first (no override entry → falls back to
+# the normal PROVIDER_PREFERENCE tie-breaker).  This means privacy:low still
+# routes to whichever provider has the most quota — which is usually Ollama
+# on this host, but not guaranteed.  See §6.1 of privacy-routing-matrix.md
+# for the design discussion.
+PRIVACY_PROVIDER_PREFERENCE = {
+    # sensitive: NanoGPT preferred over Ollama (OpenRouter already excluded)
+    "sensitive": {"pr-nanogpt": 0, "pr-ollama": 1, "pr-openrouter": 2},
+    # confidential: only local/custom qualifies
+    "confidential": {"pr-local": 0, "custom": 0},
+}
+
+# Levels that trigger preference-first routing (vs availability-first)
+_PREFERENCE_FIRST_LEVELS = set(PRIVACY_PROVIDER_PREFERENCE.keys())
+
 # Try to import the plugin's providers module for query functions.
 # If import fails, we fall back to inline implementations.
 _PLUGIN_PATH = os.path.expanduser(
@@ -611,6 +641,16 @@ def select_provider(providers_list, privacy_level=None):
     are first filtered to those capable of handling that privacy level
     before the normal availability scoring is applied.
 
+    Routing mode:
+      * **availability-first** (default, and for ``public``): providers are
+        sorted by availability descending, then by PROVIDER_PREFERENCE as
+        tie-breaker.
+      * **preference-first** (for ``sensitive`` and ``confidential``):
+        providers are sorted by PRIVACY_PROVIDER_PREFERENCE first, then by
+        availability as tie-breaker.  This ensures the OBJ-18 criterion
+        (high → NanoGPT) is satisfied even when a less-preferred provider
+        has more spare quota.
+
     Returns the best ProviderStatus dict, or None if all exhausted
     (or if no provider satisfies the privacy constraint).
     """
@@ -631,10 +671,27 @@ def select_provider(providers_list, privacy_level=None):
     if not candidates:
         return None
 
-    # Sort by availability descending, then by preference order
-    candidates.sort(
-        key=lambda p: (-p["availability"], PROVIDER_PREFERENCE.get(p["profile"], 99))
+    # Determine routing mode: preference-first for sensitive/confidential,
+    # availability-first for public and no-privacy.
+    use_preference_first = (
+        privacy_level is not None
+        and privacy_level in _PREFERENCE_FIRST_LEVELS
     )
+
+    if use_preference_first:
+        pref_map = PRIVACY_PROVIDER_PREFERENCE[privacy_level]
+        # Sort by privacy preference (ascending), then availability (descending)
+        candidates.sort(
+            key=lambda p: (
+                pref_map.get(p["profile"], 99),
+                -p["availability"],
+            )
+        )
+    else:
+        # Availability-first (public or no privacy)
+        candidates.sort(
+            key=lambda p: (-p["availability"], PROVIDER_PREFERENCE.get(p["profile"], 99))
+        )
 
     top = candidates[0]
 

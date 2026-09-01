@@ -168,8 +168,8 @@ check("public → same as no filtering (openrouter 90%)",
 print("\n--- Test 4: select_provider (sensitive) ---")
 
 result = quota_gate.select_provider(mock_providers, privacy_level="sensitive")
-check("sensitive → excludes openrouter, picks ollama (80%)",
-      result is not None and result["profile"] == "pr-ollama",
+check("sensitive → excludes openrouter, picks nanogpt (preference-first over ollama 80%)",
+      result is not None and result["profile"] == "pr-nanogpt",
       f"got {result['profile'] if result else 'None'}")
 
 # Make nanogpt higher than ollama
@@ -319,12 +319,12 @@ check("e2e public → profile pr-openrouter",
 check("e2e public → privacy_level public",
       out["context"]["privacy_level"] == "public")
 
-# Sensitive → wakeAgent true, picks ollama (openrouter excluded)
+# Sensitive → wakeAgent true, picks nanogpt (preference-first, openrouter excluded)
 out = simulate_main(mock_providers, "sensitive")
 check("e2e sensitive → wakeAgent:true",
       out["wakeAgent"] is True)
-check("e2e sensitive → profile pr-ollama",
-      out["context"]["recommended_profile"] == "pr-ollama",
+check("e2e sensitive → profile pr-nanogpt (preference-first)",
+      out["context"]["recommended_profile"] == "pr-nanogpt",
       f"got {out['context']['recommended_profile']}")
 check("e2e sensitive → privacy_level sensitive",
       out["context"]["privacy_level"] == "sensitive")
@@ -412,6 +412,125 @@ out_medium = simulate_main(mock_providers_sensitive, medium_level)
 check("e2e medium → routes to pr-nanogpt (sensitive)",
       out_medium["context"]["recommended_profile"] == "pr-nanogpt",
       f"got {out_medium['context']['recommended_profile']}")
+
+
+# -----------------------------------------------------------------------
+# Test 10: Preference-first routing (OBJ-18 Phase 3)
+# -----------------------------------------------------------------------
+# The OBJ-18 completion criterion requires privacy:high → NanoGPT even
+# when Ollama has MORE availability.  This is preference-first routing.
+# -----------------------------------------------------------------------
+print("\n--- Test 10: Preference-first routing (sensitive → NanoGPT always) ---")
+
+# Mock where Ollama has MUCH more availability than NanoGPT.
+# With availability-first, Ollama would win. With preference-first,
+# NanoGPT must win because it's preferred for sensitive.
+mock_pref = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 95.0, "bottleneck_pct": 5.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 30.0, "bottleneck_pct": 70.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+]
+
+result = quota_gate.select_provider(mock_pref, privacy_level="sensitive")
+check("sensitive preference-first: ollama=95, nanogpt=30 → nanogpt wins",
+      result is not None and result["profile"] == "pr-nanogpt",
+      f"got {result['profile'] if result else 'None'}")
+
+# Even more extreme: ollama 100%, nanogpt 1%
+mock_extreme = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 1.0, "bottleneck_pct": 99.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+]
+result = quota_gate.select_provider(mock_extreme, privacy_level="sensitive")
+check("sensitive preference-first: ollama=100, nanogpt=1 → nanogpt wins",
+      result is not None and result["profile"] == "pr-nanogpt",
+      f"got {result['profile'] if result else 'None'}")
+
+# Verify public does NOT use preference-first (availability-first instead)
+result_pub = quota_gate.select_provider(mock_pref, privacy_level="public")
+check("public availability-first: ollama=95, nanogpt=30 → ollama wins (not preference)",
+      result_pub is not None and result_pub["profile"] == "pr-ollama",
+      f"got {result_pub['profile'] if result_pub else 'None'}")
+
+# Fallback: nanogpt errored → ollama selected (preference-first respects errors)
+mock_nanogpt_err = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 0.0, "bottleneck_pct": 100.0, "bottleneck_window": "error",
+     "error": "connection refused", "raw": {}},
+]
+result = quota_gate.select_provider(mock_nanogpt_err, privacy_level="sensitive")
+check("sensitive preference-first: nanogpt errored → fallback to ollama",
+      result is not None and result["profile"] == "pr-ollama",
+      f"got {result['profile'] if result else 'None'}")
+
+# Fallback: nanogpt availability=0 (no error, exhausted quota) → ollama
+mock_nanogpt_zero = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 50.0, "bottleneck_pct": 50.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 0.0, "bottleneck_pct": 100.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+]
+result = quota_gate.select_provider(mock_nanogpt_zero, privacy_level="sensitive")
+check("sensitive preference-first: nanogpt availability=0 → fallback to ollama",
+      result is not None and result["profile"] == "pr-ollama",
+      f"got {result['profile'] if result else 'None'}")
+
+# E2E: privacy:high → sensitive → NanoGPT wins (preference-first)
+out_high_pref = simulate_main(mock_pref, "sensitive")
+check("e2e high (preference-first): ollama=95, nanogpt=30 → nanogpt",
+      out_high_pref["context"]["recommended_profile"] == "pr-nanogpt",
+      f"got {out_high_pref['context']['recommended_profile']}")
+
+# PRIVACY_PROVIDER_PREFERENCE structure checks
+check("PRIVACY_PROVIDER_PREFERENCE has sensitive key",
+      "sensitive" in quota_gate.PRIVACY_PROVIDER_PREFERENCE)
+check("sensitive prefers nanogpt over ollama",
+      quota_gate.PRIVACY_PROVIDER_PREFERENCE["sensitive"]["pr-nanogpt"]
+      < quota_gate.PRIVACY_PROVIDER_PREFERENCE["sensitive"]["pr-ollama"])
+check("sensitive has confidential key",
+      "confidential" in quota_gate.PRIVACY_PROVIDER_PREFERENCE)
+
+
+# -----------------------------------------------------------------------
+# Test 11: Preference-first with 3 providers (sensitive excludes openrouter)
+# -----------------------------------------------------------------------
+print("\n--- Test 11: Preference-first with 3 providers ---")
+
+mock_3 = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 90.0, "bottleneck_pct": 10.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 20.0, "bottleneck_pct": 80.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+    {"profile": "pr-openrouter", "provider": "openrouter", "model": "z-ai/glm-5.2:free",
+     "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "weekly_usd",
+     "error": "", "raw": {}},
+]
+
+# Sensitive: openrouter excluded, nanogpt preferred over ollama
+result = quota_gate.select_provider(mock_3, privacy_level="sensitive")
+check("sensitive 3-prov: openrouter excluded, nanogpt preferred over ollama (90 vs 20)",
+      result is not None and result["profile"] == "pr-nanogpt",
+      f"got {result['profile'] if result else 'None'}")
+
+# Public: all eligible, availability-first → openrouter (100%)
+result = quota_gate.select_provider(mock_3, privacy_level="public")
+check("public 3-prov: availability-first → openrouter (100%)",
+      result is not None and result["profile"] == "pr-openrouter",
+      f"got {result['profile'] if result else 'None'}")
 
 
 # ---------------------------------------------------------------------------
