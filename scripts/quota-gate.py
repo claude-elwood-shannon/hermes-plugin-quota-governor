@@ -41,6 +41,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 
 # Guardrail G1: only these profiles may receive auto-created tasks.
@@ -167,6 +169,58 @@ def _no_proxy():
     return _ctx()
 
 
+# ---------------------------------------------------------------------------#
+# Transient HTTP retry + last-known-good cache (OBJ-20)
+# ---------------------------------------------------------------------------#
+
+_TRANSIENT_HTTP_CODES = {403, 429, 500, 502, 503, 504}
+_RETRY_DELAY = 1.0
+_MAX_RETRIES = 2
+
+
+def _retry_http(fn, *, retries=_MAX_RETRIES, delay=_RETRY_DELAY):
+    """Retry *fn* on transient HTTP errors (403, 429, 5xx, network)."""
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except urllib.error.HTTPError as exc:
+            if exc.code in _TRANSIENT_HTTP_CODES and attempt < retries:
+                time.sleep(delay)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < retries:
+                time.sleep(delay)
+                continue
+            raise
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def _cache_dir():
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    base = hermes_home if hermes_home else os.path.expanduser("~/.hermes")
+    return os.path.join(base, "quota-governor")
+
+
+def _read_cache(provider):
+    path = os.path.join(_cache_dir(), f"{provider}-last-good.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_cache(provider, data):
+    path = os.path.join(_cache_dir(), f"{provider}-last-good.json")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Profile validation (Guardrail G1)
 # ---------------------------------------------------------------------------
@@ -263,13 +317,16 @@ def query_ollama():
     if not api_key:
         raise RuntimeError("OLLAMA_API_KEY not configured")
 
-    req = urllib.request.Request(
-        "https://ollama.com/api/usage",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    with _no_proxy():
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+    def _do_request():
+        req = urllib.request.Request(
+            "https://ollama.com/api/usage",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with _no_proxy():
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+
+    data = _retry_http(_do_request)
 
     session = data.get("limits", {}).get("session", {})
     weekly = data.get("limits", {}).get("weekly", {})
@@ -281,51 +338,81 @@ def query_ollama():
         if cost is not None:
             activity_cost = float(cost)
 
-    return {
+    result = {
         "session_pct": float(session.get("usage", 0)) * 100,
         "weekly_pct": float(weekly.get("usage", 0)) * 100,
         "activity_cost": activity_cost,
     }
+    _write_cache("ollama", result)
+    return result
 
 
 def query_nanogpt():
-    """Query NanoGPT subscription usage. Returns dict or raises."""
+    """Query NanoGPT subscription usage. Returns dict or raises.
+
+    Falls back to last-known-good cache on transient errors (OBJ-20).
+    """
     api_key = get_env("NANO_GPT_API_KEY")
     if not api_key:
         raise RuntimeError("NANO_GPT_API_KEY not configured")
 
-    req = urllib.request.Request(
-        "https://nano-gpt.com/api/subscription/v1/usage",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    with _no_proxy():
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+    def _do_request():
+        req = urllib.request.Request(
+            "https://nano-gpt.com/api/subscription/v1/usage",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with _no_proxy():
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+
+    try:
+        data = _retry_http(_do_request)
+    except Exception:
+        cached = _read_cache("nanogpt")
+        if cached:
+            cached["_cached"] = True
+            return cached
+        raise
 
     daily = data.get("daily", {})
     weekly = data.get("weeklyInputTokens", {})
-    return {
+    result = {
         "state": data.get("state"),
         "daily_pct": float(daily.get("percentUsed", 0)) * 100 if daily else None,
         "weekly_tokens_pct": (
             float(weekly.get("percentUsed", 0)) * 100 if weekly else None
         ),
     }
+    _write_cache("nanogpt", result)
+    return result
 
 
 def query_openrouter():
-    """Query OpenRouter key usage. Returns dict or raises."""
+    """Query OpenRouter key usage. Returns dict or raises.
+
+    Falls back to last-known-good cache on transient errors (OBJ-20).
+    """
     api_key = get_env("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not configured")
 
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/key",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    with _no_proxy():
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode()).get("data", {})
+    def _do_request():
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/key",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with _no_proxy():
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode()).get("data", {})
+
+    try:
+        data = _retry_http(_do_request)
+    except Exception:
+        cached = _read_cache("openrouter")
+        if cached:
+            cached["_cached"] = True
+            return cached
+        raise
 
     weekly_usd = data.get("usage_weekly")
     monthly_usd = data.get("usage_monthly")
@@ -333,13 +420,15 @@ def query_openrouter():
     usage = data.get("usage")  # total usage in USD
     expires_at = data.get("expires_at")  # ISO timestamp or null
 
-    return {
+    result = {
         "usage_weekly_usd": float(weekly_usd) if weekly_usd is not None else None,
         "usage_monthly_usd": float(monthly_usd) if monthly_usd is not None else None,
         "limit": float(limit) if limit is not None else None,
         "usage": float(usage) if usage is not None else None,
         "expires_at": expires_at,
     }
+    _write_cache("openrouter", result)
+    return result
 
 
 # ---------------------------------------------------------------------------
