@@ -178,6 +178,85 @@ if [[ "$ACTION" == "stop" && "$WRITE_STOP" == "1" ]]; then
     log "STOP signal written (spending limit: \$${COST} >= \$${SPENDING_LIMIT})"
 fi
 
+# ── Concurrency guard (OBJ-06): live worker count + hard cap ──
+# The Hermes core treats --max N as a live concurrency cap (counts
+# status='running' tasks), but the tick script can restart the daemon
+# with a lower --max while old workers are still alive. This guard:
+#   1. Counts live workers (kanban DB running tasks with alive PIDs)
+#   2. Soft cap: if live >= desired_max, skip daemon restart (existing
+#      daemon already prevents new spawns — workers drain naturally)
+#   3. Hard cap: if live > hard_limit (default desired_max+2), SIGTERM
+#      the oldest workers to prevent unbounded accumulation
+PLUGIN_DIR="${PLUGIN_DIR:-REPO}"
+CONCURRENCY_OUTPUT=$(HERMES_HOME="$HERMES_HOME" \
+    HERMES_KANBAN_DB="${HERMES_KANBAN_DB:-}" \
+    PLUGIN_DIR="$PLUGIN_DIR" \
+    QUOTA_GOVERNOR_HARD_LIMIT="${QUOTA_GOVERNOR_HARD_LIMIT:-}" \
+    python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'REPO'))
+try:
+    from concurrency_guard import check_concurrency, kill_worker, format_decision_for_log, format_kill_notice
+    desired_max = int(os.environ.get('CONCURRENCY_DESIRED_MAX', '1'))
+    decision = check_concurrency(desired_max)
+    killed = []
+    for w in decision.workers_to_kill:
+        success = kill_worker(w)
+        killed.append((w, success))
+    # Output: JSON with live_count, should_spawn, hard_limit, killed_count, kill_notice, reason
+    print(json.dumps({
+        'live_count': decision.live_count,
+        'should_spawn': decision.should_spawn,
+        'hard_limit': decision.hard_limit,
+        'killed_count': len(killed),
+        'kill_notice': format_kill_notice(killed),
+        'reason': format_decision_for_log(decision),
+    }))
+except Exception as e:
+    # Concurrency guard should never break the tick
+    print(json.dumps({'error': str(e), 'live_count': 0, 'should_spawn': True}))
+" CONCURRENCY_DESIRED_MAX="$DESIRED_MAX" 2>/dev/null) || true
+
+# Parse the JSON output
+LIVE_COUNT=$(echo "$CONCURRENCY_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('live_count', 0))
+except: print(0)
+" 2>/dev/null || echo "0")
+
+SHOULD_SPAWN=$(echo "$CONCURRENCY_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print('true' if d.get('should_spawn', True) else 'false')
+except: print('true')
+" 2>/dev/null || echo "true")
+
+KILL_NOTICE=$(echo "$CONCURRENCY_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('kill_notice', ''))
+except: print('')
+" 2>/dev/null || echo "")
+
+CONCURRENCY_REASON=$(echo "$CONCURRENCY_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('reason', ''))
+except: print('')
+" 2>/dev/null || echo "")
+
+log "Concurrency: ${CONCURRENCY_REASON}"
+
+if [[ -n "$KILL_NOTICE" ]]; then
+    echo "$KILL_NOTICE"
+    log "$KILL_NOTICE"
+fi
+
 # Daemon management
 DAEMON_NEEDS_ACTION=false
 
@@ -193,6 +272,12 @@ if [[ -f "$PIDFILE" ]]; then
             echo "Tick: stopped daemon — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}% cost=\$${COST})"
             exit 0
         elif [[ "$CURRENT_MAX" != "$DESIRED_MAX" ]]; then
+            # Max changed — but if live workers already >= desired_max,
+            # the running daemon already prevents new spawns. Only
+            # restart if we actually need to raise the cap (live <
+            # desired_max), or the daemon needs a higher cap. When
+            # lowering, just kill the daemon and let the next tick
+            # decide — the existing workers will drain on their own.
             kill "$OLDPID" 2>/dev/null || true
             rm -f "$PIDFILE"
             DAEMON_NEEDS_ACTION=true
@@ -205,6 +290,15 @@ else
     if [[ "$ACTION" != "stop" ]]; then
         DAEMON_NEEDS_ACTION=true
     fi
+fi
+
+# Soft cap: if live workers already >= desired_max, don't start a new
+# daemon — the workers will drain as they complete, and the dispatcher
+# (if still running) already respects the cap. Only start if there's
+# room for more workers.
+if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$SHOULD_SPAWN" == "false" ]]; then
+    log "Soft cap: ${LIVE_COUNT} live workers >= ${DESIRED_MAX} desired — skipping daemon restart"
+    DAEMON_NEEDS_ACTION=false
 fi
 
 if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
@@ -223,8 +317,8 @@ if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
             --verbose \
             --force > /dev/null 2>&1 &
         echo "$DESIRED_MAX" > "$MAX_FILE"
-        log "Daemon started (PID $!, --max $DESIRED_MAX)"
-        echo "Tick: ${ACTION} workers=${DESIRED_MAX} — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}% cost=\$${COST})"
+        log "Daemon started (PID $!, --max $DESIRED_MAX) [live_workers=${LIVE_COUNT}]"
+        echo "Tick: ${ACTION} workers=${DESIRED_MAX} live=${LIVE_COUNT} — ${REASON} (s=${SESSION_PCT}% w=${WEEKLY_PCT}% cost=\$${COST})"
     else
         log "ERROR: hermes binary not found"
     fi
@@ -233,7 +327,7 @@ fi
 # ── Health checks (OBJ-09): fast burn, zombie workers, silent plugin ──
 # Runs the three health detections and includes any new alerts in stdout.
 # Alerts are also persisted to ~/.hermes/logs/quota-governor-alerts.log.
-PLUGIN_DIR="${PLUGIN_DIR:-REPO}"
+# PLUGIN_DIR already set by the concurrency guard section above.
 HEALTH_OUTPUT=$(HERMES_HOME="$HERMES_HOME" python3 -c "
 import json, os, sys
 sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'REPO'))
