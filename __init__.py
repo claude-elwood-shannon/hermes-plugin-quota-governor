@@ -1,6 +1,6 @@
 """quota-governor — Hermes Agent plugin for self-governance by quota.
 
-Wires five behaviours:
+Wires six behaviours:
 
 1. ``kanban_task_claimed`` hook — fired by the DISPATCHER just before a
    worker spawns.  Queries quota and records the observation; if quota
@@ -8,7 +8,9 @@ Wires five behaviours:
 
 2. ``kanban_task_completed`` hook — fired by the WORKER when it calls
    ``kanban_complete``.  Records the task cost (elapsed time, request
-   count if available) and updates the rolling heuristic.
+   count if available), updates the rolling heuristic, and spawns
+   ``verify-task.py --task-id`` in the background for immediate
+   post-completion verification (OBJ-11 Phase 2 — anti phantom-done).
 
 3. ``kanban_task_blocked`` hook — records blocked tasks for audit.
 
@@ -18,11 +20,18 @@ Wires five behaviours:
 
 5. ``/quota-governor`` slash command — manual status, decision preview,
    and daemon control.
+
+6. ``_spawn_verify_task`` — non-blocking subprocess spawn of
+   ``verify-task.py`` for a single task. Called from the
+   ``kanban_task_completed`` hook. Falls back to the 10-minute cron
+   (``verify-task-cron.sh``) if the script is missing or the spawn fails.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from typing import Any, Dict, Optional
 
 from . import quota_governor as gov
@@ -39,6 +48,10 @@ _STATE_DIR = None  # lazily computed in gov.get_state_dir()
 
 _tool_call_counter: int = 0
 _SAMPLE_EVERY_N_TOOL_CALLS = 50  # query quota every 50 tool calls
+
+# --- verify-task.py path (OBJ-11 Phase 2) ------------------------------------
+
+_VERIFY_TASK_SCRIPT = os.path.expanduser("~/.hermes/scripts/verify-task.py")
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +95,36 @@ def _on_kanban_task_claimed(
         logger.debug("quota-governor kanban_task_claimed failed: %s", exc)
 
 
+def _spawn_verify_task(task_id: str) -> None:
+    """OBJ-11 Phase 2: spawn verify-task.py --task-id in the background.
+
+    Non-blocking: the subprocess is started with start_new_session=True so
+    it survives the worker process exit. It reads the kanban DB directly
+    (no IPC needed) and writes its result to verifications.jsonl.
+
+    Best-effort: if the script is missing or the spawn fails, the cron
+    job (verify-task-cron.sh, every 10m) still catches the task on the
+    next tick — this hook just makes verification immediate instead of
+    delayed by up to 10 minutes.
+    """
+    if not os.path.exists(_VERIFY_TASK_SCRIPT):
+        logger.debug("verify-task.py not found at %s — skipping hook spawn",
+                      _VERIFY_TASK_SCRIPT)
+        return
+
+    try:
+        subprocess.Popen(
+            ["python3", _VERIFY_TASK_SCRIPT, "--task-id", task_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from worker process group
+        )
+        logger.debug("verify-task.py spawned for task %s", task_id)
+    except Exception as exc:
+        logger.debug("failed to spawn verify-task.py for %s: %s", task_id, exc)
+
+
 def _on_kanban_task_completed(
     task_id: str = "",
     board: Optional[str] = None,
@@ -93,7 +136,9 @@ def _on_kanban_task_completed(
 ) -> None:
     """Worker fires this when it calls kanban_complete.
 
-    Records the completed task and updates the rolling cost estimate.
+    Records the completed task, updates the rolling cost estimate, and
+    spawns verify-task.py in the background for immediate post-completion
+    verification (OBJ-11 Phase 2 — anti phantom-done).
     """
     try:
         snapshot = gov.query_quota()
@@ -117,6 +162,15 @@ def _on_kanban_task_completed(
             gov.write_stop_signal(reason=reason)
     except Exception as exc:
         logger.debug("quota-governor kanban_task_completed failed: %s", exc)
+
+    # OBJ-11 Phase 2: spawn verify-task.py --task-id for immediate verification.
+    # Non-blocking: the subprocess runs independently of the worker process.
+    # Best-effort: any failure is logged and swallowed.
+    if task_id:
+        try:
+            _spawn_verify_task(task_id)
+        except Exception as exc:
+            logger.debug("quota-governor verify-task spawn failed: %s", exc)
 
 
 def _on_kanban_task_blocked(
