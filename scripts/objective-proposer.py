@@ -584,16 +584,27 @@ def detect_crash_cluster() -> Optional[Pattern]:
 
 # ── Proposal deduplication ──────────────────────────────────────────────────
 
-def _already_proposed(pattern_key: str) -> bool:
-    """Check if a pattern was already proposed today (GR6 enforcement).
+def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
+    """Check if a pattern was already proposed (GR6 enforcement + cross-day dedup).
 
-    We check both the proposals file and the pattern_key field in today's
-    entries.
+    By default (*cross_day=True*), also checks if the same pattern was
+    allowed on a **previous** day within the analysis window. This prevents
+    the proposer from re-proposing the same error every day when stale
+    errors remain in the 7-day observation window but have already been
+    addressed by a prior task.
+
+    The cross-day check matches on the ``pattern_key`` substring (e.g.
+    ``recurring_error:Error 'nanogpt: HTTP Error N: Forbidden'``) appearing
+    in the ``evidence`` or ``title`` of any past allowed entry.
     """
     if not os.path.exists(PROPOSALS_FILE):
         return False
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Extract a short normalized key from pattern_key for fuzzy matching.
+    # pattern_key looks like: "recurring_error:Error 'nanogpt: HTTP Error N: Forbidden' appeared 4 times in 7d"
+    # We extract the core error signature for cross-day matching.
+    short_key = pattern_key.split(":", 1)[-1][:60].lower() if ":" in pattern_key else pattern_key[:60].lower()
 
     try:
         with open(PROPOSALS_FILE, "r", encoding="utf-8") as f:
@@ -603,14 +614,27 @@ def _already_proposed(pattern_key: str) -> bool:
                     continue
                 try:
                     entry = json.loads(line)
-                    # Check if today's entry with same pattern_key
-                    if entry.get("date") == today and entry.get("allowed"):
-                        # Check pattern_key if present
+                    if not entry.get("allowed"):
+                        continue
+                    entry_date = entry.get("date", "")
+
+                    # Same-day dedup (GR6): no more than 1 allowed per day
+                    if entry_date == today:
                         if entry.get("pattern_key") == pattern_key:
                             return True
-                        # Also check title for backward compat
                         if pattern_key in entry.get("title", "").lower():
                             return True
+
+                    # Cross-day dedup: if the same pattern was allowed on a
+                    # previous day, don't re-propose. This prevents stale errors
+                    # in the observation window from generating duplicate tasks.
+                    if cross_day and entry_date < today:
+                        entry_text = (
+                            entry.get("evidence", "") + " " + entry.get("title", "")
+                        ).lower()
+                        if short_key and short_key in entry_text:
+                            return True
+
                 except json.JSONDecodeError:
                     continue
     except OSError:

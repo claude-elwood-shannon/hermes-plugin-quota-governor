@@ -532,6 +532,10 @@ def record_proposal(
         "violations": [{"id": v.id, "message": v.message} for v in result.violations],
         "warnings": [{"id": w.id, "message": w.message} for w in result.warnings],
         "requires_human_approval": result.requires_human_approval,
+        # Include evidence/pattern_key for cross-path dedup with objective-proposer.
+        # Without this, _already_proposed() can't match entries from validate-guardrails
+        # against entries from objective-proposer, causing duplicate proposals.
+        "evidence": title,  # title is the best available proxy here
     }
     if task_id:
         entry["task_id"] = task_id
