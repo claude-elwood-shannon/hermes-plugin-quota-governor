@@ -10,3 +10,4 @@ hooks:
   - kanban_task_blocked
   - post_tool_call
   - on_session_end
+  - on_kanban_dispatch_tick

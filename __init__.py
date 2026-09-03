@@ -1,6 +1,6 @@
 """quota-governor — Hermes Agent plugin for self-governance by quota.
 
-Wires six behaviours:
+Wires seven behaviours:
 
 1. ``kanban_task_claimed`` hook — fired by the DISPATCHER just before a
    worker spawns.  Queries quota and records the observation; if quota
@@ -25,6 +25,12 @@ Wires six behaviours:
    ``verify-task.py`` for a single task. Called from the
    ``kanban_task_completed`` hook. Falls back to the 10-minute cron
    (``verify-task-cron.sh``) if the script is missing or the spawn fails.
+
+7. ``on_kanban_dispatch_tick`` hook — fires after each dispatcher tick.
+   Spawns ``privacy-router-fix.py`` in the background to deterministically
+   reassign privacy:high tasks that the cron LLM agent misrouted to
+   pr-ollama instead of pr-nanogpt (OBJ-18 follow-up).  The script is
+   also run by a no-agent cron job every 5 minutes as backup.
 """
 
 from __future__ import annotations
@@ -52,6 +58,14 @@ _SAMPLE_EVERY_N_TOOL_CALLS = 50  # query quota every 50 tool calls
 # --- verify-task.py path (OBJ-11 Phase 2) ------------------------------------
 
 _VERIFY_TASK_SCRIPT = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+
+# --- privacy-router-fix.py path (OBJ-18 follow-up) ---------------------------
+
+_PRIVACY_ROUTER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "scripts",
+    "privacy-router-fix.py",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +137,44 @@ def _spawn_verify_task(task_id: str) -> None:
         logger.debug("verify-task.py spawned for task %s", task_id)
     except Exception as exc:
         logger.debug("failed to spawn verify-task.py for %s: %s", task_id, exc)
+
+
+def _on_kanban_dispatch_tick(
+    board: Optional[str] = None,
+    profile_name: str = "",
+    dry_run: bool = False,
+    outcome: str = "ok",
+    **_: Any,
+) -> None:
+    """Dispatcher fires this after each dispatch tick.
+
+    OBJ-18 follow-up: deterministically reassign privacy:high tasks that
+    the cron LLM agent misrouted to pr-ollama instead of pr-nanogpt.  The
+    LLM agent consistently skips the Phase 2 privacy-gate.sh re-run, so
+    we enforce correct routing here instead of relying on prompt compliance.
+
+    Non-blocking: spawns privacy-router-fix.py in the background. The
+    script reads the kanban DB directly, runs privacy-gate.sh, and
+    reassigns mismatched tasks via `hermes kanban assign`.
+
+    Best-effort: if the script is missing or the spawn fails, the no-agent
+    cron job (every 5 minutes) still catches misrouted tasks.
+    """
+    if not os.path.exists(_PRIVACY_ROUTER_SCRIPT):
+        logger.debug("privacy-router-fix.py not found at %s — skipping", _PRIVACY_ROUTER_SCRIPT)
+        return
+
+    try:
+        subprocess.Popen(
+            ["python3", _PRIVACY_ROUTER_SCRIPT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from dispatcher process group
+        )
+        logger.debug("privacy-router-fix.py spawned after dispatch tick")
+    except Exception as exc:
+        logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
 
 
 def _on_kanban_task_completed(
@@ -353,6 +405,7 @@ def register(ctx) -> None:
     ctx.register_hook("kanban_task_blocked", _on_kanban_task_blocked)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_kanban_dispatch_tick", _on_kanban_dispatch_tick)
     ctx.register_command(
         "quota-governor",
         handler=_handle_slash,
