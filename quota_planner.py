@@ -12,10 +12,15 @@ Three-state model (Aug 2026, design pay-as-you-go-design.md):
            balance.  Warn but allow (1 worker, small tasks).
   stop   — balance exhausted, spending limit hit, or weekly quota critical.
 
-Per-call cost data (Aug 2026):
-  - ~137 calls fill an Ollama session to 100%
-  - ~769 calls fill the weekly cap to 100%
-  - Per call: ~0.0073 session, ~0.0013 weekly
+Per-call cost data (calibrated 2026-09-03 from 132 task_runs + 768 observations):
+  - ~510 calls fill an Ollama session to 100% (was 137 — 272% deviation)
+  - ~2988 calls fill the weekly cap to 100% (was 769 — 289% deviation)
+  - Per call: ~0.0020 session, ~0.00034 weekly
+  - Real per-task calls: tiny median 19, small median 27, medium median 19.5
+  - Real wall-clock: micro 168s, tiny 242s, small 270s, medium 420s (medians)
+  - decide() thresholds operate on percentages, not absolute counts,
+    so no threshold changes needed — only documentation updated.
+  - See docs/quota-planner.md §"Real cost calibration" for full table.
 """
 
 from __future__ import annotations
