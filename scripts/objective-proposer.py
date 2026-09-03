@@ -250,13 +250,85 @@ def get_crashed_tasks() -> List[Dict[str, Any]]:
 
 # ── Pattern detectors ────────────────────────────────────────────────────────
 
+def _is_error_resolved(error_msg: str, observations: List[Dict[str, Any]]) -> bool:
+    """Check if a recurring error has already been resolved.
+
+    An error is considered resolved if BOTH:
+    1. It has NOT appeared in observations in the last 48h (staleness check)
+    2. There exists a done/archived kanban task whose title mentions keywords
+       from the error (fix verification check)
+
+    This prevents false-positive proposals for errors that were already fixed
+    but whose old occurrences remain in the 7-day observation window.
+    """
+    # Check 1: Did the error appear in the last 48h?
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    has_recent = False
+    for obs in observations:
+        ts_str = obs.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        if ts < recent_cutoff:
+            continue
+        quota = obs.get("quota", {})
+        errors = quota.get("errors", []) if isinstance(quota, dict) else []
+        for err in errors:
+            normalized = re.sub(r"\d+", "N", err)
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            obs_normalized = re.sub(r"\d+", "N", error_msg)
+            obs_normalized = re.sub(r"\s+", " ", obs_normalized).strip()
+            if normalized == obs_normalized:
+                has_recent = True
+                break
+        if has_recent:
+            break
+
+    if has_recent:
+        return False  # Error is still active
+
+    # Check 2: Is there a done task that fixes this error?
+    # Extract keywords from the error message for matching
+    # e.g. "nanogpt: HTTP Error N: Forbidden" → keywords: "nanogpt", "Forbidden"
+    keywords = []
+    parts = re.split(r"[:\s]+", error_msg)
+    for p in parts:
+        p_clean = re.sub(r"[^a-zA-Z]", "", p).lower()
+        if len(p_clean) >= 4 and p_clean not in ("http", "error", "urlopen", "tunnel"):
+            keywords.append(p_clean)
+    if not keywords:
+        return False  # Can't extract keywords, don't assume resolved
+
+    done_rows = query_kanban_db(
+        "SELECT title, body FROM tasks WHERE status IN ('done', 'archived') "
+        "AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 100"
+    )
+    for row in done_rows:
+        text = ((row["title"] or "") + " " + (row["body"] or "")).lower()
+        # Match if at least 2 distinctive keywords are found in the task
+        matches = sum(1 for kw in keywords if kw in text)
+        if matches >= 2:
+            log(
+                f"Error '{error_msg[:60]}' considered resolved: "
+                f"done task matches keywords {keywords}",
+            )
+            return True
+
+    return False
+
+
 def detect_recurring_errors(observations: List[Dict[str, Any]]) -> Optional[Pattern]:
     """Detect errors that appear >= ERROR_RECURRENCE_THRESHOLD times in the window.
 
     Looks at the `errors` field in observations and the `event` field for
     session_end events with errors.
+
+    Skips errors that have already been resolved (no occurrences in last 48h
+    AND a done kanban task exists that addresses the error).
     """
     error_counter = Counter()
+    error_to_observations: Dict[str, List[Dict[str, Any]]] = {}
 
     for obs in observations:
         quota = obs.get("quota", {})
@@ -266,21 +338,30 @@ def detect_recurring_errors(observations: List[Dict[str, Any]]) -> Optional[Patt
             normalized = re.sub(r"\d+", "N", err)
             normalized = re.sub(r"\s+", " ", normalized).strip()
             error_counter[normalized] += 1
+            error_to_observations.setdefault(normalized, []).append(obs)
 
     if not error_counter:
         return None
 
-    # Find the most frequent error
-    most_common = error_counter.most_common(1)[0]
-    error_msg, count = most_common
+    # Sort by frequency (most common first), then check each for eligibility
+    for error_msg, count in error_counter.most_common():
+        if count < ERROR_RECURRENCE_THRESHOLD:
+            continue
 
-    if count < ERROR_RECURRENCE_THRESHOLD:
-        return None
+        # Check if this error was already resolved (fix done + no recent occurrences)
+        if _is_error_resolved(error_msg, error_to_observations.get(error_msg, observations)):
+            log(f"Recurring error already resolved, skipping: {error_msg[:60]}")
+            continue
 
-    # Check if this error was already proposed recently
-    if _already_proposed(f"recurring_error:{error_msg[:80]}"):
-        log(f"Recurring error already proposed recently: {error_msg[:60]}")
-        return None
+        # Check if this error was already proposed recently
+        if _already_proposed(f"recurring_error:{error_msg[:80]}"):
+            log(f"Recurring error already proposed recently: {error_msg[:60]}")
+            continue
+
+        # Found an eligible error — build the proposal
+        break
+    else:
+        return None  # No eligible errors
 
     # Build proposal
     severity = "high" if count >= 5 else "medium"
@@ -587,15 +668,20 @@ def detect_crash_cluster() -> Optional[Pattern]:
 def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
     """Check if a pattern was already proposed (GR6 enforcement + cross-day dedup).
 
-    By default (*cross_day=True*), also checks if the same pattern was
-    allowed on a **previous** day within the analysis window. This prevents
-    the proposer from re-proposing the same error every day when stale
-    errors remain in the 7-day observation window but have already been
-    addressed by a prior task.
+    Checks ALL entries in the proposals file (both allowed and rejected).
+    A rejected entry still means "we already saw this pattern and decided
+    not to propose it" — re-proposing it every tick wastes the GR6 daily
+    quota and clutters the proposals file with duplicates.
+
+    By default (*cross_day=True*), also checks if the same pattern appeared
+    on a **previous** day within the analysis window. This prevents the
+    proposer from re-proposing the same error every day when stale errors
+    remain in the 7-day observation window but have already been addressed
+    by a prior task.
 
     The cross-day check matches on the ``pattern_key`` substring (e.g.
     ``recurring_error:Error 'nanogpt: HTTP Error N: Forbidden'``) appearing
-    in the ``evidence`` or ``title`` of any past allowed entry.
+    in the ``evidence`` or ``title`` of any past entry.
     """
     if not os.path.exists(PROPOSALS_FILE):
         return False
@@ -614,20 +700,24 @@ def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
                     continue
                 try:
                     entry = json.loads(line)
-                    if not entry.get("allowed"):
-                        continue
                     entry_date = entry.get("date", "")
 
-                    # Same-day dedup (GR6): no more than 1 allowed per day
+                    # Same-day dedup: any entry (allowed OR rejected) with the
+                    # same pattern blocks re-proposal today. This prevents the
+                    # 2h-cron from re-proposing a rejected pattern every tick.
                     if entry_date == today:
                         if entry.get("pattern_key") == pattern_key:
                             return True
                         if pattern_key in entry.get("title", "").lower():
                             return True
+                        # Also check evidence field (pattern_key includes evidence)
+                        if short_key and short_key in entry.get("evidence", "").lower():
+                            return True
 
-                    # Cross-day dedup: if the same pattern was allowed on a
-                    # previous day, don't re-propose. This prevents stale errors
-                    # in the observation window from generating duplicate tasks.
+                    # Cross-day dedup: if the same pattern was seen on a
+                    # previous day (allowed OR rejected), don't re-propose.
+                    # This prevents stale errors in the observation window
+                    # from generating duplicate tasks across days.
                     if cross_day and entry_date < today:
                         entry_text = (
                             entry.get("evidence", "") + " " + entry.get("title", "")

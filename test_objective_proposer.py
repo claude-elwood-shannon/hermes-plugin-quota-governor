@@ -53,6 +53,7 @@ from objective_proposer import (
     record_proposal,
     propose_objective,
     _already_proposed,
+    _is_error_resolved,
     find_validate_script,
 )
 
@@ -196,6 +197,76 @@ class TestDetectRecurringErrors(unittest.TestCase):
         self.assertIsNotNone(result)
         # The normalized error should have "N" instead of the number
         self.assertIn("N", result.evidence)
+
+    def test_resolved_error_not_detected(self):
+        """Error that was already resolved (done task + no recent occurrences) is skipped."""
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        obs = [_make_observation(errors=["nanogpt: HTTP Error 403: Forbidden"], timestamp=old_ts) for _ in range(5)]
+        # Create a kanban.db with a done task that mentions the error keywords
+        db_path = _make_kanban_db([
+            {"id": "t_fix1", "title": "OBJ-20: Fix nanogpt HTTP 403 Forbidden error", "body": "objective:OBJ-20\nFixed the 403 error.", "status": "done", "completed_at": int(datetime.now(timezone.utc).timestamp()) - 86400},
+        ])
+        with patch("objective_proposer.KANBAN_DB", db_path):
+            with patch("objective_proposer._already_proposed", return_value=False):
+                result = detect_recurring_errors(obs)
+        os.unlink(db_path)
+        self.assertIsNone(result, "Resolved error should not be detected as recurring")
+
+    def test_active_error_still_detected_with_done_task(self):
+        """Error with recent occurrences (last 48h) is still detected even if a done task exists."""
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+        obs = [_make_observation(errors=["nanogpt: HTTP Error 403: Forbidden"], timestamp=recent_ts) for _ in range(5)]
+        db_path = _make_kanban_db([
+            {"id": "t_fix1", "title": "OBJ-20: Fix nanogpt HTTP 403 Forbidden error", "body": "objective:OBJ-20\nFixed.", "status": "done", "completed_at": int(datetime.now(timezone.utc).timestamp()) - 86400},
+        ])
+        with patch("objective_proposer.KANBAN_DB", db_path):
+            with patch("objective_proposer._already_proposed", return_value=False):
+                result = detect_recurring_errors(obs)
+        os.unlink(db_path)
+        self.assertIsNotNone(result, "Active error (recent occurrences) should still be detected")
+
+
+# ── Tests: _is_error_resolved ────────────────────────────────────────────────
+
+class TestIsErrorResolved(unittest.TestCase):
+
+    def test_recent_occurrences_not_resolved(self):
+        """Error appearing in last 48h is NOT resolved."""
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+        obs = [_make_observation(errors=["nanogpt: HTTP Error 403: Forbidden"], timestamp=recent_ts)]
+        with patch("objective_proposer.query_kanban_db", return_value=[]):
+            result = _is_error_resolved("nanogpt: HTTP Error N: Forbidden", obs)
+        self.assertFalse(result)
+
+    def test_no_done_task_not_resolved(self):
+        """Error with no recent occurrences but no done task is NOT resolved."""
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        obs = [_make_observation(errors=["nanogpt: HTTP Error 403: Forbidden"], timestamp=old_ts)]
+        with patch("objective_proposer.query_kanban_db", return_value=[]):
+            result = _is_error_resolved("nanogpt: HTTP Error N: Forbidden", obs)
+        self.assertFalse(result)
+
+    def test_done_task_with_matching_keywords_is_resolved(self):
+        """Error with no recent occurrences + done task with matching keywords IS resolved."""
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        obs = [_make_observation(errors=["nanogpt: HTTP Error 403: Forbidden"], timestamp=old_ts)]
+        done_rows = [
+            {"title": "OBJ-20: Fix nanogpt HTTP 403 Forbidden error", "body": "objective:OBJ-20\nFixed."},
+        ]
+        with patch("objective_proposer.query_kanban_db", return_value=done_rows):
+            result = _is_error_resolved("nanogpt: HTTP Error N: Forbidden", obs)
+        self.assertTrue(result)
+
+    def test_done_task_with_unrelated_keywords_not_resolved(self):
+        """Done task with unrelated keywords does not mark error as resolved."""
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        obs = [_make_observation(errors=["nanogpt: HTTP Error 403: Forbidden"], timestamp=old_ts)]
+        done_rows = [
+            {"title": "OBJ-99: Unrelated task about disk cleanup", "body": "objective:OBJ-99\nCleaned temp files."},
+        ]
+        with patch("objective_proposer.query_kanban_db", return_value=done_rows):
+            result = _is_error_resolved("nanogpt: HTTP Error N: Forbidden", obs)
+        self.assertFalse(result)
 
 
 # ── Tests: detect_quota_imbalance ─────────────────────────────────────────────
@@ -413,8 +484,13 @@ class TestAlreadyProposed(unittest.TestCase):
         os.unlink(path)
         self.assertTrue(result)
 
-    def test_rejected_entry_does_not_block(self):
-        """Entry with allowed=false does not block."""
+    def test_rejected_entry_blocks_same_day(self):
+        """Entry with allowed=false (rejected by GR6) blocks same-day re-proposal.
+
+        This is the core fix for OBJ-16: without this, the proposer
+        re-proposes the same pattern every 2h cron tick, wasting the
+        GR6 daily quota and spamming the proposals file.
+        """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             entry = {
@@ -428,16 +504,57 @@ class TestAlreadyProposed(unittest.TestCase):
         with patch("objective_proposer.PROPOSALS_FILE", path):
             result = _already_proposed("recurring_error:my pattern")
         os.unlink(path)
-        self.assertFalse(result)
+        self.assertTrue(result)
 
-    def test_old_entry_does_not_block(self):
-        """Entry from a previous day does not block."""
+    def test_old_allowed_entry_blocks_cross_day(self):
+        """Allowed entry from a previous day blocks (cross-day dedup)."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
             old_date = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
             entry = {
                 "date": old_date,
                 "allowed": True,
                 "pattern_key": "recurring_error:my pattern",
+                "evidence": "Error 'my pattern' appeared 4 times in 7d",
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("recurring_error:my pattern")
+        os.unlink(path)
+        self.assertTrue(result)
+
+    def test_old_rejected_entry_blocks_cross_day(self):
+        """Rejected entry from a previous day also blocks (cross-day dedup).
+
+        A rejected proposal on a previous day means we already saw and
+        evaluated that pattern — don't re-propose it.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            old_date = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+            entry = {
+                "date": old_date,
+                "allowed": False,
+                "pattern_key": "recurring_error:my pattern",
+                "evidence": "Error 'my pattern' appeared 4 times in 7d",
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("recurring_error:my pattern")
+        os.unlink(path)
+        self.assertTrue(result)
+
+    def test_different_pattern_old_entry_does_not_block(self):
+        """Entry from a previous day with a different pattern does not block."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            old_date = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+            entry = {
+                "date": old_date,
+                "allowed": True,
+                "pattern_key": "recurring_error:completely different error",
+                "evidence": "Error 'completely different error' appeared 4 times in 7d",
             }
             f.write(json.dumps(entry) + "\n")
             path = f.name
