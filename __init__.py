@@ -31,6 +31,12 @@ Wires seven behaviours:
    reassign privacy:high tasks that the cron LLM agent misrouted to
    pr-ollama instead of pr-nanogpt (OBJ-18 follow-up).  The script is
    also run by a no-agent cron job every 5 minutes as backup.
+
+8. ``on_kanban_dispatch_tick`` hook (same hook, second spawn) — spawns
+   ``assignee-fix.py`` to deterministically reassign tasks whose
+   assignee is not a valid profile (the LLM agent sometimes invents names
+   like 'alice', violating Guardrail G1).  OBJ-08.  Same pattern as #7:
+   enforce G1 in code rather than relying on prompt compliance.
 """
 
 from __future__ import annotations
@@ -65,6 +71,12 @@ _PRIVACY_ROUTER_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "scripts",
     "privacy-router-fix.py",
+)
+
+_ASSIGNEE_FIX_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "scripts",
+    "assignee-fix.py",
 )
 
 
@@ -175,6 +187,27 @@ def _on_kanban_dispatch_tick(
         logger.debug("privacy-router-fix.py spawned after dispatch tick")
     except Exception as exc:
         logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
+
+    # OBJ-08: deterministically reassign tasks whose assignee is not a valid
+    # profile (e.g. the LLM agent invented 'alice').  Same pattern as the
+    # privacy router above — enforce G1 in code, not via prompt compliance.
+    # Runs AFTER the privacy router so privacy-routed tasks keep their
+    # (valid) profile; this only catches the remaining invalid assignees.
+    if not os.path.exists(_ASSIGNEE_FIX_SCRIPT):
+        logger.debug("assignee-fix.py not found at %s — skipping", _ASSIGNEE_FIX_SCRIPT)
+        return
+
+    try:
+        subprocess.Popen(
+            ["python3", _ASSIGNEE_FIX_SCRIPT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.debug("assignee-fix.py spawned after dispatch tick")
+    except Exception as exc:
+        logger.debug("failed to spawn assignee-fix.py: %s", exc)
 
 
 def _on_kanban_task_completed(
