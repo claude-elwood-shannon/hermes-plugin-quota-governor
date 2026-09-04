@@ -691,6 +691,11 @@ def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
     # pattern_key looks like: "recurring_error:Error 'nanogpt: HTTP Error N: Forbidden' appeared 4 times in 7d"
     # We extract the core error signature for cross-day matching.
     short_key = pattern_key.split(":", 1)[-1][:60].lower() if ":" in pattern_key else pattern_key[:60].lower()
+    # For bare-kind pattern_keys (no colon, e.g. "missing_test_coverage"),
+    # derive the kind for prefix matching against recorded entries.
+    # record_proposal() stores pattern_key as "kind:evidence", so a bare
+    # kind argument will never exactly match — we need prefix matching.
+    bare_kind = pattern_key if ":" not in pattern_key else None
 
     try:
         with open(PROPOSALS_FILE, "r", encoding="utf-8") as f:
@@ -708,6 +713,17 @@ def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
                     if entry_date == today:
                         if entry.get("pattern_key") == pattern_key:
                             return True
+                        # Kind-prefix match: when pattern_key is a bare kind
+                        # (e.g. "missing_test_coverage"), match against the
+                        # recorded pattern_kind field or pattern_key prefix.
+                        # Fixes OBJ-16: detect_missing_test_coverage() and
+                        # detect_crash_cluster() pass bare kinds, but
+                        # record_proposal() records "kind:evidence".
+                        if bare_kind:
+                            if entry.get("pattern_kind", "") == bare_kind:
+                                return True
+                            if entry.get("pattern_key", "").startswith(bare_kind + ":"):
+                                return True
                         if pattern_key in entry.get("title", "").lower():
                             return True
                         # Also check evidence field (pattern_key includes evidence)
@@ -719,6 +735,9 @@ def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
                     # This prevents stale errors in the observation window
                     # from generating duplicate tasks across days.
                     if cross_day and entry_date < today:
+                        # Kind-prefix match for bare-kind pattern_keys
+                        if bare_kind and entry.get("pattern_kind", "") == bare_kind:
+                            return True
                         entry_text = (
                             entry.get("evidence", "") + " " + entry.get("title", "")
                         ).lower()

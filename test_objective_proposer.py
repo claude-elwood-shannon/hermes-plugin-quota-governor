@@ -564,6 +564,155 @@ class TestAlreadyProposed(unittest.TestCase):
         os.unlink(path)
         self.assertFalse(result)
 
+    # ── OBJ-16 regression: bare-kind dedup ──────────────────────────────
+
+    def test_bare_kind_same_day_blocks_via_pattern_kind(self):
+        """Bare kind (e.g. 'missing_test_coverage') matches a same-day
+        recorded entry via the pattern_kind field.
+
+        This is the core OBJ-16 regression test: detect_missing_test_coverage()
+        calls _already_proposed('missing_test_coverage') (bare kind), but
+        record_proposal() stores pattern_key='missing_test_coverage:evidence'.
+        The bare kind must still match for same-day dedup.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry = {
+                "date": today,
+                "allowed": True,
+                "pattern_kind": "missing_test_coverage",
+                "pattern_key": "missing_test_coverage:Uncovered scripts: foo.py, bar.py",
+                "evidence": "Uncovered scripts: foo.py, bar.py",
+                "title": "OBJ-X: Add test coverage for uncovered plugin scripts (2 scripts)",
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("missing_test_coverage")
+        os.unlink(path)
+        self.assertTrue(result, "Bare kind must match same-day entry via pattern_kind")
+
+    def test_bare_kind_same_day_blocks_via_pattern_key_prefix(self):
+        """Bare kind matches a same-day recorded entry via pattern_key prefix
+        even when pattern_kind field is absent (backward compat)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry = {
+                "date": today,
+                "allowed": False,
+                "pattern_key": "crash_cluster:3 crashed tasks: ...",
+                "evidence": "3 crashed tasks: ...",
+                "title": "OBJ-X: Investigate crash cluster",
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("crash_cluster")
+        os.unlink(path)
+        self.assertTrue(result, "Bare kind must match same-day entry via pattern_key prefix")
+
+    def test_bare_kind_rejected_entry_blocks_same_day(self):
+        """A rejected (allowed=false) same-day entry with a matching bare
+        kind blocks re-proposal. This is the exact OBJ-16 spam scenario:
+        the first proposal is rejected by GR6, and without this fix the
+        2h cron re-proposes every tick."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry = {
+                "date": today,
+                "allowed": False,
+                "pattern_kind": "missing_test_coverage",
+                "pattern_key": "missing_test_coverage:Uncovered scripts: foo.py",
+                "evidence": "Uncovered scripts: foo.py",
+                "title": "OBJ-X: Add test coverage for uncovered plugin scripts",
+                "violations": [{"id": "GR6", "message": "Daily proposal limit reached"}],
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("missing_test_coverage")
+        os.unlink(path)
+        self.assertTrue(result, "Rejected same-day entry with bare kind must block")
+
+    def test_bare_kind_cross_day_blocks(self):
+        """Bare kind matches a previous-day recorded entry (cross-day dedup)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            old_date = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+            entry = {
+                "date": old_date,
+                "allowed": True,
+                "pattern_kind": "missing_test_coverage",
+                "pattern_key": "missing_test_coverage:Uncovered scripts: foo.py",
+                "evidence": "Uncovered scripts: foo.py",
+                "title": "OBJ-X: Add test coverage for uncovered plugin scripts",
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("missing_test_coverage")
+        os.unlink(path)
+        self.assertTrue(result, "Bare kind must match cross-day entry via pattern_kind")
+
+    def test_bare_kind_different_kind_does_not_block(self):
+        """A same-day entry with a different pattern_kind does not block a
+        bare-kind check for another kind."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry = {
+                "date": today,
+                "allowed": True,
+                "pattern_kind": "recurring_error",
+                "pattern_key": "recurring_error:some error",
+                "evidence": "Error 'some error' appeared 4 times in 7d",
+                "title": "OBJ-X: Fix recurring error",
+            }
+            f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            result = _already_proposed("missing_test_coverage")
+        os.unlink(path)
+        self.assertFalse(result, "Different pattern_kind must not block bare kind")
+
+    def test_missing_test_coverage_detector_dedup_after_record(self):
+        """End-to-end regression: after recording a missing_test_coverage
+        proposal, detect_missing_test_coverage() returns None on the next
+        call (same day). This is the exact bug scenario from OBJ-16."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scripts_dir = os.path.join(tmpdir, "scripts")
+            os.makedirs(scripts_dir)
+            # Create an uncovered script
+            with open(os.path.join(scripts_dir, "foo.py"), "w") as f:
+                f.write("# stub")
+            # No test_foo.py → uncovered
+
+            proposals_path = os.path.join(tmpdir, "proposals.jsonl")
+
+            # First call: should detect (no prior proposals)
+            with patch("objective_proposer.SCRIPT_DIR_PLUGIN", scripts_dir):
+                with patch("objective_proposer.PLUGIN_REPO", tmpdir):
+                    with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                        result1 = detect_missing_test_coverage()
+            self.assertIsNotNone(result1, "First call should detect uncovered script")
+
+            # Record the proposal (simulating what propose_objective does)
+            with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                record_proposal(result1, allowed=False,
+                    violations=[{"id": "GR6", "message": "Daily limit"}],
+                    warnings=[])
+
+            # Second call: should return None (dedup via pattern_kind)
+            with patch("objective_proposer.SCRIPT_DIR_PLUGIN", scripts_dir):
+                with patch("objective_proposer.PLUGIN_REPO", tmpdir):
+                    with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                        result2 = detect_missing_test_coverage()
+            self.assertIsNone(result2,
+                "Second call same day must return None (dedup via pattern_kind)")
+
 
 # ── Tests: record_proposal ─────────────────────────────────────────────────────
 
