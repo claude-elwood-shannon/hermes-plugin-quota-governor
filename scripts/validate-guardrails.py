@@ -520,14 +520,47 @@ def record_proposal(
     state_file: str,
     task_id: Optional[str] = None,
 ) -> None:
-    """Record a proposal (allowed or rejected) in the state file."""
+    """Record a proposal (allowed or rejected) in the state file.
+
+    Dedup: if a proposal with the same title was already recorded today,
+    skip recording a duplicate. This prevents the autonomous-task-creator
+    LLM cron from spamming the proposals file with the same rejected
+    objective every 30m tick, which exhausts GR6 and clutters the file.
+    (Fixes OBJ-16 root cause 2.)
+    """
     state_path = os.path.expanduser(state_file)
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
 
+    # Dedup: check if an entry with the same title was already recorded today.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if (entry.get("date", "") == today
+                                and entry.get("title", "") == title):
+                            # Already recorded this exact proposal today — skip.
+                            return
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            pass
+
+    # Derive a pattern_kind from the title for cross-path dedup with
+    # objective-proposer.py (which uses kind:suffix pattern_keys).
+    kind_match = re.match(r"OBJ-\d+:\s*(.+?)(?:\s*[\(\—]|$)", title)
+    pattern_kind = kind_match.group(1).strip().lower().replace(" ", "_") if kind_match else title[:40]
+
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "date": today,
         "title": title,
+        "pattern_kind": pattern_kind,
         "allowed": result.allowed,
         "violations": [{"id": v.id, "message": v.message} for v in result.violations],
         "warnings": [{"id": w.id, "message": w.message} for w in result.warnings],
@@ -536,6 +569,7 @@ def record_proposal(
         # Without this, _already_proposed() can't match entries from validate-guardrails
         # against entries from objective-proposer, causing duplicate proposals.
         "evidence": title,  # title is the best available proxy here
+        "pattern_key": f"{pattern_kind}:{title[:80]}",
     }
     if task_id:
         entry["task_id"] = task_id

@@ -551,6 +551,70 @@ class TestRecordProposal(unittest.TestCase):
             if os.path.exists(path):
                 os.unlink(path)
 
+    # ── OBJ-16 regression: validate-guardrails dedup ───────────────────────
+
+    def test_record_same_title_same_day_dedup(self):
+        """Recording the same proposal title twice on the same day writes
+        only ONE entry. This is the core OBJ-16 RC2 regression test:
+        the autonomous-task-creator LLM cron calls validate-guardrails.py
+        --record every 30m with the same title, and without dedup it
+        spams the proposals file with duplicates."""
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            result = GuardrailResult(allowed=False)
+            result.violations.append(Violation("GR6", "Daily limit"))
+            title = "OBJ-21: Fix proposer dedup bug"
+            record_proposal(title, result, path)
+            record_proposal(title, result, path)
+            record_proposal(title, result, path)
+            with open(path) as f:
+                lines = [l for l in f if l.strip()]
+            self.assertEqual(len(lines), 1,
+                "Same title same day must record only once (dedup)")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_record_different_titles_not_deduped(self):
+        """Different titles on the same day are both recorded (no false dedup)."""
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            result = GuardrailResult(allowed=True)
+            record_proposal("OBJ-30: Task A", result, path)
+            record_proposal("OBJ-31: Task B", result, path)
+            with open(path) as f:
+                lines = [l for l in f if l.strip()]
+            self.assertEqual(len(lines), 2,
+                "Different titles must both be recorded")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_record_includes_pattern_kind(self):
+        """record_proposal now includes pattern_kind and pattern_key fields
+        so cross-path dedup with objective-proposer.py works."""
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            result = GuardrailResult(allowed=True)
+            record_proposal("OBJ-30: Add test coverage for scripts", result, path)
+            with open(path) as f:
+                entry = json.loads(f.readline())
+            self.assertIn("pattern_kind", entry,
+                "record_proposal must include pattern_kind for cross-path dedup")
+            self.assertIn("pattern_key", entry,
+                "record_proposal must include pattern_key for cross-path dedup")
+            self.assertTrue(entry["pattern_key"].startswith(entry["pattern_kind"] + ":"),
+                "pattern_key must start with pattern_kind:")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
 
 # ===========================================================================
 # GuardrailResult
