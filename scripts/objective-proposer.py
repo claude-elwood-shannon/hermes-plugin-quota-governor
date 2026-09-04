@@ -816,12 +816,45 @@ def record_proposal(
     warnings: List[Dict],
     task_id: Optional[str] = None,
 ) -> None:
-    """Record a proposal in the proposals file."""
+    """Record a proposal in the proposals file.
+
+    Dedup: if an entry with the same ``pattern_kind`` was already recorded
+    today (regardless of allowed/rejected), skip appending a duplicate.
+    This is a defense-in-depth measure — ``_already_proposed`` should
+    suppress detection before we get here, but if it somehow misses (e.g.,
+    a subtle key mismatch), this prevents the proposals file from growing
+    with duplicate entries every 2h cron tick.
+
+    Fixes OBJ-16 root cause 3: record_proposal had no dedup, so even when
+    _already_proposed failed to suppress, each tick appended a new entry,
+    amplifying the spam.
+    """
     os.makedirs(os.path.dirname(PROPOSALS_FILE), exist_ok=True)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Dedup: check if an entry with the same pattern_kind already exists today.
+    if os.path.exists(PROPOSALS_FILE):
+        try:
+            with open(PROPOSALS_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing = json.loads(line)
+                        if (existing.get("date", "") == today
+                                and existing.get("pattern_kind", "") == pattern.kind):
+                            # Already recorded this pattern_kind today — skip.
+                            return
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            pass
 
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "date": today,
         "title": pattern.title,
         "pattern_kind": pattern.kind,
         "pattern_key": f"{pattern.kind}:{pattern.evidence[:80]}",

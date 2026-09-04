@@ -713,6 +713,78 @@ class TestAlreadyProposed(unittest.TestCase):
             self.assertIsNone(result2,
                 "Second call same day must return None (dedup via pattern_kind)")
 
+    def test_multi_tick_spam_scenario(self):
+        """Regression test for OBJ-16: simulates 3 cron ticks (2h apart)
+        where missing_test_coverage is detected, proposed, blocked by GR6,
+        and recorded. The second and third ticks must NOT re-detect the
+        pattern.
+
+        This reproduces the exact spam scenario: the 2h cron kept
+        re-proposing missing_test_coverage every tick because the dedup
+        wasn't matching bare-kind pattern_keys against recorded entries.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scripts_dir = os.path.join(tmpdir, "scripts")
+            os.makedirs(scripts_dir)
+            # Create an uncovered script
+            with open(os.path.join(scripts_dir, "foo.py"), "w") as f:
+                f.write("# stub")
+            # No test_foo.py → uncovered
+
+            proposals_path = os.path.join(tmpdir, "proposals.jsonl")
+
+            # ── Tick 1: first detection, no prior proposals ──
+            with patch("objective_proposer.SCRIPT_DIR_PLUGIN", scripts_dir):
+                with patch("objective_proposer.PLUGIN_REPO", tmpdir):
+                    with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                        tick1 = detect_missing_test_coverage()
+            self.assertIsNotNone(tick1, "Tick 1: should detect uncovered script")
+
+            # Simulate guardrails blocking it (GR6 daily limit) and recording
+            with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                record_proposal(tick1, allowed=False,
+                    violations=[{"id": "GR6", "message": "Daily limit"}],
+                    warnings=[])
+
+            # Verify one entry was recorded
+            with open(proposals_path) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            self.assertEqual(len(lines), 1, "Tick 1: should record 1 entry")
+
+            # ── Tick 2: should be suppressed by _already_proposed ──
+            with patch("objective_proposer.SCRIPT_DIR_PLUGIN", scripts_dir):
+                with patch("objective_proposer.PLUGIN_REPO", tmpdir):
+                    with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                        tick2 = detect_missing_test_coverage()
+            self.assertIsNone(tick2,
+                "Tick 2: must return None (dedup via pattern_kind)")
+
+            # Even if record_proposal is called again (defense-in-depth),
+            # it must NOT append a duplicate
+            with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                record_proposal(tick1, allowed=False,
+                    violations=[{"id": "GR6", "message": "Daily limit"}],
+                    warnings=[])
+
+            with open(proposals_path) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            self.assertEqual(len(lines), 1,
+                "Tick 2: record_proposal dedup must prevent duplicate entry")
+
+            # ── Tick 3: still suppressed ──
+            with patch("objective_proposer.SCRIPT_DIR_PLUGIN", scripts_dir):
+                with patch("objective_proposer.PLUGIN_REPO", tmpdir):
+                    with patch("objective_proposer.PROPOSALS_FILE", proposals_path):
+                        tick3 = detect_missing_test_coverage()
+            self.assertIsNone(tick3,
+                "Tick 3: must still return None")
+
+            # Final check: proposals file should still have only 1 entry
+            with open(proposals_path) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            self.assertEqual(len(lines), 1,
+                "After 3 ticks: proposals file must have exactly 1 entry")
+
 
 # ── Tests: record_proposal ─────────────────────────────────────────────────────
 
@@ -743,6 +815,48 @@ class TestRecordProposal(unittest.TestCase):
         self.assertEqual(entry["title"], "Test Title")
         self.assertEqual(entry["task_id"], "t_test123")
         self.assertEqual(entry["pattern_kind"], "test_kind")
+
+    def test_record_dedup_same_kind_same_day(self):
+        """record_proposal must NOT append a duplicate if an entry with the
+        same pattern_kind was already recorded today.
+
+        This is the OBJ-16 root cause 3 fix: without this dedup, every
+        2h cron tick that bypassed _already_proposed would append a new
+        entry, growing the proposals file unbounded.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix="..jsonl", delete=False) as f:
+            path = f.name
+
+        pattern = Pattern(
+            kind="missing_test_coverage",
+            severity="low",
+            title="OBJ-X: Add test coverage",
+            body="Test body",
+            evidence="Uncovered scripts: foo.py",
+            source="plugin_repo",
+        )
+
+        # First record — should write
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            record_proposal(pattern, False, [{"id": "GR6", "message": "Daily limit"}], [])
+
+        # Second record same kind same day — should skip
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            record_proposal(pattern, False, [{"id": "GR6", "message": "Daily limit"}], [])
+
+        # Third record same kind same day — should also skip
+        with patch("objective_proposer.PROPOSALS_FILE", path):
+            record_proposal(pattern, True, [], [], task_id="t_abc")
+
+        with open(path, "r") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        os.unlink(path)
+
+        self.assertEqual(len(lines), 1,
+            "record_proposal dedup: same pattern_kind same day must not duplicate")
+        entry = json.loads(lines[0])
+        self.assertFalse(entry["allowed"],
+            "First entry was rejected — must be preserved as-is")
 
 
 # ── Tests: propose_objective (dry-run vs execute) ───────────────────────────
