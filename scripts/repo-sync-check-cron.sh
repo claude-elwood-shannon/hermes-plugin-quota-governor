@@ -6,4 +6,7 @@
 # by the cron layer. On empty stdout (repo is synced), the cron stays silent.
 
 export REPO_SYNC_EXECUTE=1
+# Explicitly set HERMES_KANBAN_DB — cron daemon env may have a stale/wrong value
+# (past runs logged "Kanban DB not found at /nonexistent.db").
+export HERMES_KANBAN_DB="$HOME/.hermes/kanban.db"
 exec python3 "$(dirname "$0")/repo-sync-check.py" --execute
