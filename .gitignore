@@ -15,4 +15,5 @@ STOP
 .idea/
 *.swp
 *.swo
-*~.worktrees/
+*~
+.worktrees/
