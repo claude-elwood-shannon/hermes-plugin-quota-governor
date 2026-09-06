@@ -535,7 +535,8 @@ PROFILE_MODELS = {
 # Measured per-million prices (USD):
 #   pr-opencode:  glm-5.2 $1.40/$4.40  vs  qwen3.8-flash $0.15/$0.47 (~9x cheaper)
 #   pr-ollama:    glm-5.2 $1.40/$4.40  vs  deepseek-v4-flash $0.22/M
-#   pr-nanogpt:   zai-org/glm-5.2      vs  qwen3.5-4b (cheap local-tier model)
+#   pr-nanogpt:   zai-org/glm-5.2 (subscription-covered; cheap covered tier TBD —
+#                 qwen3.5-4b NOT covered, HTTP 402, verified Sep 7 2026)
 #
 # INTERACTIVE MODEL WARNING (Sep 7 2026, verified live — OpenCode Go console):
 # glm-5.2 via opencode-go burned 82% of the 5h window alone ($9.84 of $12)
@@ -550,7 +551,11 @@ PROFILE_MODELS = {
 # server error — also not usable.
 PROFILE_WORKER_MODELS = {
     "pr-ollama": "deepseek-v4-flash",       # $0.22/M
-    "pr-nanogpt": "qwen3.5-4b",             # cheap tier on NanoGPT
+    "pr-nanogpt": "zai-org/glm-5.2",        # Sep 7 2026: subscription-COVERED (proven by
+                                            # worker t_a5f2d953).  qwen3.5-4b returns HTTP
+                                            # 402 Insufficient balance — NOT included in the
+                                            # NanoGPT subscription, prepaid balance empty.
+                                            # Cheaper covered candidate TBD via MULTI-PROV-10.2.
     "pr-openrouter": "z-ai/glm-5.2:free",   # free tier already — keep as is
     "pr-opencode": "qwen3.8-flash",         # $0.15/$0.47/M, no peak pricing
 }

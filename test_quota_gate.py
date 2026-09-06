@@ -782,7 +782,11 @@ class TestCostModelMap(unittest.TestCase):
         self.assertNotEqual(PROFILE_MODELS["pr-opencode"],
                             PROFILE_WORKER_MODELS["pr-opencode"])
         self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "deepseek-v4-flash")
-        self.assertEqual(PROFILE_WORKER_MODELS["pr-nanogpt"], "qwen3.5-4b")
+        # Sep 7 2026: qwen3.5-4b returns HTTP 402 (not subscription-covered);
+        # zai-org/glm-5.2 is the proven covered model.  Worker==interactive is
+        # a known temporary cost compromise until MULTI-PROV-10 finds a cheaper
+        # covered model.
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-nanogpt"], "zai-org/glm-5.2")
 
     def test_deepseek_never_mapped_to_pr_opencode(self):
         """Pitfall: deepseek-v4-flash gives RegionError 403 on OpenCode Go
