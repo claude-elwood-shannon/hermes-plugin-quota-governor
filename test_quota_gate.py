@@ -715,6 +715,25 @@ class TestComputeOpenCodeGoStatus(unittest.TestCase):
         self.assertAlmostEqual(st["bottleneck_pct"], 100.0)
         self.assertAlmostEqual(st["availability"], 0.0)
 
+    def test_burning_balance_flag(self):
+        """Calibrated Sep 7 2026 (t_47640f18): when a window is exhausted the
+        API keeps serving via prepaid Zen balance — the status dict must say
+        so explicitly instead of looking like a hard block."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=100, weekly=40, monthly=20,
+                                                   r_status="rate-limited")):
+            st = compute_opencode_go_status()
+        self.assertTrue(st["burning_balance"])
+        self.assertEqual(st["bottleneck_window"], "rolling")
+        self.assertAlmostEqual(st["availability"], 0.0)
+        self.assertEqual(st["raw"]["rolling_status"], "rate-limited")
+
+    def test_no_burning_balance_when_all_ok(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=15, weekly=6, monthly=3)):
+            st = compute_opencode_go_status()
+        self.assertFalse(st["burning_balance"])
+
     def test_no_usage_data_fully_available(self):
         with patch("quota_gate.query_opencode_go",
                    return_value=self._query_result(rolling=None, weekly=None,

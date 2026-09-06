@@ -25,10 +25,19 @@ Privacy routing (Phase 2):
   The privacy level is read from the ``QUOTA_GATE_PRIVACY`` env var or
   from the ``privacy:`` field of a JSON object piped on stdin.
 
+Parked profiles (t_7da69d59, Sep 2026):
+  Providers config ``scripts/providers.json`` may mark a profile with
+  ``"parked": true`` (temporarily out of use, e.g. pr-openrouter).  Parked
+  profiles are excluded from the candidate set BEFORE recommended_profile
+  is computed, so guardrail G1 no longer logs "recommended profile
+  'pr-openrouter' not in allowed set; falling back" on every tick.  They
+  still appear in the ``providers`` array (informational, with a
+  ``parked: true`` flag).
+
 Output (last line, JSON):
   {"wakeAgent": false}  — skip this tick, all providers exhausted
   {"wakeAgent": true, "context": {
-      "providers": [...],
+      "providers": [...],              # each entry carries "parked": bool
       "recommended_profile": "pr-...",
       "recommended_model": "...",
       "recommended_worker_model": "...",   # cheap model for worker tasks
@@ -815,6 +824,16 @@ def compute_opencode_go_status():
     bottleneck_window, bottleneck_pct = max(pcts, key=lambda x: x[1])
     availability = max(100.0 - bottleneck_pct, 0.0)
 
+    # Balance-fallback detection (calibrated live Sep 7 2026, t_47640f18):
+    # when a window is exhausted (status "rate-limited") but the API keeps
+    # serving requests, OpenCode Go is burning prepaid Zen balance — money,
+    # not subscription quota.  Availability stays 0 (correct: don't route
+    # more work here), but the context must say WHY so nobody mistakes
+    # "burning paid balance" for a hard block.
+    burning_balance = any(
+        status is not None and status != "ok" for _, _, status in windows
+    )
+
     return {
         "profile": "pr-opencode",
         "provider": "opencode-go",
@@ -822,11 +841,15 @@ def compute_opencode_go_status():
         "availability": round(availability, 1),
         "bottleneck_pct": round(bottleneck_pct, 1),
         "bottleneck_window": bottleneck_window,
+        "burning_balance": burning_balance,
         "error": "",
         "raw": {
             "rolling_pct": rolling_pct,
             "weekly_pct": weekly_pct,
             "monthly_pct": monthly_pct,
+            "rolling_status": raw.get("rolling_status"),
+            "weekly_status": raw.get("weekly_status"),
+            "monthly_status": raw.get("monthly_status"),
         },
     }
 
