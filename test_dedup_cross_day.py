@@ -85,13 +85,19 @@ class TestCrossDayDedup(unittest.TestCase):
         new_pk = "recurring_error:Error 'nanogpt: HTTP Error N: Forbidden' appeared 4 times in 7d"
         self.assertFalse(_already_proposed(new_pk))
 
-    def test_rejected_proposal_not_blocked_cross_day(self):
-        """Only allowed=true entries block cross-day. Rejected ones don't."""
+    def test_rejected_proposal_also_blocked_cross_day(self):
+        """Rejected entries (allowed=False) ALSO block cross-day re-proposal.
+
+        Commit cfd5774 intentionally changed _already_proposed to check ALL
+        entries (both allowed and rejected). A rejected entry means "we already
+        saw this pattern and decided not to propose it" — re-proposing it every
+        tick wastes the GR6 daily quota and clutters the proposals file.
+        """
         yesterday = "2026-09-01"
         pk = "recurring_error:Error 'nanogpt: HTTP Error N: Forbidden' appeared 4 times in 7d"
         self._write_entry(yesterday, False, pattern_key=pk,
                          evidence="Error 'nanogpt: HTTP Error N: Forbidden' appeared 4 times in 7d")
-        self.assertFalse(_already_proposed(pk))
+        self.assertTrue(_already_proposed(pk))
 
     def test_no_file_returns_false(self):
         """No proposals file -> not already proposed."""
