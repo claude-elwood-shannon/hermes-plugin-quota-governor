@@ -522,7 +522,7 @@ PROFILE_MODELS = {
     "pr-ollama": "glm-5.2",
     "pr-nanogpt": "zai-org/glm-5.2",
     "pr-openrouter": "z-ai/glm-5.2:free",
-    "pr-opencode": "glm-5.2",  # opencode-go provider, MULTI-PROV-06
+    "pr-opencode": "glm-5.3-flash",  # opencode-go provider, MULTI-PROV-06
 }
 
 # ---------------------------------------------------------------------------
@@ -536,6 +536,12 @@ PROFILE_MODELS = {
 #   pr-opencode:  glm-5.2 $1.40/$4.40  vs  qwen3.8-flash $0.15/$0.47 (~9x cheaper)
 #   pr-ollama:    glm-5.2 $1.40/$4.40  vs  deepseek-v4-flash $0.22/M
 #   pr-nanogpt:   zai-org/glm-5.2      vs  qwen3.5-4b (cheap local-tier model)
+#
+# INTERACTIVE MODEL WARNING (Sep 7 2026, verified live — OpenCode Go console):
+# glm-5.2 via opencode-go burned 82% of the 5h window alone ($9.84 of $12)
+# while the worker (qwen3.8-flash) used 7.5% and glm-5.3-flash 3.6%.  The
+# pr-opencode interactive model is therefore glm-5.3-flash, NOT glm-5.2.
+# glm-5.2 stays interactive for pr-ollama (Ollama Cloud Pro window is wider).
 #
 # PITFALL (verified live, MULTI-PROV-07 diagnostic): deepseek-v4-flash via
 # OpenCode Go returns RegionError 403 (China-hosted, requires explicit
@@ -592,7 +598,8 @@ def peak_pricing_context(now=None):
         "affected_models": PEAK_AFFECTED_MODELS if active else {},
         "note": (
             "DeepSeek models double in price during peak hours. Current "
-            "worker models (qwen3.8-flash, glm-5.2) have no peak pricing."
+            "worker models (qwen3.8-flash, glm-5.2, glm-5.3-flash) have no "
+            "peak pricing."
         ),
     }
 

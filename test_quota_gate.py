@@ -628,7 +628,9 @@ class TestOpenCodeGoAllowedProfiles(unittest.TestCase):
         self.assertIn("pr-opencode", ALLOWED_PROFILES)
 
     def test_pr_opencode_in_profile_models(self):
-        self.assertEqual(PROFILE_MODELS.get("pr-opencode"), "glm-5.2")
+        # Sep 7 2026: glm-5.2 burned 82% of the OpenCode Go 5h window alone;
+        # interactive model switched to glm-5.3-flash (3.6% for the same work).
+        self.assertEqual(PROFILE_MODELS.get("pr-opencode"), "glm-5.3-flash")
 
     def test_pr_opencode_in_provider_preference(self):
         self.assertIn("pr-opencode", PROVIDER_PREFERENCE)
