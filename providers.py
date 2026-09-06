@@ -4,14 +4,15 @@ Each provider has a different API surface for quota/usage. This module
 normalises them into a common ``QuotaSnapshot`` dataclass so the rest of
 the governor never needs to know which provider it's talking to.
 
-Supported providers (Aug 2026):
+Supported providers (Sep 2026):
   - Ollama Cloud  — GET /api/usage (session + weekly, fractional)
   - NanoGPT       — GET /api/subscription/v1/usage (daily + monthly + weekly tokens)
   - OpenRouter    — GET /api/v1/key (USD-denominated)
+  - OpenCode Go   — GET /zen/go/v1/usage (rolling + weekly + monthly, percent)
 
 Only Ollama Cloud has session/weekly windows that map cleanly to the
-governor's "should I keep spawning workers?" decision. NanoGPT and
-OpenRouter are reported as informational context.
+governor's "should I keep spawning workers?" decision. NanoGPT,
+OpenRouter and OpenCode Go are reported as informational context.
 """
 
 from __future__ import annotations
@@ -124,6 +125,11 @@ class QuotaSnapshot:
     openrouter_usage_weekly_usd: Optional[float] = None
     openrouter_usage_monthly_usd: Optional[float] = None
 
+    # OpenCode Go (informational)
+    opencode_go_rolling_pct: Optional[float] = None
+    opencode_go_weekly_pct: Optional[float] = None
+    opencode_go_monthly_pct: Optional[float] = None
+
     # Metadata
     timestamp: str = ""
     errors: list = field(default_factory=list)
@@ -158,12 +164,14 @@ def _get_env(key: str, env_file: Optional[str] = None) -> Optional[str]:
 
     if env_file is None:
         # Try the active profile's .env first (HERMES_HOME), then
-        # pr-ollama as a legacy fallback, then the global .env.
+        # pr-ollama as a legacy fallback, then pr-opencode (OpenCode Go
+        # key lives there — MULTI-PROV-06), then the global .env.
         hermes_home = os.environ.get("HERMES_HOME", "").strip()
         candidates = []
         if hermes_home:
             candidates.append(os.path.join(hermes_home, ".env"))
         candidates.append(os.path.expanduser("~/.hermes/profiles/pr-ollama/.env"))
+        candidates.append(os.path.expanduser("~/.hermes/profiles/pr-opencode/.env"))
         candidates.append(os.path.expanduser("~/.hermes/.env"))
         for path in candidates:
             if os.path.isfile(path):
@@ -346,6 +354,80 @@ def query_openrouter() -> dict:
     return result
 
 
+def query_opencode_go() -> dict:
+    """Query OpenCode Go usage (informational).
+
+    Endpoint: GET https://opencode.ai/zen/go/v1/usage
+    Response shape (verified Sep 2026, MULTI-PROV-06):
+
+        {"usage": {
+            "rolling":  {"status": "ok", "percent": 5, "resetsAt": "..."},
+            "weekly":   {"status": "ok", "percent": 2, "resetsAt": "..."},
+            "monthly":  {"status": "ok", "percent": 1, "resetsAt": "..."}
+        }}
+
+    Unlike Ollama (0-1 fraction) and NanoGPT (percentUsed fraction),
+    ``percent`` is ALREADY 0-100 — no multiplication.
+
+    The API key lives in the pr-opencode profile .env. Falls back to
+    last-known-good cached values on transient errors (same pattern as
+    NanoGPT/OpenRouter, OBJ-20).
+
+    Pitfall (verified Sep 2026, MULTI-PROV-06): opencode.ai sits behind
+    Cloudflare, which returns ``403 error code: 1010`` (browser
+    signature ban) for urllib's default ``Python-urllib/x.y``
+    User-Agent. A custom UA header is required.
+    """
+    api_key = _get_env("OPENCODE_GO_API_KEY")
+    if not api_key:
+        return {
+            "rolling_pct": None,
+            "weekly_pct": None,
+            "monthly_pct": None,
+        }
+
+    def _do_request():
+        req = urllib.request.Request(
+            "https://opencode.ai/zen/go/v1/usage",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                # Cloudflare 1010-bans the default Python-urllib UA.
+                "User-Agent": "hermes-quota-governor/1.0",
+            },
+        )
+        with _no_proxy():
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+
+    try:
+        data = _retry_http(_do_request)
+    except Exception as exc:
+        cached = _read_cache("opencode_go")
+        if cached:
+            logger.debug("opencode_go query failed, using cached values: %s", exc)
+            cached["_cached"] = True
+            return cached
+        raise
+
+    usage = data.get("usage", {})
+    rolling = usage.get("rolling", {})
+    weekly = usage.get("weekly", {})
+    monthly = usage.get("monthly", {})
+
+    def _pct(window: dict) -> Optional[float]:
+        """Extract percent (already 0-100) from a window dict."""
+        val = window.get("percent")
+        return float(val) if val is not None else None
+
+    result = {
+        "rolling_pct": _pct(rolling),
+        "weekly_pct": _pct(weekly),
+        "monthly_pct": _pct(monthly),
+    }
+    _write_cache("opencode_go", result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Unified query
 # ---------------------------------------------------------------------------
@@ -391,5 +473,15 @@ def query_all() -> QuotaSnapshot:
     except Exception as exc:
         snapshot.errors.append(f"openrouter: {exc}")
         logger.debug("openrouter quota query failed: %s", exc)
+
+    # OpenCode Go (informational)
+    try:
+        opencode_go = query_opencode_go()
+        snapshot.opencode_go_rolling_pct = opencode_go.get("rolling_pct")
+        snapshot.opencode_go_weekly_pct = opencode_go.get("weekly_pct")
+        snapshot.opencode_go_monthly_pct = opencode_go.get("monthly_pct")
+    except Exception as exc:
+        snapshot.errors.append(f"opencode_go: {exc}")
+        logger.debug("opencode_go quota query failed: %s", exc)
 
     return snapshot

@@ -98,6 +98,9 @@ def record_observation(
             "nanogpt_daily_pct": snapshot.nanogpt_daily_pct,
             "nanogpt_weekly_tokens_pct": snapshot.nanogpt_weekly_tokens_pct,
             "openrouter_weekly_usd": snapshot.openrouter_usage_weekly_usd,
+            "opencode_go_rolling_pct": snapshot.opencode_go_rolling_pct,
+            "opencode_go_weekly_pct": snapshot.opencode_go_weekly_pct,
+            "opencode_go_monthly_pct": snapshot.opencode_go_monthly_pct,
             "errors": snapshot.errors,
         }
         # activity_cost: prefer the design-canonical key, keep the legacy
@@ -406,6 +409,25 @@ def format_status() -> str:
         lines.append(f"  Weekly:  ${snapshot.openrouter_usage_weekly_usd:.4f}")
         if snapshot.openrouter_usage_monthly_usd is not None:
             lines.append(f"  Monthly: ${snapshot.openrouter_usage_monthly_usd:.4f}")
+
+    # OpenCode Go (informational) — percent fields are already 0-100
+    if (
+        snapshot.opencode_go_rolling_pct is not None
+        or snapshot.opencode_go_weekly_pct is not None
+        or snapshot.opencode_go_monthly_pct is not None
+    ):
+        lines.append("")
+        lines.append("OpenCode Go (informational):")
+        if snapshot.opencode_go_rolling_pct is not None:
+            lines.append(f"  Rolling: {snapshot.opencode_go_rolling_pct:5.1f}%")
+        if snapshot.opencode_go_weekly_pct is not None:
+            lines.append(f"  Weekly:  {snapshot.opencode_go_weekly_pct:5.1f}%")
+        if snapshot.opencode_go_monthly_pct is not None:
+            lines.append(f"  Monthly: {snapshot.opencode_go_monthly_pct:5.1f}%")
+    else:
+        lines.append("")
+        lines.append("OpenCode Go (informational):")
+        lines.append("  Not configured — set OPENCODE_GO_API_KEY in profile .env")
 
     lines.append("")
     lines.append(f"Decision: {decision.action.upper()}")

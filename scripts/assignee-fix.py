@@ -63,11 +63,13 @@ KANBAN_DB = os.path.expanduser("~/.hermes/kanban.db")
 
 # Guardrail G1: only these profiles may receive auto-created tasks.
 # Mirrors quota-gate.py ALLOWED_PROFILES.
-ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt"}
+# pr-opencode added in MULTI-PROV-06 (OpenCode Go provider).
+ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-opencode"}
 
 # Preference order for fallback reassignment: pr-ollama first (cheaper,
-# availability-first), then pr-nanogpt.  Never pr-openrouter for auto-tasks.
-PROFILE_PREFERENCE = ["pr-ollama", "pr-nanogpt"]
+# availability-first), then pr-nanogpt, then pr-opencode (newest
+# provider).  Never pr-openrouter for auto-tasks.
+PROFILE_PREFERENCE = ["pr-ollama", "pr-nanogpt", "pr-opencode"]
 
 # Only reassign tasks in these statuses (not running, done, blocked, archived).
 # Mirrors privacy-router-fix.py REASSIGNABLE_STATUSES.

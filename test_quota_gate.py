@@ -600,5 +600,158 @@ class TestSelectProviderNonPrivacy(unittest.TestCase):
         self.assertEqual(result["profile"], "pr-ollama")  # higher avail
 
 
+# ── OpenCode Go (MULTI-PROV-06) ─────────────────────────────────────────────
+
+from quota_gate import (
+    query_opencode_go,
+    compute_opencode_go_status,
+    PROFILE_MODELS,
+)
+
+# Verified live response shape (Sep 2026, MULTI-PROV-06):
+#   {"usage": {"rolling": {"status": "ok", "percent": 5, "resetsAt": "..."},
+#              "weekly":  {"status": "ok", "percent": 2, "resetsAt": "..."},
+#              "monthly": {"status": "ok", "percent": 1, "resetsAt": "..."}}}
+_OPENCODE_GO_RAW = {
+    "usage": {
+        "rolling": {"status": "ok", "percent": 5, "resetsAt": "2026-09-06T23:44:21Z"},
+        "weekly": {"status": "ok", "percent": 2, "resetsAt": "2026-09-07T00:00:00Z"},
+        "monthly": {"status": "ok", "percent": 1, "resetsAt": "2026-10-06T18:28:47Z"},
+    }
+}
+
+
+class TestOpenCodeGoAllowedProfiles(unittest.TestCase):
+    """MULTI-PROV-06: pr-opencode joins the allowed/recommended sets."""
+
+    def test_pr_opencode_in_allowed_profiles(self):
+        self.assertIn("pr-opencode", ALLOWED_PROFILES)
+
+    def test_pr_opencode_in_profile_models(self):
+        self.assertEqual(PROFILE_MODELS.get("pr-opencode"), "glm-5.2")
+
+    def test_pr_opencode_in_provider_preference(self):
+        self.assertIn("pr-opencode", PROVIDER_PREFERENCE)
+
+    def test_opencode_go_public_only(self):
+        """opencode-go qualifies for public, NOT for sensitive/confidential."""
+        self.assertIn("opencode-go", PRIVACY_CAPABILITIES["public"])
+        self.assertNotIn("opencode-go", PRIVACY_CAPABILITIES["sensitive"])
+        self.assertNotIn("opencode-go", PRIVACY_CAPABILITIES["confidential"])
+
+
+class TestQueryOpenCodeGo(unittest.TestCase):
+    """query_opencode_go parses the live response shape correctly."""
+
+    def test_not_configured_returns_none_fields(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENCODE_GO_API_KEY", None)
+            with patch("quota_gate.get_env", return_value=None):
+                # The unconfigured path returns Nones without raising.
+                # (query_opencode_go raises via get_env in the gate — the
+                # providers.py twin returns Nones; here we assert the
+                # RuntimeError branch.)
+                with self.assertRaises(RuntimeError):
+                    query_opencode_go()
+
+    def test_parses_live_shape(self):
+        with patch("quota_gate.get_env", return_value="test-key"), \
+             patch("quota_gate._retry_http", return_value=_OPENCODE_GO_RAW):
+            result = query_opencode_go()
+        self.assertEqual(result["rolling_pct"], 5.0)
+        self.assertEqual(result["weekly_pct"], 2.0)
+        self.assertEqual(result["monthly_pct"], 1.0)
+        self.assertEqual(result["rolling_status"], "ok")
+        self.assertEqual(result["weekly_resets_at"], "2026-09-07T00:00:00Z")
+
+    def test_percent_not_multiplied(self):
+        """percent is already 0-100 — 5 must stay 5.0, not 500."""
+        with patch("quota_gate.get_env", return_value="test-key"), \
+             patch("quota_gate._retry_http", return_value=_OPENCODE_GO_RAW):
+            result = query_opencode_go()
+        self.assertEqual(result["rolling_pct"], 5.0)
+
+
+class TestComputeOpenCodeGoStatus(unittest.TestCase):
+    """compute_opencode_go_status maps windows to availability."""
+
+    def _query_result(self, rolling=5, weekly=2, monthly=1,
+                      r_status="ok", w_status="ok", m_status="ok"):
+        # rolling/weekly/monthly may be int, float, or None (no data).
+        return {
+            "rolling_pct": rolling, "weekly_pct": weekly, "monthly_pct": monthly,
+            "rolling_status": r_status, "weekly_status": w_status,
+            "monthly_status": m_status,
+            "rolling_resets_at": None, "weekly_resets_at": None,
+            "monthly_resets_at": None,
+        }
+
+    def test_normal_status(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=15, weekly=6, monthly=3)):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["profile"], "pr-opencode")
+        self.assertEqual(st["provider"], "opencode-go")
+        self.assertEqual(st["bottleneck_window"], "rolling")
+        self.assertAlmostEqual(st["bottleneck_pct"], 15.0)
+        self.assertAlmostEqual(st["availability"], 85.0)
+
+    def test_monthly_bottleneck(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=10, weekly=20, monthly=80)):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["bottleneck_window"], "monthly")
+        self.assertAlmostEqual(st["availability"], 20.0)
+
+    def test_non_ok_status_treated_as_100(self):
+        """A rate-limited window (status != ok) counts as fully used."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=5, weekly=2, monthly=1,
+                                                   w_status="rate_limited")):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["bottleneck_window"], "weekly")
+        self.assertAlmostEqual(st["bottleneck_pct"], 100.0)
+        self.assertAlmostEqual(st["availability"], 0.0)
+
+    def test_no_usage_data_fully_available(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=None, weekly=None,
+                                                   monthly=None)):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["availability"], 100.0)
+        self.assertEqual(st["bottleneck_pct"], 0.0)
+        self.assertEqual(st["bottleneck_window"], "unknown")
+
+    def test_select_provider_considers_opencode_go(self):
+        """pr-opencode wins when it has the most availability (public)."""
+        providers = [
+            _provider(profile="pr-ollama", availability=10, bottleneck=90),
+            _provider(profile="pr-opencode", availability=85, bottleneck=15,
+                      provider="opencode-go"),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-opencode")
+
+    def test_select_provider_excludes_opencode_go_for_sensitive(self):
+        """sensitive excludes opencode-go (public only, unaudited ZDR)."""
+        providers = [
+            _provider(profile="pr-ollama", availability=10, bottleneck=90),
+            _provider(profile="pr-opencode", availability=85, bottleneck=15,
+                      provider="opencode-go"),
+        ]
+        result = select_provider(providers, privacy_level="sensitive")
+        self.assertEqual(result["profile"], "pr-ollama")
+
+    def test_validate_recommended_profile_accepts_pr_opencode(self):
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-opencode",
+            {"pr-ollama", "pr-nanogpt", "pr-opencode"},
+            warnings,
+        )
+        self.assertEqual(result, "pr-opencode")
+        self.assertEqual(warnings, [])
+
+
 if __name__ == "__main__":
     unittest.main()

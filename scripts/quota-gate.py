@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """quota-gate.py — pre-run script for the autonomous task creator cron job.
 
-Queries all configured providers (Ollama Cloud, NanoGPT, OpenRouter) and
-outputs a recommended profile with the most available quota.
+Queries all configured providers (Ollama Cloud, NanoGPT, OpenRouter,
+OpenCode Go) and outputs a recommended profile with the most available
+quota.
+
+OpenCode Go (MULTI-PROV-06, Sep 2026):
+  Endpoint: GET https://opencode.ai/zen/go/v1/usage
+  Windows: rolling + weekly + monthly, ``percent`` is already 0-100.
+  The gate reports it as a full candidate (not informational) because
+  all three windows map to the availability scoring; the profile
+  pr-opencode is added to ALLOWED_PROFILES so the task creator can
+  assign to it.
 
 Privacy routing (Phase 2):
   Tasks may carry a ``privacy:`` tag in their body (public|sensitive|
@@ -47,7 +56,8 @@ import urllib.request
 
 # Guardrail G1: only these profiles may receive auto-created tasks.
 # The autonomous task creator must NEVER assign to any other profile.
-ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt"}
+# pr-opencode added in MULTI-PROV-06 (OpenCode Go provider).
+ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-opencode"}
 
 # ---------------------------------------------------------------------------
 # Privacy capability mapping (Phase 2 — privacy-by-provider-design.md §4, §7)
@@ -69,7 +79,11 @@ ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt"}
 #                 local profile configured, so confidential tasks get
 #                 wakeAgent:false with a warning.
 PRIVACY_CAPABILITIES = {
-    "public": {"ollama-cloud", "nanogpt", "openrouter", "custom"},
+    # OpenCode Go: public only — its retention/training policy is not
+    # audited (see provider-privacy-audit.md, which predates it), so we
+    # take the same conservative stance as OpenRouter without
+    # data_collection:deny. Revisit if a ZDR policy is verified.
+    "public": {"ollama-cloud", "nanogpt", "openrouter", "opencode-go", "custom"},
     "sensitive": {"ollama-cloud", "nanogpt", "custom"},
     "confidential": {"custom"},
 }
@@ -136,6 +150,10 @@ def get_env(key):
         return val
     for path in (
         os.path.expanduser("~/.hermes/profiles/pr-ollama/.env"),
+        # pr-opencode holds OPENCODE_GO_API_KEY (MULTI-PROV-06); the gate
+        # runs from the pr-ollama cron, so the active HERMES_HOME .env
+        # does not contain it.
+        os.path.expanduser("~/.hermes/profiles/pr-opencode/.env"),
         os.path.expanduser("~/.hermes/.env"),
     ):
         if os.path.isfile(path):
@@ -431,6 +449,65 @@ def query_openrouter():
     return result
 
 
+def query_opencode_go():
+    """Query OpenCode Go usage (MULTI-PROV-06). Returns dict or raises.
+
+    Endpoint: GET https://opencode.ai/zen/go/v1/usage
+    ``percent`` is already 0-100 (no fraction conversion).
+    Falls back to last-known-good cache on transient errors (OBJ-20).
+    Sends a custom User-Agent — Cloudflare 1010-bans Python-urllib.
+    """
+    api_key = get_env("OPENCODE_GO_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENCODE_GO_API_KEY not configured")
+
+    def _do_request():
+        req = urllib.request.Request(
+            "https://opencode.ai/zen/go/v1/usage",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                # Cloudflare 1010-bans the default Python-urllib UA.
+                "User-Agent": "hermes-quota-governor/1.0",
+            },
+        )
+        with _no_proxy():
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+
+    try:
+        data = _retry_http(_do_request)
+    except Exception:
+        cached = _read_cache("opencode_go")
+        if cached:
+            cached["_cached"] = True
+            return cached
+        raise
+
+    usage = data.get("usage", {})
+    rolling = usage.get("rolling", {})
+    weekly = usage.get("weekly", {})
+    monthly = usage.get("monthly", {})
+
+    def _pct(window):
+        """Extract percent (already 0-100) from a window dict."""
+        val = window.get("percent")
+        return float(val) if val is not None else None
+
+    result = {
+        "rolling_pct": _pct(rolling),
+        "weekly_pct": _pct(weekly),
+        "monthly_pct": _pct(monthly),
+        "rolling_status": rolling.get("status"),
+        "weekly_status": weekly.get("status"),
+        "monthly_status": monthly.get("status"),
+        "rolling_resets_at": rolling.get("resetsAt"),
+        "weekly_resets_at": weekly.get("resetsAt"),
+        "monthly_resets_at": monthly.get("resetsAt"),
+    }
+    _write_cache("opencode_go", result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Provider status computation
 # ---------------------------------------------------------------------------
@@ -440,6 +517,7 @@ PROFILE_MODELS = {
     "pr-ollama": "glm-5.2",
     "pr-nanogpt": "zai-org/glm-5.2",
     "pr-openrouter": "z-ai/glm-5.2:free",
+    "pr-opencode": "glm-5.2",  # opencode-go provider, MULTI-PROV-06
 }
 
 # Tie-breaking preference order (lower = preferred)
@@ -447,6 +525,7 @@ PROVIDER_PREFERENCE = {
     "pr-ollama": 0,
     "pr-nanogpt": 1,
     "pr-openrouter": 2,
+    "pr-opencode": 3,  # newest provider — lowest tie-break priority
 }
 
 
@@ -592,6 +671,66 @@ def compute_openrouter_status():
         "error": "",
         "raw": {"usage_weekly_usd": weekly_usd, "limit": limit,
                 "usage": usage, "expires_at": expires_at},
+    }
+
+
+def compute_opencode_go_status():
+    """Build a ProviderStatus dict for OpenCode Go (MULTI-PROV-06).
+
+    All three windows (rolling, weekly, monthly) contribute to the
+    bottleneck: the window with the highest percent is the bottleneck,
+    availability = 100 - bottleneck. A window whose ``status`` is not
+    "ok" (e.g. rate-limited) is treated as fully used.
+    """
+    raw = query_opencode_go()
+    rolling_pct = raw.get("rolling_pct")
+    weekly_pct = raw.get("weekly_pct")
+    monthly_pct = raw.get("monthly_pct")
+
+    windows = [
+        ("rolling", rolling_pct, raw.get("rolling_status")),
+        ("weekly", weekly_pct, raw.get("weekly_status")),
+        ("monthly", monthly_pct, raw.get("monthly_status")),
+    ]
+
+    # A non-ok status on any window means that window is exhausted
+    # (rate-limited / over quota) — treat as 100%.
+    pcts = []
+    for name, pct, status in windows:
+        if status is not None and status != "ok":
+            pcts.append((name, 100.0))
+        elif pct is not None:
+            pcts.append((name, float(pct)))
+
+    if not pcts:
+        # No usage data — assume fully available
+        return {
+            "profile": "pr-opencode",
+            "provider": "opencode-go",
+            "model": PROFILE_MODELS["pr-opencode"],
+            "availability": 100.0,
+            "bottleneck_pct": 0.0,
+            "bottleneck_window": "unknown",
+            "error": "",
+            "raw": raw,
+        }
+
+    bottleneck_window, bottleneck_pct = max(pcts, key=lambda x: x[1])
+    availability = max(100.0 - bottleneck_pct, 0.0)
+
+    return {
+        "profile": "pr-opencode",
+        "provider": "opencode-go",
+        "model": PROFILE_MODELS["pr-opencode"],
+        "availability": round(availability, 1),
+        "bottleneck_pct": round(bottleneck_pct, 1),
+        "bottleneck_window": bottleneck_window,
+        "error": "",
+        "raw": {
+            "rolling_pct": rolling_pct,
+            "weekly_pct": weekly_pct,
+            "monthly_pct": monthly_pct,
+        },
     }
 
 
@@ -858,6 +997,25 @@ def main():
                 "raw": {},
             })
             warnings.append(f"openrouter: {exc}")
+    # else: not configured — skip silently
+
+    # OpenCode Go (MULTI-PROV-06)
+    opencode_go_key = get_env("OPENCODE_GO_API_KEY")
+    if opencode_go_key:
+        try:
+            providers_list.append(compute_opencode_go_status())
+        except Exception as exc:
+            providers_list.append({
+                "profile": "pr-opencode",
+                "provider": "opencode-go",
+                "model": PROFILE_MODELS["pr-opencode"],
+                "availability": 0.0,
+                "bottleneck_pct": 100.0,
+                "bottleneck_window": "error",
+                "error": str(exc),
+                "raw": {},
+            })
+            warnings.append(f"opencode_go: {exc}")
     # else: not configured — skip silently
 
     # --- Select recommended provider (with privacy filtering) ---
