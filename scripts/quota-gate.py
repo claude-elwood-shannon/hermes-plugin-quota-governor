@@ -31,6 +31,10 @@ Output (last line, JSON):
       "providers": [...],
       "recommended_profile": "pr-...",
       "recommended_model": "...",
+      "recommended_worker_model": "...",   # cheap model for worker tasks
+      "worker_models": {profile: cheap model},     # MULTI-PROV-07
+      "interactive_models": {profile: quality model},
+      "peak_pricing": {"active": bool, ...},       # MULTI-PROV-07
       "max_task_cost": "medium|small|tiny|micro|any",
       "max_workers": N,
       "privacy_level": "public|sensitive|confidential|none",
@@ -46,6 +50,7 @@ Design references:
   - ~/.hermes/profiles/pr-ollama/docs/privacy-by-provider-design.md §7
   - ~/.hermes/profiles/pr-ollama/docs/autonomous-objectives.md §8.6
 """
+import datetime
 import json
 import os
 import subprocess
@@ -519,6 +524,86 @@ PROFILE_MODELS = {
     "pr-openrouter": "z-ai/glm-5.2:free",
     "pr-opencode": "glm-5.2",  # opencode-go provider, MULTI-PROV-06
 }
+
+# ---------------------------------------------------------------------------
+# Cost-based model selection (MULTI-PROV-07, Sep 2026)
+# ---------------------------------------------------------------------------
+# Generic rule, all providers: auto-created WORKER tasks must use the CHEAP
+# model of the assigned profile; the expensive/interactive model is reserved
+# for interactive sessions and tasks tagged cost:medium or above.
+#
+# Measured per-million prices (USD):
+#   pr-opencode:  glm-5.2 $1.40/$4.40  vs  qwen3.8-flash $0.15/$0.47 (~9x cheaper)
+#   pr-ollama:    glm-5.2 $1.40/$4.40  vs  deepseek-v4-flash $0.22/M
+#   pr-nanogpt:   zai-org/glm-5.2      vs  qwen3.5-4b (cheap local-tier model)
+#
+# PITFALL (verified live, MULTI-PROV-07 diagnostic): deepseek-v4-flash via
+# OpenCode Go returns RegionError 403 (China-hosted, requires explicit
+# account opt-in).  It is therefore ONLY usable as pr-ollama's worker model,
+# NEVER as pr-opencode's.  minimax-m2.7 on OpenCode Go fails with Internal
+# server error — also not usable.
+PROFILE_WORKER_MODELS = {
+    "pr-ollama": "deepseek-v4-flash",       # $0.22/M
+    "pr-nanogpt": "qwen3.5-4b",             # cheap tier on NanoGPT
+    "pr-openrouter": "z-ai/glm-5.2:free",   # free tier already — keep as is
+    "pr-opencode": "qwen3.8-flash",         # $0.15/$0.47/M, no peak pricing
+}
+
+# Cost tiers whose auto-created tasks must use the worker (cheap) model.
+# medium+ may use PROFILE_MODELS (interactive/quality model).
+WORKER_COST_TIERS = {"micro", "tiny", "small"}
+
+# ---------------------------------------------------------------------------
+# Peak pricing (MULTI-PROV-07)
+# ---------------------------------------------------------------------------
+# OpenCode Go / Ollama Cloud DeepSeek models double in price during peak
+# hours: Monday–Friday 01:00–04:00 UTC and 06:00–10:00 UTC.  qwen3.8-flash
+# and glm-5.2 have NO peak pricing, so today's recommended worker models
+# are unaffected — but the gate exposes peak_pricing in its context so
+# future peak-priced models can be handled without re-touching the gate.
+PEAK_WINDOWS_UTC = ((1, 4), (6, 10))  # half-open [start, end) hour ranges
+PEAK_AFFECTED_MODELS = {
+    "ollama-cloud": ["deepseek-v4-flash"],
+    "opencode-go": ["deepseek-v4-flash"],
+}
+
+
+def is_peak_hours(now=None):
+    """True if *now* (UTC, default: current time) falls in peak pricing hours.
+
+    Peak = Monday–Friday within any PEAK_WINDOWS_UTC hour range.
+    Weekends are never peak.
+    """
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    if now.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        return False
+    return any(start <= now.hour < end for start, end in PEAK_WINDOWS_UTC)
+
+
+def peak_pricing_context(now=None):
+    """Build the peak_pricing block for the gate output context."""
+    active = is_peak_hours(now)
+    return {
+        "active": active,
+        "windows_utc": [f"{s:02d}:00-{e:02d}:00" for s, e in PEAK_WINDOWS_UTC],
+        "days": "monday-friday",
+        "multiplier": 2,
+        "affected_models": PEAK_AFFECTED_MODELS if active else {},
+        "note": (
+            "DeepSeek models double in price during peak hours. Current "
+            "worker models (qwen3.8-flash, glm-5.2) have no peak pricing."
+        ),
+    }
+
+
+def worker_model_for(profile):
+    """Cheap worker model for *profile* (MULTI-PROV-07 rule).
+
+    Falls back to the interactive PROFILE_MODELS entry if the profile has
+    no cheap model mapped.
+    """
+    return PROFILE_WORKER_MODELS.get(profile, PROFILE_MODELS.get(profile))
 
 # Tie-breaking preference order (lower = preferred)
 PROVIDER_PREFERENCE = {
@@ -1095,6 +1180,15 @@ def main():
             "providers": providers_list,
             "recommended_profile": recommended["profile"],
             "recommended_model": recommended["model"],
+            "recommended_worker_model": worker_model_for(recommended["profile"]),
+            "model_selection_rule": (
+                "Workers (cost:micro/tiny/small) MUST use the profile's "
+                "cheap worker model; only cost:medium+ tasks may use the "
+                "interactive model (recommended_model)."
+            ),
+            "worker_models": PROFILE_WORKER_MODELS,
+            "interactive_models": PROFILE_MODELS,
+            "peak_pricing": peak_pricing_context(),
             "max_task_cost": max_cost,
             "max_workers": max_workers,
             "privacy_level": privacy_level or "none",

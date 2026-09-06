@@ -753,5 +753,147 @@ class TestComputeOpenCodeGoStatus(unittest.TestCase):
         self.assertEqual(warnings, [])
 
 
+# ── Cost-based model selection + peak pricing (MULTI-PROV-07) ──────────────
+
+from quota_gate import (
+    is_peak_hours,
+    peak_pricing_context,
+    worker_model_for,
+    PROFILE_WORKER_MODELS,
+    WORKER_COST_TIERS,
+    PEAK_WINDOWS_UTC,
+)
+import datetime
+
+
+class TestCostModelMap(unittest.TestCase):
+    """MULTI-PROV-07: every allowed profile has a cheap worker model."""
+
+    def test_worker_models_cover_allowed_profiles(self):
+        for profile in ALLOWED_PROFILES:
+            self.assertIn(profile, PROFILE_WORKER_MODELS,
+                          f"{profile} has no cheap worker model")
+
+    def test_worker_model_is_not_the_interactive_model(self):
+        # The whole point: worker model differs from the pricey default.
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-opencode"], "qwen3.8-flash")
+        self.assertNotEqual(PROFILE_MODELS["pr-opencode"],
+                            PROFILE_WORKER_MODELS["pr-opencode"])
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "deepseek-v4-flash")
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-nanogpt"], "qwen3.5-4b")
+
+    def test_deepseek_never_mapped_to_pr_opencode(self):
+        """Pitfall: deepseek-v4-flash gives RegionError 403 on OpenCode Go
+        (China-hosted, needs explicit opt-in). Must never be pr-opencode's."""
+        self.assertNotIn("deepseek",
+                         PROFILE_WORKER_MODELS["pr-opencode"].lower())
+
+    def test_worker_model_for_known_profile(self):
+        self.assertEqual(worker_model_for("pr-opencode"), "qwen3.8-flash")
+
+    def test_worker_model_for_unknown_profile_falls_back(self):
+        # Unknown profile → falls back to interactive model if present,
+        # else None (never crashes the gate).
+        self.assertEqual(worker_model_for("pr-openrouter"),
+                         PROFILE_MODELS["pr-openrouter"])
+        self.assertIsNone(worker_model_for("pr-nonexistent"))
+
+    def test_worker_cost_tiers(self):
+        self.assertEqual(WORKER_COST_TIERS, {"micro", "tiny", "small"})
+
+
+class TestIsPeakHours(unittest.TestCase):
+    """Peak = Mon–Fri 01:00–04:00 and 06:00–10:00 UTC (half-open ranges)."""
+
+    def _utc(self, y, mo, d, h):
+        return datetime.datetime(y, mo, d, h, tzinfo=datetime.timezone.utc)
+
+    def test_weekday_peak_windows_active(self):
+        # 2026-09-07 is a Monday
+        for hour in (1, 2, 3, 6, 7, 8, 9):
+            self.assertTrue(is_peak_hours(self._utc(2026, 9, 7, hour)),
+                            f"Monday {hour:02d}:00 should be peak")
+
+    def test_boundary_hours(self):
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 0)))
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 4)))  # end excl
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 5)))
+        self.assertTrue(is_peak_hours(self._utc(2026, 9, 7, 6)))
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 10)))  # end excl
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 23)))
+
+    def test_weekday_outside_windows_inactive(self):
+        # 2026-09-09 is a Wednesday
+        for hour in (0, 4, 5, 10, 12, 18, 23):
+            self.assertFalse(is_peak_hours(self._utc(2026, 9, 9, hour)))
+
+    def test_weekends_never_peak(self):
+        # 2026-09-05 Saturday, 2026-09-06 Sunday
+        for day in (5, 6):
+            for hour in (1, 2, 3, 6, 7, 8, 9):
+                self.assertFalse(is_peak_hours(self._utc(2026, 9, day, hour)),
+                                 f"weekend day {day} {hour:02d}:00 not peak")
+
+    def test_default_now_is_utc(self):
+        # No exception when called without args; returns bool.
+        self.assertIsInstance(is_peak_hours(), bool)
+
+    def test_windows_shape(self):
+        self.assertEqual(PEAK_WINDOWS_UTC, ((1, 4), (6, 10)))
+
+
+class TestPeakPricingContext(unittest.TestCase):
+    def test_active_context(self):
+        # Monday 2026-09-07 at 07:00 UTC → peak
+        ctx = peak_pricing_context(
+            datetime.datetime(2026, 9, 7, 7, tzinfo=datetime.timezone.utc))
+        self.assertTrue(ctx["active"])
+        self.assertEqual(ctx["windows_utc"], ["01:00-04:00", "06:00-10:00"])
+        self.assertEqual(ctx["multiplier"], 2)
+        self.assertIn("opencode-go", ctx["affected_models"])
+        self.assertIn("ollama-cloud", ctx["affected_models"])
+
+    def test_inactive_context_has_no_affected_models(self):
+        # Tuesday 12:00 UTC → off-peak
+        ctx = peak_pricing_context(
+            datetime.datetime(2026, 9, 8, 12, tzinfo=datetime.timezone.utc))
+        self.assertFalse(ctx["active"])
+        self.assertEqual(ctx["affected_models"], {})
+
+
+class TestGateOutputContainsPeakAndWorkerModel(unittest.TestCase):
+    """main()'s wakeAgent:true context must expose peak_pricing and the
+    cheap-model recommendation (the task creator consumes them)."""
+
+    def _fake_provider(self, profile="pr-opencode", provider="opencode-go",
+                       model="glm-5.2", availability=80.0, bottleneck=20.0):
+        return {"profile": profile, "provider": provider, "model": model,
+                "availability": availability, "bottleneck_pct": bottleneck,
+                "bottleneck_window": "monthly", "error": "", "raw": {}}
+
+    def test_main_context_fields(self):
+        import io
+        import contextlib
+        fake = self._fake_provider()
+        with patch.object(_mod, "parse_privacy_level", return_value=None), \
+             patch.object(_mod, "compute_ollama_status", return_value=fake), \
+             patch.object(_mod, "get_env", return_value=None), \
+             patch.object(_mod, "select_provider", return_value=dict(fake)), \
+             patch.object(_mod, "get_existing_profiles",
+                          return_value={"pr-ollama", "pr-nanogpt", "pr-opencode"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _mod.main()
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        ctx = out["context"]
+        self.assertTrue(out["wakeAgent"])
+        self.assertEqual(ctx["recommended_worker_model"], "qwen3.8-flash")
+        self.assertIn("peak_pricing", ctx)
+        self.assertIn("active", ctx["peak_pricing"])
+        self.assertIn("windows_utc", ctx["peak_pricing"])
+        self.assertEqual(ctx["worker_models"]["pr-opencode"], "qwen3.8-flash")
+        self.assertIn("model_selection_rule", ctx)
+
+
 if __name__ == "__main__":
     unittest.main()
