@@ -49,6 +49,8 @@ from quota_gate import (
     _normalise_privacy_value,
     validate_recommended_profile,
     get_existing_profiles,
+    load_providers_config,
+    get_parked_profiles,
     _retry_http,
     _read_cache,
     _write_cache,
@@ -918,6 +920,140 @@ class TestGateOutputContainsPeakAndWorkerModel(unittest.TestCase):
         self.assertIn("windows_utc", ctx["peak_pricing"])
         self.assertEqual(ctx["worker_models"]["pr-opencode"], "qwen3.8-flash")
         self.assertIn("model_selection_rule", ctx)
+
+
+# ── Parked profiles (t_7da69d59) ────────────────────────────────────────────
+
+class TestProvidersConfig(unittest.TestCase):
+    """providers.json loading + parked set extraction."""
+
+    def test_repo_config_parks_pr_openrouter(self):
+        """AC: pr-openrouter is marked parked:true in the shipped config."""
+        cfg = load_providers_config()  # reads scripts/providers.json
+        self.assertIn("pr-openrouter", cfg)
+        self.assertTrue(cfg["pr-openrouter"].get("parked") is True)
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(load_providers_config("/nonexistent/providers.json"), {})
+
+    def test_malformed_json_returns_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{not json")
+            path = f.name
+        try:
+            self.assertEqual(load_providers_config(path), {})
+        finally:
+            os.unlink(path)
+
+    def test_wrong_shape_returns_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(["unexpected", "list"], f)
+            path = f.name
+        try:
+            self.assertEqual(load_providers_config(path), {})
+        finally:
+            os.unlink(path)
+
+    def test_get_parked_profiles_filters_true_only(self):
+        cfg = {
+            "pr-openrouter": {"parked": True},
+            "pr-ollama": {"parked": False},
+            "pr-vllm": {"reason": "no parked key"},
+            42: "not-a-dict",
+        }
+        self.assertEqual(get_parked_profiles(cfg), {"pr-openrouter"})
+
+
+class TestParkedSelection(unittest.TestCase):
+    """select_provider removes parked profiles BEFORE ranking (G1 silent)."""
+
+    def test_parked_profile_never_recommended(self):
+        """pr-openrouter wins on availability but is parked → nanogpt picks."""
+        providers = [
+            _provider(profile="pr-ollama", availability=40),
+            _provider(profile="pr-nanogpt", availability=50),
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+        ]
+        result = select_provider(providers, parked={"pr-openrouter"})
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_parked_none_keeps_legacy_behavior(self):
+        providers = [
+            _provider(profile="pr-nanogpt", availability=50),
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-openrouter")
+
+    def test_all_candidates_parked_returns_none(self):
+        providers = [
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+        ]
+        result = select_provider(providers, parked={"pr-openrouter"})
+        self.assertIsNone(result)
+
+    def test_fallback_skips_parked_profiles(self):
+        """G1 fallback must not resurrect a parked profile."""
+        providers = [
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+            _provider(profile="pr-nanogpt", availability=10),
+        ]
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-evil", {"pr-ollama", "pr-nanogpt", "pr-openrouter"}, warnings,
+            providers_list=providers,
+            parked={"pr-nanogpt"},
+        )
+        # pr-nanogpt parked → excluded from fallback despite availability>0;
+        # pr-openrouter not in ALLOWED_PROFILES → nothing qualifies except…
+        # none of the remaining allowed profiles have availability, so
+        # falls through to the "no allowed profile" warning.
+        self.assertIsNone(result)
+        self.assertTrue(any("no allowed profile" in w for w in warnings))
+
+
+class TestGateMainParked(unittest.TestCase):
+    """End-to-end: parked pr-openrouter top-availability → clean recommendation."""
+
+    def _fp(self, profile, provider, availability, model="m"):
+        return {"profile": profile, "provider": provider, "model": model,
+                "availability": availability, "bottleneck_pct": 100 - availability,
+                "bottleneck_window": "weekly", "error": "", "raw": {}}
+
+    def test_main_no_g1_warning_with_parked_openrouter(self):
+        import io
+        import contextlib
+        ollama = self._fp("pr-ollama", "ollama-cloud", 40)
+        orouter = self._fp("pr-openrouter", "openrouter", 100)
+
+        def fake_get_env(key):
+            return "k" if key == "OPENROUTER_API_KEY" else None
+
+        with patch.object(_mod, "parse_privacy_level", return_value=None), \
+             patch.object(_mod, "compute_ollama_status", return_value=ollama), \
+             patch.object(_mod, "compute_openrouter_status", return_value=orouter), \
+             patch.object(_mod, "get_env", side_effect=fake_get_env), \
+             patch.object(_mod, "load_providers_config",
+                          return_value={"pr-openrouter": {"parked": True}}), \
+             patch.object(_mod, "get_existing_profiles",
+                          return_value={"pr-ollama", "pr-nanogpt",
+                                        "pr-openrouter", "pr-opencode"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _mod.main()
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        ctx = out["context"]
+        # Recommendation goes to the best NON-parked profile, silently.
+        self.assertEqual(ctx["recommended_profile"], "pr-ollama")
+        self.assertNotIn("not in allowed set", ctx.get("warning") or "")
+        # Parked profile stays visible for observability, flagged.
+        by_profile = {p["profile"]: p for p in ctx["providers"]}
+        self.assertTrue(by_profile["pr-openrouter"]["parked"])
+        self.assertFalse(by_profile["pr-ollama"]["parked"])
 
 
 if __name__ == "__main__":

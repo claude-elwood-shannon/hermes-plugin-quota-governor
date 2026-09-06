@@ -154,6 +154,49 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
+# Providers config (parked profiles — t_7da69d59)
+# ---------------------------------------------------------------------------
+
+PROVIDERS_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "providers.json"
+)
+
+
+def load_providers_config(path=None):
+    """Read providers.json (provider-profile config). Returns {} if absent.
+
+    Format: {"providers": {"<profile>": {"parked": bool, "reason": str}}}
+    Malformed JSON must never break the gate — fall back to {} silently.
+    """
+    if path is None:
+        path = PROVIDERS_CONFIG_PATH
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("providers"), dict):
+            return data["providers"]
+        return {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def get_parked_profiles(config=None):
+    """Set of profile names marked parked:true — temporarily out of use.
+
+    Parked profiles are excluded from the candidate set BEFORE
+    recommended_profile is computed (t_7da69d59), so guardrail G1 does
+    not warn-and-fall-back on every tick when e.g. pr-openrouter wins
+    availability ranking.
+    """
+    if config is None:
+        config = load_providers_config()
+    return {
+        name for name, cfg in config.items()
+        if isinstance(cfg, dict) and cfg.get("parked") is True
+    }
+
+
+# ---------------------------------------------------------------------------
 # Environment helpers
 # ---------------------------------------------------------------------------
 
@@ -290,14 +333,21 @@ def get_existing_profiles():
     return profiles
 
 
-def validate_recommended_profile(recommended, existing, warnings, providers_list=None):
+def validate_recommended_profile(recommended, existing, warnings,
+                                 providers_list=None, parked=None):
     """Return a profile that is safe to assign tasks to.
 
     Guardrail G1: the recommended profile must (a) exist on the host and
     (b) be in ALLOWED_PROFILES. If it is not, fall back to the allowed
     provider with the highest availability from providers_list (not
     alphabetical order). Returns None if no allowed profile qualifies.
+
+    *parked* (t_7da69d59): profiles excluded from the fallback too. In
+    the normal flow parked profiles never reach this function (they are
+    filtered in select_provider first), so the G1 warning for a parked
+    profile is no longer emitted on every tick.
     """
+    parked = parked or set()
     if recommended in existing and recommended in ALLOWED_PROFILES:
         return recommended
 
@@ -321,6 +371,7 @@ def validate_recommended_profile(recommended, existing, warnings, providers_list
             p for p in providers_list
             if p["profile"] in ALLOWED_PROFILES
             and p["profile"] in existing
+            and p["profile"] not in parked
             and not p["error"]
             and p["availability"] > 0
         ]
@@ -982,8 +1033,15 @@ def parse_privacy_level():
     return None
 
 
-def select_provider(providers_list, privacy_level=None):
+def select_provider(providers_list, privacy_level=None, parked=None):
     """Pick the provider with the most available quota.
+
+    *parked* (t_7da69d59): set of profile names marked ``parked: true`` in
+    providers.json.  Parked profiles are removed from the candidate set
+    here — BEFORE any recommendation is computed — so a parked profile can
+    never become recommended_profile and trigger the G1 warn-and-fallback
+    warning on every tick.  None → no parked filtering (tests / callers
+    without config).
 
     If *privacy_level* is given (public|sensitive|confidential), providers
     are first filtered to those capable of handling that privacy level
@@ -1008,6 +1066,9 @@ def select_provider(providers_list, privacy_level=None):
             # Errored providers are excluded from selection
             continue
         if p["availability"] <= 0:
+            continue
+        # Parked profiles never enter the candidate set (t_7da69d59)
+        if parked and p["profile"] in parked:
             continue
         # Privacy filtering: skip providers that can't handle this level
         if privacy_level:
@@ -1138,8 +1199,18 @@ def main():
             warnings.append(f"opencode_go: {exc}")
     # else: not configured — skip silently
 
+    # --- Parked profiles (t_7da69d59) ---
+    # Providers config may park profiles temporarily (e.g. pr-openrouter).
+    # Parked profiles stay in the providers array for observability but are
+    # excluded from selection BEFORE recommended_profile is computed, so
+    # guardrail G1 does not warn-and-fall-back every tick.
+    parked = get_parked_profiles()
+    for p in providers_list:
+        p["parked"] = p["profile"] in parked
+
     # --- Select recommended provider (with privacy filtering) ---
-    recommended = select_provider(providers_list, privacy_level=privacy_level)
+    recommended = select_provider(providers_list, privacy_level=privacy_level,
+                                  parked=parked)
 
     # If privacy filtering eliminated all candidates, warn
     if recommended is None and privacy_level:
@@ -1158,6 +1229,7 @@ def main():
         recommended_profile = validate_recommended_profile(
             recommended["profile"], existing_profiles, warnings,
             providers_list=providers_list,
+            parked=parked,
         )
         if recommended_profile is None:
             # No allowed profile exists on host — do not create any task.

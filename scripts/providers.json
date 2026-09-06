@@ -1,0 +1,10 @@
+{
+  "_comment": "Provider-profile configuration for quota-gate.py (t_7da69d59). A profile with parked:true is temporarily out of use: the gate excludes it from recommended_profile candidates BEFORE selection, so guardrail G1 no longer falls back with a warning on every tick. To un-park a profile, set parked:false or remove its entry. Unknown profiles are ignored.",
+  "providers": {
+    "pr-openrouter": {
+      "parked": true,
+      "reason": "Profile aparcado: clave OpenRouter caduca 2026-09-10 y el perfil esta fuera de uso (excluido de valid_profiles del task creator desde MULTI-PROV-07).",
+      "updated": "2026-09-07"
+    }
+  }
+}
