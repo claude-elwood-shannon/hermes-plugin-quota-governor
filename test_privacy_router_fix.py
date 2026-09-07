@@ -43,8 +43,11 @@ _spec.loader.exec_module(_mod)
 from privacy_router_fix import (
     parse_privacy_tag,
     is_sensitive,
+    is_confidential,
     find_misrouted_sensitive_tasks,
+    find_misrouted_confidential_tasks,
     SENSITIVE_TAGS,
+    CONFIDENTIAL_TAGS,
     REASSIGNABLE_STATUSES,
 )
 
@@ -308,6 +311,187 @@ class TestConstants(unittest.TestCase):
         self.assertNotIn("running", REASSIGNABLE_STATUSES)
         self.assertNotIn("done", REASSIGNABLE_STATUSES)
         self.assertNotIn("blocked", REASSIGNABLE_STATUSES)
+
+
+# ── Tests: is_confidential (OBJ-18 S2) ───────────────────────────────────────
+
+class TestIsConfidential(unittest.TestCase):
+
+    def test_confidential_is_confidential(self):
+        self.assertTrue(is_confidential("confidential"))
+
+    def test_conf_alias_is_confidential(self):
+        self.assertTrue(is_confidential("conf"))
+
+    def test_intimo_alias_is_confidential(self):
+        self.assertTrue(is_confidential("intimo"))
+
+    def test_high_not_confidential(self):
+        self.assertFalse(is_confidential("high"))
+
+    def test_sensitive_not_confidential(self):
+        self.assertFalse(is_confidential("sensitive"))
+
+    def test_medium_not_confidential(self):
+        self.assertFalse(is_confidential("medium"))
+
+    def test_low_not_confidential(self):
+        self.assertFalse(is_confidential("low"))
+
+    def test_public_not_confidential(self):
+        self.assertFalse(is_confidential("public"))
+
+    def test_case_insensitive(self):
+        self.assertTrue(is_confidential("CONFIDENTIAL"))
+        self.assertTrue(is_confidential("Conf"))
+        self.assertTrue(is_confidential("INTIMO"))
+
+    def test_none_not_confidential(self):
+        self.assertFalse(is_confidential(None))
+
+    def test_empty_not_confidential(self):
+        self.assertFalse(is_confidential(""))
+
+    def test_unknown_not_confidential(self):
+        self.assertFalse(is_confidential("unknown"))
+
+
+# ── Tests: find_misrouted_confidential_tasks (OBJ-18 S2) ─────────────────────
+
+class TestFindMisroutedConfidentialTasks(unittest.TestCase):
+
+    def test_finds_confidential_on_cloud_provider(self):
+        """Task with privacy:confidential assigned to any cloud → found."""
+        db = _make_kanban_db([
+            {"id": "t_c01", "body": "privacy:confidential\ntask body",
+             "assignee": "pr-ollama", "status": "todo"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "t_c01")
+        self.assertEqual(result[0][2], "pr-ollama")
+        self.assertEqual(result[0][3], "confidential")
+
+    def test_finds_conf_alias_on_cloud_provider(self):
+        """privacy:conf alias also detected as confidential misroute."""
+        db = _make_kanban_db([
+            {"id": "t_c02", "body": "privacy:conf\ntask body",
+             "assignee": "pr-nanogpt", "status": "ready"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][3], "conf")
+
+    def test_finds_intimo_alias_on_cloud_provider(self):
+        """privacy:intimo alias also detected as confidential misroute."""
+        db = _make_kanban_db([
+            {"id": "t_c03", "body": "privacy:intimo\ntask body",
+             "assignee": "pr-opencode", "status": "triage"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][3], "intimo")
+
+    def test_skips_sensitive_tasks(self):
+        """privacy:high is sensitive, not confidential — not flagged here."""
+        db = _make_kanban_db([
+            {"id": "t_c04", "body": "privacy:high\ntask body",
+             "assignee": "pr-ollama", "status": "todo"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(result, [])
+
+    def test_skips_public_tasks(self):
+        """privacy:low is public, not confidential — not flagged."""
+        db = _make_kanban_db([
+            {"id": "t_c05", "body": "privacy:low\ntask body",
+             "assignee": "pr-ollama", "status": "todo"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(result, [])
+
+    def test_skips_done_tasks(self):
+        """Done tasks are excluded."""
+        db = _make_kanban_db([
+            {"id": "t_c06", "body": "privacy:confidential",
+             "assignee": "pr-ollama", "status": "done"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(result, [])
+
+    def test_skips_running_tasks(self):
+        """Running tasks must never be touched."""
+        db = _make_kanban_db([
+            {"id": "t_c07", "body": "privacy:confidential",
+             "assignee": "pr-ollama", "status": "running"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(result, [])
+
+    def test_finds_multiple_confidential(self):
+        """Multiple confidential tasks on different cloud providers."""
+        db = _make_kanban_db([
+            {"id": "t_c08", "body": "privacy:confidential",
+             "assignee": "pr-ollama", "status": "todo"},
+            {"id": "t_c09", "body": "privacy:conf",
+             "assignee": "pr-nanogpt", "status": "ready"},
+            {"id": "t_c10", "body": "privacy:high",
+             "assignee": "pr-ollama", "status": "triage"},
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(len(result), 2)  # c08 + c09, not c10 (high)
+
+    def test_empty_db(self):
+        db = _make_kanban_db([])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_confidential_tasks(conn)
+        conn.close()
+        self.assertEqual(result, [])
+
+
+# ── Tests: CONFIDENTIAL_TAGS constant ─────────────────────────────────────────
+
+class TestConfidentialConstants(unittest.TestCase):
+
+    def test_confidential_tags(self):
+        self.assertIn("confidential", CONFIDENTIAL_TAGS)
+        self.assertIn("conf", CONFIDENTIAL_TAGS)
+        self.assertIn("intimo", CONFIDENTIAL_TAGS)
+        self.assertNotIn("high", CONFIDENTIAL_TAGS)
+        self.assertNotIn("sensitive", CONFIDENTIAL_TAGS)
+        self.assertNotIn("low", CONFIDENTIAL_TAGS)
+        self.assertNotIn("public", CONFIDENTIAL_TAGS)
+
+    def test_sensitive_and_confidential_disjoint(self):
+        """No tag should be both sensitive and confidential."""
+        self.assertEqual(
+            SENSITIVE_TAGS & CONFIDENTIAL_TAGS, set()
+        )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,12 @@ How it works:
      touches `running` tasks (assign_task refuses running tasks anyway).
   5. Idempotent: a task already correctly assigned is a no-op.
 
+  Additionally (OBJ-18 S2):
+  6. Scans for `privacy:confidential` tasks assigned to ANY cloud provider.
+     Confidential data must never leave the host. Since no local provider
+     is configured on this host, these tasks cannot be reassigned — they
+     are flagged with a WARNING on stderr so the operator can intervene.
+
 This script is wired two ways:
   - Plugin hook `on_kanban_dispatch_tick` (near-real-time, ~60s after tick)
   - No-agent cron job every 5 minutes (backup)
@@ -61,6 +67,9 @@ REASSIGNABLE_STATUSES = {"ready", "todo", "triage"}
 # Privacy tags that trigger sensitive routing
 SENSITIVE_TAGS = {"high", "sensitive", "medium"}
 
+# Privacy tags that trigger confidential routing (stricter than sensitive)
+CONFIDENTIAL_TAGS = {"confidential", "conf", "intimo"}
+
 
 # ── Privacy tag parsing ──────────────────────────────────────────────────────
 
@@ -86,6 +95,18 @@ def is_sensitive(privacy_value: Optional[str]) -> bool:
     if not privacy_value:
         return False
     return privacy_value.lower() in SENSITIVE_TAGS
+
+
+def is_confidential(privacy_value: Optional[str]) -> bool:
+    """Check if a privacy value maps to confidential routing.
+
+    Confidential is stricter than sensitive: data must never leave the host.
+    On this host no local provider is configured, so confidential tasks
+    cannot be routed to ANY cloud provider — they should be flagged.
+    """
+    if not privacy_value:
+        return False
+    return privacy_value.lower() in CONFIDENTIAL_TAGS
 
 
 # ── Privacy gate query ──────────────────────────────────────────────────────
@@ -151,7 +172,7 @@ def find_misrouted_sensitive_tasks(
 ) -> list:
     """Find tasks with privacy:high/sensitive assigned to the wrong profile.
 
-    Returns a list of (task_id, title, assignee, privacy_value) tuples.
+    Returns a list of (task_id, title, assignee, privacy_value, status) tuples.
     """
     misrouted = []
     rows = conn.execute(
@@ -164,6 +185,30 @@ def find_misrouted_sensitive_tasks(
         privacy_value = parse_privacy_tag(body)
         if is_sensitive(privacy_value) and assignee != correct_profile:
             misrouted.append((task_id, title, assignee, privacy_value, status))
+
+    return misrouted
+
+
+def find_misrouted_confidential_tasks(conn: sqlite3.Connection) -> list:
+    """Find confidential tasks assigned to ANY cloud provider.
+
+    Confidential data must never leave the host. On this host no local
+    provider is configured, so ANY cloud assignee is a misroute.
+    Returns a list of (task_id, title, assignee, privacy_value, status) tuples.
+    """
+    misrouted = []
+    rows = conn.execute(
+        "SELECT id, title, body, assignee, status FROM tasks "
+        "WHERE status NOT IN ('done', 'archived', 'blocked', 'running')",
+    ).fetchall()
+
+    for row in rows:
+        task_id, title, body, assignee, status = row
+        privacy_value = parse_privacy_tag(body)
+        if is_confidential(privacy_value) and assignee is not None:
+            misrouted.append(
+                (task_id, title, assignee, privacy_value, status)
+            )
 
     return misrouted
 
@@ -221,15 +266,18 @@ def main():
     conn.row_factory = sqlite3.Row
     try:
         misrouted = find_misrouted_sensitive_tasks(conn, correct_profile)
+        # Also find confidential tasks on any cloud provider (no local
+        # provider exists, so any cloud assignee is a misroute).
+        confidential_misrouted = find_misrouted_confidential_tasks(conn)
     finally:
         conn.close()
 
-    if not misrouted:
+    if not misrouted and not confidential_misrouted:
         if args.verbose:
-            print("VERBOSE: no misrouted sensitive tasks found")
+            print("VERBOSE: no misrouted sensitive or confidential tasks found")
         return  # silent, nothing to do
 
-    # 3. Reassign
+    # 3. Reassign sensitive tasks
     reassigned = 0
     for task_id, title, current_assignee, privacy_value, status in misrouted:
         if args.dry_run:
@@ -257,6 +305,18 @@ def main():
     if not args.dry_run and reassigned:
         # Non-empty stdout ensures the cron layer delivers this
         pass
+
+    # 4. Flag confidential tasks (cannot reassign — no local provider)
+    for task_id, title, current_assignee, privacy_value, status in confidential_misrouted:
+        msg = (
+            f"WARNING: {task_id} ({status}) has privacy:{privacy_value} "
+            f"but is assigned to cloud profile {current_assignee} — "
+            f"no local provider configured, cannot reassign"
+        )
+        if args.dry_run:
+            print(f"DRY-RUN: {msg}")
+        else:
+            print(msg, file=sys.stderr)
 
 
 if __name__ == "__main__":

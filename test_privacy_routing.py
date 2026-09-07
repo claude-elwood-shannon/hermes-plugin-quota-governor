@@ -347,8 +347,8 @@ check("e2e none → privacy_level none",
       out["context"]["privacy_level"] == "none")
 
 
-# -----------------------------------------------------------------------
-# Test 9: End-to-end alias routing (OBJ-18: high→NanoGPT, low→Ollama)
+# -----------------------------------------------------------------------#
+# Test 9: Alias routing (OBJ-18: high→NanoGPT, low→Ollama)
 # -----------------------------------------------------------------------
 print("\n--- Test 9: Alias routing (high→NanoGPT, low→Ollama) ---")
 
@@ -533,9 +533,201 @@ check("public 3-prov: availability-first → openrouter (100%)",
       f"got {result['profile'] if result else 'None'}")
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
+# Test 12: stdin JSON privacy level (OBJ-18 S2)
+# ---------------------------------------------------------------------------#
+print("\n--- Test 12: stdin JSON privacy level ---")
+
+# parse_privacy_level reads from stdin JSON when env var is not set.
+# We simulate this by piping JSON to a subprocess that calls the function.
+import subprocess as _sp
+
+def _parse_privacy_via_stdin(json_str):
+    """Run parse_privacy_level with stdin JSON (no env var set)."""
+    code = (
+        "import sys, json, os, importlib.util\n"
+        "os.environ.pop('QUOTA_GATE_PRIVACY', None)\n"
+        f"_spec = importlib.util.spec_from_file_location('qg', "
+        f"'{os.path.join(SCRIPTS_DIR, 'quota-gate.py')}')\n"
+        "qg = importlib.util.module_from_spec(_spec)\n"
+        "_spec.loader.exec_module(qg)\n"
+        "print(qg.parse_privacy_level())\n"
+    )
+    proc = _sp.run(
+        [sys.executable, "-c", code],
+        input=json_str, capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        return None
+    val = proc.stdout.strip()
+    return val if val != "None" else None
+
+# Note: parse_privacy_level reads stdin only when not a tty.
+# In subprocess, stdin is a pipe (not a tty), so it reads the JSON.
+check("stdin JSON {\"privacy\": \"sensitive\"} → sensitive",
+      _parse_privacy_via_stdin('{"privacy": "sensitive"}') == "sensitive")
+check("stdin JSON {\"privacy_level\": \"confidential\"} → confidential",
+      _parse_privacy_via_stdin('{"privacy_level": "confidential"}') == "confidential")
+check("stdin JSON {\"privacy\": \"high\"} → sensitive (alias)",
+      _parse_privacy_via_stdin('{"privacy": "high"}') == "sensitive")
+check("stdin JSON {\"privacy\": \"low\"} → public (alias)",
+      _parse_privacy_via_stdin('{"privacy": "low"}') == "public")
+check("stdin JSON {\"privacy\": \"medium\"} → sensitive (alias)",
+      _parse_privacy_via_stdin('{"privacy": "medium"}') == "sensitive")
+check("stdin JSON with no privacy field → None",
+      _parse_privacy_via_stdin('{"objective": "OBJ-18"}') is None)
+check("stdin JSON empty {} → None",
+      _parse_privacy_via_stdin('{}') is None)
+
+
+# ---------------------------------------------------------------------------#
+# Test 13: Confidential routing (OBJ-18 S2 — harden)
+# ---------------------------------------------------------------------------#
+print("\n--- Test 13: Confidential routing ---")
+
+# Confidential with no local provider → None (wakeAgent:false)
+mock_cloud_only = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 90.0, "bottleneck_pct": 10.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+]
+
+result = quota_gate.select_provider(mock_cloud_only, privacy_level="confidential")
+check("confidential → no local provider → None",
+      result is None,
+      f"got {result}")
+
+# Confidential excludes ALL cloud providers even if they have high availability
+check("confidential → ollama-cloud NOT capable",
+      "confidential" not in quota_gate._PROVIDER_PRIVACY.get("ollama-cloud", set()))
+check("confidential → nanogpt NOT capable",
+      "confidential" not in quota_gate._PROVIDER_PRIVACY.get("nanogpt", set()))
+check("confidential → openrouter NOT capable",
+      "confidential" not in quota_gate._PROVIDER_PRIVACY.get("openrouter", set()))
+check("confidential → custom IS capable",
+      "confidential" in quota_gate._PROVIDER_PRIVACY.get("custom", set()))
+
+# E2E: confidential → wakeAgent:false with warning
+out_conf = simulate_main(mock_cloud_only, "confidential")
+check("e2e confidential → wakeAgent:false",
+      out_conf["wakeAgent"] is False)
+check("e2e confidential → warning mentions privacy exclusion",
+      "privacy:confidential excludes" in (out_conf["context"]["warning"] or ""),
+      f"warning: {out_conf['context']['warning']}")
+
+# Confidential with local provider → picks custom (preference-first)
+mock_with_local_conf = mock_cloud_only + [
+    {"profile": "pr-local", "provider": "custom", "model": "llama3.2:3b",
+     "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "local",
+     "error": "", "raw": {}},
+]
+result = quota_gate.select_provider(mock_with_local_conf, privacy_level="confidential")
+check("confidential → local provider available → picks custom",
+      result is not None and result["provider"] == "custom",
+      f"got {result['provider'] if result else 'None'}")
+
+# Confidential preference-first: even if ollama has 100% avail, custom wins
+mock_conf_extreme = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-local", "provider": "custom", "model": "llama3.2:3b",
+     "availability": 1.0, "bottleneck_pct": 99.0, "bottleneck_window": "local",
+     "error": "", "raw": {}},
+]
+result = quota_gate.select_provider(mock_conf_extreme, privacy_level="confidential")
+check("confidential preference-first: ollama=100, custom=1 → custom wins",
+      result is not None and result["provider"] == "custom",
+      f"got {result['provider'] if result else 'None'}")
+
+# Confidential via env var alias: privacy:conf → confidential
+conf_env_level = quota_gate.parse_privacy_tag("privacy:conf")
+check("parse_privacy_tag('privacy:conf') → confidential",
+      conf_env_level == "confidential",
+      f"got {conf_env_level}")
+
+# Confidential via env var alias: privacy:intimo → confidential
+intimo_level = quota_gate.parse_privacy_tag("privacy:intimo")
+check("parse_privacy_tag('privacy:intimo') → confidential",
+      intimo_level == "confidential",
+      f"got {intimo_level}")
+
+
+# ---------------------------------------------------------------------------#
+# Test 14: Sensitive excludes OpenCode Go (OBJ-18 S2 — harden)
+# ---------------------------------------------------------------------------#
+print("\n--- Test 14: Sensitive excludes OpenCode Go ---")
+
+# OpenCode Go (opencode-go) is public-only per the privacy matrix.
+# It must NOT appear in PRIVACY_CAPABILITIES["sensitive"].
+check("opencode-go in public capabilities",
+      "opencode-go" in quota_gate.PRIVACY_CAPABILITIES["public"])
+check("opencode-go NOT in sensitive capabilities",
+      "opencode-go" not in quota_gate.PRIVACY_CAPABILITIES["sensitive"])
+check("opencode-go NOT in confidential capabilities",
+      "opencode-go" not in quota_gate.PRIVACY_CAPABILITIES["confidential"])
+
+# Verify routing: a sensitive task with opencode-go available → excluded
+mock_with_opencode = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 10.0, "bottleneck_pct": 90.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-opencode", "provider": "opencode-go", "model": "glm-5.2",
+     "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+]
+result = quota_gate.select_provider(mock_with_opencode, privacy_level="sensitive")
+check("sensitive → opencode-go (100%) excluded, ollama (10%) wins",
+      result is not None and result["profile"] == "pr-ollama",
+      f"got {result['profile'] if result else 'None'}")
+
+# But public → opencode-go is eligible (availability-first)
+result = quota_gate.select_provider(mock_with_opencode, privacy_level="public")
+check("public → opencode-go (100%) wins (availability-first)",
+      result is not None and result["profile"] == "pr-opencode",
+      f"got {result['profile'] if result else 'None'}")
+
+
+# ---------------------------------------------------------------------------#
+# Test 15: No privacy degradation (sensitive never falls back to public-only)
+# ---------------------------------------------------------------------------#
+print("\n--- Test 15: No privacy degradation ---")
+
+# If all sensitive-capable providers are exhausted, the gate must NOT
+# fall back to a public-only provider (opencode-go, openrouter).
+# It must return None (wakeAgent:false) instead.
+mock_sens_exhausted = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 0.0, "bottleneck_pct": 100.0, "bottleneck_window": "error",
+     "error": "quota exhausted", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 0.0, "bottleneck_pct": 100.0, "bottleneck_window": "daily",
+     "error": "quota exhausted", "raw": {}},
+    {"profile": "pr-opencode", "provider": "opencode-go", "model": "glm-5.2",
+     "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+]
+
+result = quota_gate.select_provider(mock_sens_exhausted, privacy_level="sensitive")
+check("sensitive: all sensitive providers exhausted → None (no degradation to opencode)",
+      result is None,
+      f"got {result['profile'] if result else 'None'}")
+
+# E2E: sensitive exhausted → wakeAgent:false
+out_sens_exhausted = simulate_main(mock_sens_exhausted, "sensitive")
+check("e2e sensitive exhausted → wakeAgent:false (no degradation)",
+      out_sens_exhausted["wakeAgent"] is False)
+check("e2e sensitive exhausted → warning mentions privacy exclusion",
+      "privacy:sensitive excludes" in (out_sens_exhausted["context"]["warning"] or ""),
+      f"warning: {out_sens_exhausted['context']['warning']}")
+
+
+# ---------------------------------------------------------------------------#
 # Results
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
 print(f"\n{'='*60}")
 print(f"Results: {passed} passed, {failed} failed")
 print(f"{'='*60}")

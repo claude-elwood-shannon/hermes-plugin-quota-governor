@@ -55,6 +55,7 @@ from quota_gate_privacy_summary import (
     _PRIVACY_SUMMARY_BUCKETS,
     _ACTIVE_STATUSES_FOR_PRIVACY,
     select_provider,
+    PRIVACY_CAPABILITIES,
 )
 
 
@@ -351,6 +352,20 @@ class TestComputePrivacySummary(unittest.TestCase):
         finally:
             os.unlink(db)
 
+    def test_confidential_alias_conf_buckets_as_high(self):
+        """privacy:conf and privacy:intimo aliases bucket as high (OBJ-18 S2)."""
+        db = _make_kanban_db([
+            {"id": "t_conf_alias", "body": "privacy:conf\nwork", "status": "ready"},
+            {"id": "t_intimo", "body": "privacy:intimo\nwork", "status": "todo"},
+        ])
+        try:
+            warnings = []
+            summary = compute_privacy_summary(db, warnings=warnings)
+            self.assertEqual(summary, {"high": 2, "medium": 0, "low": 0, "none": 0})
+            self.assertEqual(warnings, [])
+        finally:
+            os.unlink(db)
+
     def test_terminal_tasks_not_counted(self):
         """done / archived tasks are excluded from the census."""
         db = _make_kanban_db([
@@ -536,6 +551,17 @@ class TestRoutingUnchanged(unittest.TestCase):
         """Sensitive → preference-first: nanogpt wins regardless of quota."""
         result = select_provider(self.MOCK_PROVIDERS, privacy_level="sensitive")
         self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_confidential_routing_no_cloud_provider(self):
+        """Confidential → no cloud provider qualifies, returns None (OBJ-18 S2)."""
+        result = select_provider(self.MOCK_PROVIDERS, privacy_level="confidential")
+        self.assertIsNone(result)
+
+    def test_confidential_excludes_all_cloud_in_capabilities(self):
+        """PRIVACY_CAPABILITIES['confidential'] must only contain custom."""
+        self.assertEqual(
+            PRIVACY_CAPABILITIES["confidential"], {"custom"}
+        )
 
     def test_active_statuses_cover_pending_work(self):
         """All non-terminal statuses are censused; done/archived are not."""
