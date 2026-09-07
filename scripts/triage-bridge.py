@@ -159,6 +159,26 @@ def promote_via_core(db_path, task_id: str) -> bool:
         wconn.close()
 
 
+def human_gate_pending(db_path, task_id: str) -> bool:
+    """Mirror of the core's is_human_gate_pending (block_loop_detected
+    kind=needs_input with no human comment since). Checked here so the
+    DRY-RUN report is honest about what the core would refuse. Any failure
+    (no core, no events table) returns False — the core still refuses at
+    execute time, so this can only make decisions stricter, never looser."""
+    try:
+        if HERMES_SRC not in sys.path:
+            sys.path.insert(0, HERMES_SRC)
+        from hermes_cli.kanban_db import is_human_gate_pending as core_gate
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return bool(core_gate(conn, task_id))
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
     """Core loop. Returns list of decision entries (for tests and reporting)."""
     now = now or datetime.now(timezone.utc).isoformat()
@@ -182,6 +202,11 @@ def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
         if not promotable:
             decide({"ts": now, "task": task_id, "action": "kept-in-triage",
                     "reason": reason})
+            continue
+        if human_gate_pending(db_path, task_id):
+            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
+                    "reason": f"{title[:40]}: block_loop needs_input sin "
+                              "comentario humano (gate del core)"})
             continue
         if promoted >= MAX_PER_TICK:
             decide({"ts": now, "task": task_id, "action": "cap-reached",

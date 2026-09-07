@@ -228,6 +228,21 @@ class TestDryRun(BridgeTestCase):
         kept = self.by_action(decisions, "kept-in-triage")
         self.assertIn("ya promocionada", kept[0]["reason"])
 
+    def test_human_gate_mirror_blocks(self):
+        """A task whose core human-gate is pending must be held even when its
+        tags are perfect — mirrors the t_8b74bbab live case (block_loop
+        needs_input, no human comment since)."""
+        db = make_db([{"id": "t_gated", "title": "OBJ-19: Docs", "body": GOOD_BODY}])
+        orig = triage_bridge.human_gate_pending
+        triage_bridge.human_gate_pending = lambda db_path, task_id: True
+        try:
+            decisions = triage_bridge.run(db_path=Path(db), execute=False)
+        finally:
+            triage_bridge.human_gate_pending = orig
+        self.assertEqual(self.by_action(decisions, "would-promote"), [])
+        kept = self.by_action(decisions, "kept-in-triage")
+        self.assertIn("gate del core", kept[0]["reason"])
+
     def test_non_triage_rows_ignored(self):
         db = make_db([{"id": "t_done", "title": "OBJ-1", "body": GOOD_BODY,
                        "status": "done"}])
