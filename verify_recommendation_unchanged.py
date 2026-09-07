@@ -56,17 +56,37 @@ FAKE_ENV = {
 }
 
 
-def extract_old_gate():
-    """Get quota-gate.py as of git HEAD.
+def old_gate_ref():
+    """Commit whose quota-gate.py is the PRE-S1 baseline.
 
-    Also copies HEAD's scripts/providers.json next to the extracted gate
-    so both versions resolve the SAME providers config: the gate derives
+    Hard-coding HEAD was only valid while the branch tip sat directly on
+    top of the base commit.  After a rebase onto main, HEAD itself already
+    contains the S1 changes, so the "old" side would be the modified gate
+    and the diff would be meaningless (privacy_summary stripped from one
+    side only).  Anchor on the merge-base instead, falling back to HEAD.
+    """
+    out = subprocess.run(
+        ["git", "-C", REPO, "merge-base", "HEAD", "main"],
+        capture_output=True, text=True,
+    )
+    if out.returncode == 0 and out.stdout.strip():
+        return out.stdout.strip()
+    return "HEAD~1"
+
+
+def extract_old_gate():
+    """Get quota-gate.py as of the pre-S1 baseline (see old_gate_ref).
+
+    Also copies the baseline's scripts/providers.json next to the extracted
+    gate so both versions resolve the SAME providers config: the gate derives
     PROVIDERS_CONFIG_PATH from its own directory, and a /tmp extraction
     would otherwise read no providers.json (parked flags would differ —
     a setup artifact, not a behavioural change).
     """
+    ref = old_gate_ref()
+    print("baseline ref for old gate:", ref)
     out = subprocess.run(
-        ["git", "-C", REPO, "show", "HEAD:scripts/quota-gate.py"],
+        ["git", "-C", REPO, "show", f"{ref}:scripts/quota-gate.py"],
         capture_output=True, text=True, check=True,
     )
     with open(OLD_GATE, "w", encoding="utf-8") as f:
@@ -138,6 +158,12 @@ def capture_output(mod, kanban_db, scratch):
     os.environ.pop("QUOTA_GATE_PRIVACY", None)
 
     buf = io.StringIO()
+    # Freeze the per-model cost ledger (MULTI-PROV-09) on BOTH sides: it is
+    # live state (real profile state.db scans + shared cursor throttling) and
+    # path-sensitive (the extracted old gate lives in /tmp, where its
+    # model-cost-ledger.py sibling is missing → null).  Neither has anything
+    # to do with S1; the comparison must isolate the privacy_summary delta.
+    ledger_frozen = lambda rolling_resets_at=None: (None, [])
     with mock.patch.dict(os.environ, env, clear=False), \
          mock.patch.object(mod, "query_ollama",
                            lambda: dict(FROZEN_OLLAMA)), \
@@ -150,6 +176,7 @@ def capture_output(mod, kanban_db, scratch):
          mock.patch.object(mod, "get_existing_profiles",
                            lambda: set(EXPECTED_PROFILES)), \
          mock.patch.object(mod, "get_env", lambda key: FAKE_ENV.get(key)), \
+         mock.patch.object(mod, "model_cost_context", ledger_frozen), \
          contextlib.redirect_stdout(buf):
         mod.main()
     return json.loads(buf.getvalue().strip())
