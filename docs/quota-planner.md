@@ -262,3 +262,49 @@ python3 test_concurrency_guard.py
 ```
 
 Expected: 23 passed, 0 failed.
+
+### Addendum (t_e3d17323, 2026-09-08): cost-tag guarantee at creation + re-runnable USD table
+
+The INCONCLUSIVE verdict above traced to 6 of 9 attributable tasks lacking
+a parseable `cost:` tag. Both ends of that leak are now closed:
+
+1. **Creator-side guarantee (objective-proposer.py, commit 2f8cbec).**
+   `create_triage_task()` — the single choke point through which all five
+   detectors create tasks — now runs `enforce_cost_tag()` on the body
+   before invoking `hermes kanban create`: canonical values (any case,
+   spacing, or pipe style) pass untouched; a missing tag gets
+   `cost:tiny` injected right after the auto_created line (inline
+   `| cost:tiny` for pipe-style headers); an unmappable value
+   (`coste:mesmer`, `cost:xl`) is normalised in place.  Deterministic —
+   no LLM compliance involved.  The autonomous-task-creator cron prompt
+   (jobs.json, living config) got the exact tag spec + default in its
+   RULES block the same day.  Layering: proposer-enforced bodies read as
+   backstop action `ok` in cost-tag-fix.py (tested), so the two layers
+   never fight.
+2. **Re-runnable table (scripts/usd-stats.py, same commit).**  The
+   one-off scratch analysis of t_3b401256 (whose workspace was cleaned at
+   completion) is now a repo script:
+
+   ```bash
+   python3 scripts/usd-stats.py --since 2026-09-06T00:00Z --json /tmp/usd.json
+   ```
+
+   Same join method as this section (session-start → task_runs window,
+   profile-matched, nearest run wins), with two corrections over the
+   original: worker/aux rows are split per ROW inside each run (a run's
+   session mixes worker calls with Hermes aux calls), and `cron_*`
+   sessions — the creator/proposer cron LLM runs themselves — are never
+   attributed to tasks and reported separately.
+
+**Post-fix snapshot (2026-09-07T22:38Z):** board audit with the
+backstop's own header parser — 74/74 tasks with an `auto_created:true`
+header carry a canonical cost tag (100%, was 3/9 attributable before).
+First re-run over the ledger window 2026-09-06→2026-09-07 (236 rows):
+70 worker rows attributed (tiny n=1 done $0.52/104c/22min; small n=1
+done $0.07/22c/2min + 2 crashed $0.23 mean; untagged n=14 done mean
+$1.45), 51 aux rows, 36 cron rows ($0.62 — the creator's own LLM cost,
+previously folded into untagged), 79 unattributed rows ($14.35 —
+long-lived sessions spanning past every run window, e.g. the burn
+watchdog; structural to the ledger, documented in
+`test_usd_stats.py`/`probe` notes).  Per-category USD needs
+tiny/medium n≥3 — accumulating now that every new task is tagged.
