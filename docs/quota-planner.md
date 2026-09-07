@@ -73,6 +73,107 @@ not absolute counts), but the per-call cost comments in
 
 ---
 
+## USD cost calibration (OBJ-02, 2026-09)
+
+Extends the 2026-09-03 wall-time/call calibration above with REAL USD,
+now that `model-cost-ledger.jsonl` (MULTI-PROV-09, t_5bdd7cfa) meters
+per-model token consumption. Snapshot: 2026-09-06 13:45Z through
+2026-09-07 04:40Z CEST, excluding this task's own analysis sessions —
+52 ledger rows, $17.77 across 3 windows ($0.04 / $14.01 / $3.73; the
+23:45Z window was still open at snapshot). The ledger live-updates every
+20-min gate sync, so counts below are as-of-snapshot.
+
+**Verdict up front: INCONCLUSIVE per category.** 27 of 52 ledger rows
+are attributable to a kanban task run (10 runs / 9 tasks), but only 3
+of those tasks carry a `cost:` tag (micro n=2 — one crashed — and
+small n=1). tiny and medium have ZERO attributable rows in this
+window. Single-point figures below
+are upper bounds (ledger estimate is +16% vs console, see
+model-cost-ledger.py docstring). Do NOT feed these into
+`planner.decide()` thresholds until >=1 week of tagged data accrues.
+
+### Methodology (join key)
+
+The ledger has no task_id; it keys on `session_id`
+(`<YYYYMMDD>_<HHMMSS>_<hash>`, local CEST) created when a kanban worker
+session starts. Attribution = match session-start timestamp into a
+`task_runs` window (same `profile`, `started_at-10s <= session_start <=
+ended_at+120s`, nearest run wins). Rows with a non-empty ledger `task`
+tag (title_generation / approval / background_review / compression) are
+Hermes auxiliary calls, NOT worker work — counted separately. Worker rows
+are the ones with empty `task`. Ledger is opencode-go-only by design:
+runs whose worker used another provider (pr-nanogpt zai-org/glm-5.2,
+ollama-cloud) are invisible here, and sessions that crashed before the
+first 20-min sync contribute nothing (that is why the 3 crashed
+`cost:medium` runs of t_d3854101 have no rows).
+
+### USD per task by category (worker rows, upper bound)
+
+| Category | n done (attrib.) | USD/task | calls/task | wall | model observed |
+|----------|------------------|----------|------------|------|----------------|
+| micro    | 1 (+1 crashed)   | $0.43 done; $0.09 crashed | 72; 5 | 18 min; 1 min | qwen3.8-flash; glm-5.2 |
+| tiny     | 0                | —        | —          | —    | — (only t_3b401256 in flight at snapshot) |
+| small    | 1                | $5.20 (outlier — multi-file feature + tests, ran on glm-5.2) | 159 | 20 min | glm-5.2 |
+| medium   | 0                | —        | —          | —    | — (all 3 runs crashed pre-sync) |
+| untagged (reference) | 6 | mean $1.00 / median $0.74 (min $0.19, max $2.90) | mean 75 | mean 25 min | mostly qwen3.8-flash |
+
+Per-call rate by model (attributed worker rows, exact request counts):
+
+| Model | USD | calls | USD/call |
+|-------|------|-------|----------|
+| glm-5.2 | $9.07 | 295 | $0.0307 |
+| qwen3.8-flash | $2.66 | 394 | $0.0068 |
+
+Ratio glm-5.2 / qwen3.8-flash = **4.6x per call**. The cleanest natural
+experiment: t_fd3e1763 reclaimed attempt on glm-5.2 burned $2.57/85c;
+its successful redo on qwen3.8-flash cost $0.33/64c — **7.8x** for the
+same task.
+
+Auxiliary Hermes calls per task-run (not attributable to one task):
+title_generation median $0.0002 (negligible), approval mean $0.025,
+compression $0.015, **background_review mean $0.41** — one review cycle
+costs as much as an entire micro task and must be budgeted.
+
+### Deviation vs planner.decide() / quota-gate heuristics (>20%)
+
+`decide()` caps by CATEGORY from percentage headroom, and the Sep-3
+calibration assumes category≈calls is model-agnostic. Real data breaks
+that in three ways:
+
+1. **Call counts mispredict USD within category (up to +489%).** small
+   median expectation = 27 calls; the observed small task used 159
+   (+489%). micro done used 72 calls vs the tiny median 19 the tier
+   ladder implies (+279%). High-variance categories cannot be budgeted
+   in calls; USD spread per task is $0.09-$5.20 (57x).
+2. **Model mix is invisible to the tier heuristic (up to +350%).** 27
+   calls costs $0.18 on qwen3.8-flash but $0.83 on glm-5.2 — same tier,
+   4.6x apart. The PROFILE_WORKER_MODELS enforcement (G7 fix, same
+   window) is the real cost control; tiering without pinning the worker
+   model is not.
+3. **Window budget pressure at current dispatch rate.** The 18:45Z
+   window metered $14.01 ledger-estimated vs $12 budget (console
+   confirmed 100.2% — the +16% upper bound). One glm-5.2 small task
+   alone = 43% of a window; at the observed untagged mean ($1.00/task
+   on the cheap model) ~12 tasks/window fits the $12 budget, but only
+   ~2/window on the quality model. The gate's warn_fraction (50% of
+   $12 per model) would have fired correctly: glm-5.2 hit $5.20+ in
+   that window.
+
+### Recommended follow-ups (not implemented here)
+
+- Task creator MUST emit `cost:` tags: 6 of 9 attributable tasks were
+  untagged — that is the data bottleneck, not row volume.
+- Re-run this analysis after ~2 weeks; target >=5 done tasks per
+  category per model, then publish median USD/task per
+  (category, model) and let `bottleneck_to_max_cost` consume it.
+- Recalibrate price triples in `model-cost.json` against console fully-
+  closed windows (per ledger docstring), then drop the +16% caveat.
+
+Evidence scripts + per-task JSON: kanban scratch workspace
+`t_3b401256/` (attribute2.py, stats.py, per_task.json).
+
+---
+
 ## Concurrency Control (OBJ-06)
 
 ## Problem
