@@ -36,13 +36,25 @@ ESTIMATION RULE
              + cache_read/1e6*price_cache_read
 
 cache_write is EXCLUDED (no published cache-write price in the docs/go
-2026-09-07 catalog; including it would inflate estimates).  DeepSeek
-models double in peak hours (mono-fr 01:00-04:00 & 06:00-10:00 UTC) and
-the estimate applies the x2 when the row's timestamp falls in peak.
-Prices: MODEL_PRICES below, overridable via
-``~/.hermes/quota-governor/model-cost.json`` (shape: {"prices": {model:
-[in, out, cache]}, "window_usd": float, "warn_fraction": float}) so the
-formula can be recalibrated from console data without code changes.
+2026-09-07 catalog).  DeepSeek models double in peak hours (mono-fr
+01:00-04:00 & 06:00-10:00 UTC) and the estimate applies the x2 when the
+row's timestamp falls in peak.  Prices: MODEL_PRICES below, overridable
+via ``~/.hermes/quota-governor/model-cost.json`` (shape: {"prices": {model:
+[in, out, cache]}, "window_usd": float, "warn_fraction": float}).
+
+KNOWN BIAS — calibrated live Sep 7 2026 against the console's own
+metering (window 18:45Z→23:45Z closed at 100.2% of $12 = $12.03; ledger
+total for the same window $14.01 → +16% overall).  Cause: Hermes records
+the FULL prompt as input_tokens on every call even when the provider
+serves most of it from cache; the provider meters the re-sent context at
+the (cheaper) cache-read rate, and per-model cache-read prices are
+approximate.  Net effect: the estimate is a CONSERVATIVE UPPER BOUND —
+warnings fire early, never late (correct direction for an alerting gate;
+the request/token counts per model are exact).  After ~1 week of ledger
+rows, recalibrate the per-model price triples in model-cost.json against
+the console table (compare only FULLY-CLOSED windows — console mid-window
+splits are not comparable) — no code change needed.  Do NOT treat the
+numbers as billing-exact until recalibrated.
 
 LIMITATIONS (documented honestly)
 ---------------------------------
@@ -498,8 +510,10 @@ def current_window_shares(hermes_home=None, now=None, reset_at=None):
             "models": summary.get(current, {}),
             "note": ("Estimated from token deltas x published prices "
                      "(Hermes does not persist the API cost field; see "
-                     "model-cost-ledger.py docstring). Authoritative while "
-                     "subscription-covered; upper bound while burning balance."),
+                     "model-cost-ledger.py docstring). Conservative upper "
+                     "bound (calibrated Sep 7 2026: +16% vs console on a "
+                     "closed window, due to full-prompt input accounting); "
+                     "request and token counts are exact."),
         }
     except Exception:
         return {}

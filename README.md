@@ -51,17 +51,21 @@ console:
 - **Source of truth**: Hermes does not persist the API `cost` field
   (`session_model_usage.estimated_cost_usd` is always 0 — verified Sep 7),
   so the ledger estimates `cost = tokens × published prices`
-  (input, output+reasoning, cache_read; cache_write excluded). That is
-  exactly how OpenCode Go meters a window's USD budget, so the per-model
-  share is authoritative while subscription-covered and an upper bound
-  while burning prepaid balance. Prices/budget/warn-threshold are
-  overridable via `~/.hermes/quota-governor/model-cost.json`
+  (input, output+reasoning, cache_read; cache_write excluded). Calibrated
+  live Sep 7 2026 against the console's per-model table, the estimate is a
+  CONSERVATIVE UPPER BOUND (+16%..+125%: Hermes records the full prompt as
+  input on every call while the provider meters cached context at the
+  cheaper cache-read rate) — warnings fire early, never late; request and
+  token counts per model are exact. Recalibrate the price triples after
+  ~1 week of data via `~/.hermes/quota-governor/model-cost.json`
   (`{"prices": {model: [in, out, cache]}, "window_usd": 12.0,
-  "warn_fraction": 0.5}`) — recalibrate from console data without code
-  changes.
+  "warn_fraction": 0.5}`) — no code change needed.
 - **Automatic sync**: quota-gate.py opportunistically syncs the ledger on
   every cron run (throttled to ≤1 sync/20 min; the gate cron cadence is
-  30 min) — zero extra API calls, zero tokens.
+  30 min) — zero extra API calls, zero tokens. The FIRST sync after
+  deployment is a historical catch-up batch (whole pre-existing sessions
+  land in the window of their last activity); from then on 30-min deltas
+  track the right window closely.
 - **Gate integration**: the snapshot's `context.model_cost` carries the
   current-window per-model shares, and any model over `warn_fraction`
   (default 50%) of the window budget injects a
