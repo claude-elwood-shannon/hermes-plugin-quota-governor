@@ -735,6 +735,35 @@ class TestComputeOpenCodeGoStatus(unittest.TestCase):
                    return_value=self._query_result(rolling=15, weekly=6, monthly=3)):
             st = compute_opencode_go_status()
         self.assertFalse(st["burning_balance"])
+        self.assertEqual(st["state"], "ok")
+
+    def test_state_is_burning_balance_not_blocked(self):
+        """t_47640f18: percent >100 in pr-opencode is 'burning-balance'
+        (money burn via prepaid Zen), NOT a hard 'blocked' state."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=100, weekly=40, monthly=20,
+                                                   r_status="rate-limited")):
+            st = compute_opencode_go_status()
+        self.assertTrue(st["burning_balance"])
+        self.assertEqual(st["state"], "burning-balance")
+
+    def test_zen_soft_cap_unset_returns_none(self):
+        """t_47640f18: the monthly Zen soft-cap is a PLACEHOLDER that stays
+        None (no cap) until the user names the exact USD amount."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result()):
+            st = compute_opencode_go_status()
+        self.assertIsNone(st["zen_monthly_soft_cap_usd"])
+
+    def test_raw_carries_resets_at(self):
+        """resetsAt per window flows through to raw for predictive planning."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value={
+                       **self._query_result(rolling=5, weekly=2, monthly=1),
+                       "rolling_resets_at": "2026-09-07T04:44:00Z",
+                   }):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["raw"]["rolling_resets_at"], "2026-09-07T04:44:00Z")
 
     def test_no_usage_data_fully_available(self):
         with patch("quota_gate.query_opencode_go",
@@ -920,6 +949,34 @@ class TestGateOutputContainsPeakAndWorkerModel(unittest.TestCase):
         self.assertIn("windows_utc", ctx["peak_pricing"])
         self.assertEqual(ctx["worker_models"]["pr-opencode"], "qwen3.8-flash")
         self.assertIn("model_selection_rule", ctx)
+
+    def test_main_snapshot_warns_on_burning_balance(self):
+        """t_47640f18: even when pr-opencode is NOT the recommended provider
+        (it has availability 0 while burning), the snapshot warning must say
+        'burning-balance' and spell out that it is spending prepaid Zen, not
+        free quota. Otherwise the money-burn is invisible to the creator."""
+        import io
+        import contextlib
+        burning = self._fake_provider(availability=0.0, bottleneck=100.0)
+        burning["burning_balance"] = True
+        fine = self._fake_provider(profile="pr-ollama", provider="ollama-cloud",
+                                   availability=80.0, bottleneck=20.0)
+        with patch.object(_mod, "parse_privacy_level", return_value=None), \
+             patch.object(_mod, "compute_ollama_status", return_value=fine), \
+             patch.object(_mod, "compute_nanogpt_status", side_effect=Exception("no key")), \
+             patch.object(_mod, "compute_opencode_go_status", return_value=burning), \
+             patch.object(_mod, "select_provider", return_value=dict(fine)), \
+             patch.object(_mod, "get_existing_profiles",
+                          return_value={"pr-ollama", "pr-nanogpt", "pr-opencode"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _mod.main()
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        ctx = out["context"]
+        self.assertEqual(ctx["recommended_profile"], "pr-ollama")  # NOT opencode
+        self.assertIn("burning-balance", ctx["warning"])
+        self.assertIn("PREPAID ZEN", ctx["warning"])
+        self.assertIn("not free quota", ctx["warning"])
 
 
 # ── Parked profiles (t_7da69d59) ────────────────────────────────────────────

@@ -225,6 +225,25 @@ def get_env(key):
     return None
 
 
+def _config_zen_monthly_soft_cap():
+    """Read the optional monthly Zen soft-cap for pr-opencode (t_47640f18).
+
+    PLACEHOLDER — the exact USD ceiling for Zen credits that autonomous
+    tasks may burn in a month is PENDING USER DECISION. Until the user
+    names an amount this returns None (no cap enforced), regardless of
+    the env var. Set OPENCODE_GO_ZEN_MONTHLY_SOFT_CAP (USD float) only
+    after the user confirms the figure; the var is read but currently
+    documented as inert so a stray value cannot silently constrain quota.
+    """
+    raw = os.environ.get("OPENCODE_GO_ZEN_MONTHLY_SOFT_CAP", "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _no_proxy():
     """Temporarily disable proxy env vars (providers reject Tor)."""
     import contextlib
@@ -884,6 +903,10 @@ def compute_opencode_go_status():
     burning_balance = any(
         status is not None and status != "ok" for _, _, status in windows
     )
+    # Distinct state: "burning-balance" (money burn) vs a hard "blocked"
+    # (no fallback / balance exhausted). With balance-fallback the requests
+    # keep succeeding past 100% — that is NOT a hard stop, it is spend.
+    state = "burning-balance" if burning_balance else "ok"
 
     return {
         "profile": "pr-opencode",
@@ -893,6 +916,12 @@ def compute_opencode_go_status():
         "bottleneck_pct": round(bottleneck_pct, 1),
         "bottleneck_window": bottleneck_window,
         "burning_balance": burning_balance,
+        "state": state,
+        # Soft cap placeholder (t_47640f18): a configurable ceiling for the
+        # monthly Zen credits acceptable on autonomous tasks. The exact USD
+        # value is PENDING USER DECISION — leave unset (None) until the user
+        # names an amount. Read from OPENCODE_GO_ZEN_MONTHLY_SOFT_CAP USD.
+        "zen_monthly_soft_cap_usd": _config_zen_monthly_soft_cap(),
         "error": "",
         "raw": {
             "rolling_pct": rolling_pct,
@@ -901,6 +930,9 @@ def compute_opencode_go_status():
             "rolling_status": raw.get("rolling_status"),
             "weekly_status": raw.get("weekly_status"),
             "monthly_status": raw.get("monthly_status"),
+            "rolling_resets_at": raw.get("rolling_resets_at"),
+            "weekly_resets_at": raw.get("weekly_resets_at"),
+            "monthly_resets_at": raw.get("monthly_resets_at"),
         },
     }
 
@@ -1280,6 +1312,22 @@ def main():
             warning += f"; {recommended['profile']} in paying mode (deprioritized)"
         else:
             warning = f"{recommended['profile']} in paying mode (deprioritized)"
+
+    # Burning-balance WARNING (t_47640f18): surface it in the snapshot even
+    # when pr-opencode is NOT the recommended provider (it has availability 0
+    # while burning, so it is never recommended) — otherwise the money-burn
+    # state would be invisible to the task creator. Explicitly notes that
+    # burning-balance means spending prepaid Zen, NOT free subscription quota.
+    for p in providers_list:
+        if p.get("provider") == "opencode-go" and p.get("burning_balance"):
+            note = (f"{p['profile']} state=burning-balance: an OpenCode Go window "
+                    f"is exhausted and balance-fallback is spending PREPAID ZEN "
+                    f"credits (money), not free quota. No new work routed there "
+                    f"until reset.")
+            if warning:
+                warning += "; " + note
+            else:
+                warning = note
 
     output = {
         "wakeAgent": True,
