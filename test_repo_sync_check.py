@@ -18,6 +18,7 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -81,9 +82,53 @@ def _make_kanban_db(tasks: list) -> str:
     return path
 
 
+# ── Main-flow test isolation ────────────────────────────────────────────────
+# main() runs in-process, so it inherits the unittest CLI in sys.argv
+# (argparse then errors with SystemExit(2)) and touches REAL state
+# (repo-watch.json, kanban.db, repo-sync-check.log). These helpers pin
+# argv and redirect every path to a temp sandbox so tests can never
+# create board tasks or write to real config/log files.
+
+def _patch_main_isolation(patchers, tmpdir):
+    """Register on a list the patchers that isolate main() from real state."""
+    patchers.append(patch("sys.argv", ["repo-sync-check.py"]))
+    patchers.append(patch("repo_sync_check.CONFIG_FILE",
+                          os.path.join(tmpdir, "repo-watch.json")))
+    patchers.append(patch("repo_sync_check.LOG_FILE",
+                          os.path.join(tmpdir, "repo-sync-check.log")))
+    patchers.append(patch("repo_sync_check.get_db_path",
+                          return_value=os.path.join(tmpdir, "nonexistent.db")))
+    # Defense in depth: even with isolation, never honor execute mode.
+    patchers.append(patch.dict(os.environ, {"REPO_SYNC_EXECUTE": ""}))
+
+
+class _LogIsolationMixin(unittest.TestCase):
+    """TestCase base redirecting the script's LOG_FILE to a temp dir.
+
+    log() writes unconditionally to the real
+    ~/.hermes/logs/repo-sync-check.log; tests exercising failure paths
+    (mocked git failures, corrupt configs) would otherwise append noise
+    to the production ops log. Override setUp/tearDown but call super().
+    """
+
+    def setUp(self):
+        self._log_tmp = tempfile.TemporaryDirectory()
+        self._log_patcher = patch(
+            "repo_sync_check.LOG_FILE",
+            os.path.join(self._log_tmp.name, "repo-sync-check.log"),
+        )
+        self._log_patcher.start()
+        super().setUp()
+
+    def tearDown(self):
+        self._log_patcher.stop()
+        self._log_tmp.cleanup()
+        super().tearDown()
+
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-class TestGetUncommittedChanges(unittest.TestCase):
+class TestGetUncommittedChanges(_LogIsolationMixin, unittest.TestCase):
     """Tests for get_uncommitted_changes()."""
 
     @patch("repo_sync_check.git")
@@ -147,7 +192,7 @@ class TestGetUncommittedChanges(unittest.TestCase):
         self.assertEqual(result[0]["path"], "real.py")
 
 
-class TestGetAheadCount(unittest.TestCase):
+class TestGetAheadCount(_LogIsolationMixin, unittest.TestCase):
     """Tests for get_ahead_count()."""
 
     @patch("repo_sync_check.git")
@@ -414,38 +459,50 @@ class TestBuildSyncBody(unittest.TestCase):
 class TestMainDryRun(unittest.TestCase):
     """Tests for main() in dry-run mode (no --execute)."""
 
-    @patch("repo_sync_check.os.path.isdir")
-    @patch("repo_sync_check.get_uncommitted_changes")
-    @patch("repo_sync_check.get_ahead_commits")
-    def test_synced_repo_silent_exit(self, mock_ahead, mock_uncomm, mock_isdir):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patchers = []
+        _patch_main_isolation(self._patchers, self._tmp.name)
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_synced_repo_silent_exit(self):
         """Repo with no changes → sys.exit(0), no output."""
-        mock_isdir.return_value = True
-        mock_uncomm.return_value = []
-        mock_ahead.return_value = []
-
-        with self.assertRaises(SystemExit) as ctx:
-            _mod.main()
+        with patch("repo_sync_check.os.path.isdir", return_value=True), \
+             patch("repo_sync_check.get_uncommitted_changes", return_value=[]), \
+             patch("repo_sync_check.get_ahead_commits", return_value=[]), \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            with self.assertRaises(SystemExit) as ctx:
+                _mod.main()
         self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(out.getvalue(), "")
 
-    @patch("repo_sync_check.os.path.isdir")
-    @patch("repo_sync_check.get_uncommitted_changes")
-    @patch("repo_sync_check.get_ahead_commits")
-    @patch("repo_sync_check.VERBOSE", False)
-    def test_dry_run_with_changes(self, mock_ahead, mock_uncomm, mock_isdir):
+    def test_dry_run_with_changes(self):
         """Dry-run with changes → prints DRY-RUN line."""
-        mock_isdir.return_value = True
-        mock_uncomm.return_value = [{"status": " M", "path": "foo.py"}]
-        mock_ahead.return_value = [{"hash": "abc1234", "message": "test"}]
-
-        # Mock the DB check to return no pending tasks
-        with patch("repo_sync_check.get_db_path", return_value="/nonexistent.db"):
+        with patch("repo_sync_check.os.path.isdir", return_value=True), \
+             patch("repo_sync_check.get_uncommitted_changes",
+                   return_value=[{"status": " M", "path": "foo.py"}]), \
+             patch("repo_sync_check.get_ahead_commits",
+                   return_value=[{"hash": "abc1234", "message": "test"}]), \
+             patch("repo_sync_check.compute_desync_time", return_value=12345), \
+             patch("repo_sync_check.VERBOSE", False), \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
             _mod.main()
+        printed = out.getvalue()
+        self.assertIn("DRY-RUN", printed)
+        self.assertIn("foo.py", printed)
+        self.assertIn("abc1234", printed)
         # main() doesn't sys.exit in dry-run with changes (it just prints)
 
 
 # ── Multi-repo config tests ──────────────────────────────────────────────────
 
-class TestLoadRepoConfigs(unittest.TestCase):
+class TestLoadRepoConfigs(_LogIsolationMixin, unittest.TestCase):
     """Tests for load_repo_configs()."""
 
     def test_config_absent_falls_back_to_single_repo(self):
@@ -542,10 +599,11 @@ class TestMultiRepoHasPendingPerRepo(unittest.TestCase):
             conn.close()
 
 
-class TestGatherDirtyRepos(unittest.TestCase):
+class TestGatherDirtyRepos(_LogIsolationMixin, unittest.TestCase):
     """Multi-repo orchestration: dirty detection, disabled skip, pending surfacing."""
 
     def setUp(self):
+        super().setUp()  # LOG_FILE redirect from _LogIsolationMixin
         self.patchers = []
 
     def tearDown(self):
@@ -554,6 +612,7 @@ class TestGatherDirtyRepos(unittest.TestCase):
                 p.stop()
             except Exception:
                 pass
+        super().tearDown()  # _LogIsolationMixin cleanup
 
     def _patch(self, target, **kw):
         p = patch(target, **kw)
@@ -628,28 +687,25 @@ class TestMainMultiRepo(unittest.TestCase):
     """main() end-to-end multi-repo behavior."""
 
     def setUp(self):
-        self.patchers = []
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patchers = []
+        _patch_main_isolation(self._patchers, self._tmp.name)
+        for p in self._patchers:
+            p.start()
 
     def tearDown(self):
-        for p in self.patchers:
-            try:
-                p.stop()
-            except Exception:
-                pass
+        for p in self._patchers:
+            p.stop()
+        self._tmp.cleanup()
 
     def _patch(self, target, **kw):
         p = patch(target, **kw)
         p.start()
-        self.patchers.append(p)
+        self._patchers.append(p)
         return p
 
-    @patch("repo_sync_check.load_repo_configs")
-    @patch("repo_sync_check.get_db_path", return_value="/nonexistent.db")
-    @patch("repo_sync_check.os.path.isfile", return_value=False)
-    @patch("repo_sync_check._gather_dirty_repos")
-    def test_two_dirty_dry_run_creates_one_for_oldest(self, mock_gather, mock_isfile, mock_db, mock_load):
+    def test_two_dirty_dry_run_creates_one_for_oldest(self):
         """Dry-run over 2 dirty repos → DRY-RUN names only the oldest-desync one."""
-        from unittest.mock import MagicMock
         dirty = [
             {
                 "cfg": _mod._normalize_config({"repo": "/r/repoA"}),
@@ -668,32 +724,31 @@ class TestMainMultiRepo(unittest.TestCase):
                 "pending_id": None,
             },
         ]
-        mock_gather.return_value = dirty
-        mock_load.return_value = [
+        self._patch("repo_sync_check._gather_dirty_repos", return_value=dirty)
+        self._patch("repo_sync_check.load_repo_configs", return_value=[
             _mod._normalize_config({"repo": "/r/repoA"}),
             _mod._normalize_config({"repo": "/r/repoB"}),
-        ]
-        with patch("sys.stdout", new_callable=MagicMock) as out_mock:
-            _mod.main()
-        printed = "".join(call.args[0] for call in out_mock.write.call_args_list)
+        ])
+        out = io.StringIO()
+        self._patch("sys.stdout", new=out)
+        _mod.main()
+        printed = out.getvalue()
         self.assertIn("repoB", printed)
         self.assertIn("DRY-RUN", printed)
+        self.assertNotIn("would create sync task for repoA", printed)
 
-    @patch("repo_sync_check.load_repo_configs", side_effect=ValueError("corrupt"))
-    @patch("repo_sync_check._gather_dirty_repos")
-    def test_corrupt_config_no_tasks(self, mock_gather, mock_load):
+    def test_corrupt_config_no_tasks(self):
         """Corrupt config → sys.exit(1) without creating any task."""
-        mock_gather.return_value = []
+        mock_gather = MagicMock()
+        self._patch("repo_sync_check._gather_dirty_repos", new=mock_gather)
+        self._patch("repo_sync_check.load_repo_configs",
+                    side_effect=ValueError("corrupt"))
         with self.assertRaises(SystemExit) as ctx:
             _mod.main()
         self.assertEqual(ctx.exception.code, 1)
         mock_gather.assert_not_called()
 
-    @patch("repo_sync_check.load_repo_configs")
-    @patch("repo_sync_check.get_db_path", return_value="/nonexistent.db")
-    @patch("repo_sync_check.os.path.isfile", return_value=False)
-    @patch("repo_sync_check._gather_dirty_repos")
-    def test_all_pending_skips_new_task(self, mock_gather, mock_isfile, mock_db, mock_load):
+    def test_all_pending_skips_new_task(self):
         """If every dirty repo already has a pending task, nothing is created."""
         dirty = [
             {
@@ -705,8 +760,10 @@ class TestMainMultiRepo(unittest.TestCase):
                 "pending_id": "t_p",
             },
         ]
-        mock_gather.return_value = dirty
-        mock_load.return_value = [_mod._normalize_config({"repo": "/r/repoA"})]
+        self._patch("repo_sync_check._gather_dirty_repos", return_value=dirty)
+        self._patch("repo_sync_check.load_repo_configs", return_value=[
+            _mod._normalize_config({"repo": "/r/repoA"}),
+        ])
         with self.assertRaises(SystemExit) as ctx:
             _mod.main()
         self.assertEqual(ctx.exception.code, 0)
