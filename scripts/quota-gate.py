@@ -564,6 +564,10 @@ def query_opencode_go():
     if not api_key:
         raise RuntimeError("OPENCODE_GO_API_KEY not configured")
 
+    import uuid
+
+    session_id = str(uuid.uuid4())
+
     def _do_request():
         req = urllib.request.Request(
             "https://opencode.ai/zen/go/v1/usage",
@@ -571,6 +575,8 @@ def query_opencode_go():
                 "Authorization": f"Bearer {api_key}",
                 # Cloudflare 1010-bans the default Python-urllib UA.
                 "User-Agent": "hermes-quota-governor/1.0",
+                # OpenCode Go requires x-opencode-session for routing since 2026-09-06.
+                "x-opencode-session": session_id,
             },
         )
         with _no_proxy():
