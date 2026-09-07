@@ -315,6 +315,25 @@ def _write_cache(provider, data):
         pass
 
 
+def load_burn_warnings():
+    """Read the burn-watchdog's active warnings (MULTI-PROV-08).
+
+    The watchdog persists open burn warnings to
+    ``~/.hermes/quota-governor/burn-warnings.json``. When any exist, they
+    are surfaced into the gate snapshot's ``context.burn_warnings`` so the
+    task creator / user can see a provider burning prepaid balance before
+    it hits the STOP threshold. Absent/unparseable -> empty dict (never
+    breaks the gate).
+    """
+    path = os.path.join(_cache_dir(), "burn-warnings.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Profile validation (Guardrail G1)
 # ---------------------------------------------------------------------------
@@ -1291,6 +1310,7 @@ def main():
                 "privacy_level": privacy_level or "none",
                 "valid_profiles": valid_profiles,
                 "warning": "; ".join(warnings) if warnings else "all providers exhausted",
+                "burn_warnings": load_burn_warnings(),
             },
         }
         print(json.dumps(output))
@@ -1349,6 +1369,7 @@ def main():
             "privacy_level": privacy_level or "none",
             "valid_profiles": valid_profiles,
             "warning": warning,
+            "burn_warnings": load_burn_warnings(),
         },
     }
     print(json.dumps(output))
