@@ -47,8 +47,15 @@ Output (last line, JSON):
       "max_task_cost": "medium|small|tiny|micro|any",
       "max_workers": N,
       "privacy_level": "public|sensitive|confidential|none",
+      "privacy_summary": {"high": N, "medium": N, "low": N, "none": N},
       "warning": null
   }}
+
+privacy_summary (OBJ-18 S1) is a read-only census of the "privacy:"
+tags found in the bodies of active (non-terminal) tasks in kanban.db.
+It does NOT influence provider routing — it only reports how many
+active tasks carry each privacy tag so the task creator and user can
+see the privacy demand landscape.  Routing by privacy is S2.
 
 The JSON context is consumed by the autonomous-task-creator cron prompt.
 The agent reads recommended_profile and recommended_model to decide which
@@ -62,6 +69,7 @@ Design references:
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1110,6 +1118,185 @@ def parse_privacy_tag(text):
     return None
 
 
+# ---------------------------------------------------------------------------#
+# Privacy summary — active-task tag census (OBJ-18 S1)
+# ---------------------------------------------------------------------------#
+# Maps each recognised raw privacy tag value to its summary bucket
+# (high / medium / low).  This is the reverse of the high/medium/low →
+# canonical mapping in _normalise_privacy_value: it lets the gate report
+# a census of active tasks grouped by the OBJ-18 alias namespace, even
+# when a task body uses the canonical form (privacy:sensitive → high,
+# privacy:public → low) or a legacy abbreviation.
+_PRIVACY_SUMMARY_BUCKETS = {
+    # OBJ-18 aliases (the primary tag format per the routing matrix)
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+    # Canonical levels → closest OBJ-18 bucket
+    "sensitive": "high",       # high and sensitive share the strictest cloud lane
+    "public": "low",           # low and public share the unrestricted lane
+    "confidential": "high",    # strictest overall — group with high
+    # Legacy abbreviations / Spanish aliases (→ canonical → bucket)
+    "pub": "low",
+    "publico": "low",
+    "sens": "high",
+    "selectivo": "high",
+    "conf": "high",
+    "intimo": "high",
+}
+
+# Active task statuses — the privacy summary only counts tasks that are
+# not in a terminal state (done / archived).  Triaged tasks are included
+# because they represent pending work that will eventually run.
+_ACTIVE_STATUSES_FOR_PRIVACY = ("ready", "running", "blocked", "todo", "triage")
+
+# Delimiter-aware privacy tag regexes (OBJ-18 S1).
+#
+# The tag must start at a line start, after whitespace, or after an
+# opening delimiter ( '(' '[' '*' — covers the creator's bold style
+# ``**privacy:high**`` ), and the value must end at end-of-line,
+# whitespace, or closing punctuation.  '|' is deliberately NOT a valid
+# value char NOR a valid end delimiter: prose that MENTIONS the tag
+# format (e.g. "privacy:high|medium|low" inside a task description)
+# must NOT be counted as a tag — the '|' fails the match.
+_PRIVACY_TAG_VALUE_RE = re.compile(
+    r"(?:^|(?<=[\s(\[*]))privacy:[ \t]*['\"]?"
+    r"([^\s'\",;.:|)\]}*]+)"
+    r"['\"]?(?=$|[\s)\]}'\"*,;.:])",
+    re.IGNORECASE,
+)
+_PRIVACY_TAG_EMPTY_RE = re.compile(
+    r"(?:^|(?<=[\s(\[*]))privacy:[ \t]*(?=$|[\s)\]}'\"*,;.:])",
+    re.IGNORECASE,
+)
+
+
+def _parse_privacy_tag_raw(text):
+    """Extract the raw privacy tag value (un-normalised) from text.
+
+    Unlike parse_privacy_tag() (line-start only, used for the routing
+    level), this scans the WHOLE body so tags written inline the way
+    the task creator writes them are also detected::
+
+        privacy:high                     (own line)
+        **privacy:high**                 (bold, creator style)
+        objective:OBJ-18 privacy:high   (mid-line, space-delimited)
+        (privacy:low)                    (parenthesised)
+
+    Delimiter-aware: the tag must start after a line start, whitespace,
+    ``(``, ``[`` or ``*`` and the value must end at end-of-line,
+    whitespace or a closing delimiter (``) ] } ' " * , ; . :``).
+    Prose that MENTIONS the tag format (e.g. ``privacy:high|medium|low``
+    in a description) does not match — the ``|`` after the value fails
+    the end-delimiter check at every backtrack position.
+
+    Returns:
+      * the lowercased raw value string (e.g. "high") for a
+        syntactically well-formed tag — even if the value is not a
+        recognised level (the caller warns for those);
+      * "" for a tag present with an EMPTY value (``privacy:`` alone);
+      * None when no ``privacy:`` tag is present (or only prose
+        mentions that don't satisfy the delimiters).
+    """
+    if not text:
+        return None
+    m = _PRIVACY_TAG_VALUE_RE.search(text)
+    if m:
+        return m.group(1).lower()
+    if _PRIVACY_TAG_EMPTY_RE.search(text):
+        # "privacy:" present but no value where one is expected
+        return ""
+    return None
+
+
+def compute_privacy_summary(kanban_db_path=None, warnings=None):
+    """Census the privacy: tags of active tasks in kanban.db (OBJ-18 S1).
+
+    Scans the body of every non-terminal task (ready / running / blocked
+    / todo / triage) for a ``privacy:<level>`` tag and counts them into
+    the OBJ-18 alias buckets::
+
+        {"high": N, "medium": N, "low": N, "none": N}
+
+    * Tasks with no ``privacy:`` tag count as ``none``.
+    * Tasks with a recognised tag (high/medium/low or their canonical /
+      alias equivalents) count in the corresponding bucket.
+    * Tasks with a malformed tag (e.g. ``privacy:xyz``) count as
+      ``none`` AND emit a warning via the *warnings* list, so the gate
+      snapshot surfaces the bad tag without breaking.
+
+    This is a READ-ONLY census: it does NOT change the recommendation
+    logic, the privacy_level field, or provider routing.  Routing by
+    privacy is S2 (separate task, after user approval of the matrix).
+
+    Args:
+        kanban_db_path: Path to kanban.db.  Defaults to
+            ``$HERMES_KANBAN_DB`` env var, then ``~/.hermes/kanban.db``.
+        warnings: Optional list to append warning strings to.
+
+    Returns:
+        dict with keys "high", "medium", "low", "none" (all ints >= 0).
+    """
+    summary = {"high": 0, "medium": 0, "low": 0, "none": 0}
+    if warnings is None:
+        warnings = []
+
+    # Resolve the kanban.db path
+    if kanban_db_path is None:
+        kanban_db_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not kanban_db_path:
+        kanban_db_path = os.path.expanduser("~/.hermes/kanban.db")
+
+    if not os.path.isfile(kanban_db_path):
+        # No kanban.db — nothing to census.  Not an error.
+        return summary
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(kanban_db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        placeholders = ",".join("?" * len(_ACTIVE_STATUSES_FOR_PRIVACY))
+        cursor.execute(
+            f"SELECT id, body FROM tasks WHERE status IN ({placeholders})",
+            _ACTIVE_STATUSES_FOR_PRIVACY,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception as exc:
+        # DB error — fail open: return empty summary + warning.
+        warnings.append(f"privacy_summary: kanban.db read failed: {exc}")
+        return summary
+
+    for row in rows:
+        task_id = row["id"]
+        body = row["body"] or ""
+        raw = _parse_privacy_tag_raw(body)
+        if raw is None:
+            # No privacy: tag → none
+            summary["none"] += 1
+        elif raw == "":
+            # "privacy:" with no value → malformed
+            summary["none"] += 1
+            warnings.append(
+                f"privacy_summary: task {task_id} has empty privacy: tag "
+                f"(ignored, counted as none)"
+            )
+        else:
+            bucket = _PRIVACY_SUMMARY_BUCKETS.get(raw)
+            if bucket:
+                summary[bucket] += 1
+            else:
+                # Unrecognised tag value → malformed, ignore with warning
+                summary["none"] += 1
+                warnings.append(
+                    f"privacy_summary: task {task_id} has unrecognised "
+                    f"privacy:{raw} tag (ignored, counted as none)"
+                )
+
+    return summary
+
+
 def parse_privacy_level():
     """Determine the privacy level for this gate run.
 
@@ -1369,6 +1556,7 @@ def main():
     if recommended is None:
         # All providers exhausted/errored, or no allowed profile exists,
         # or privacy filtering eliminated all candidates
+        privacy_summary = compute_privacy_summary(warnings=warnings)
         output = {
             "wakeAgent": False,
             "context": {
@@ -1378,6 +1566,7 @@ def main():
                 "max_task_cost": None,
                 "max_workers": 0,
                 "privacy_level": privacy_level or "none",
+                "privacy_summary": privacy_summary,
                 "valid_profiles": valid_profiles,
                 "warning": "; ".join(warnings) if warnings else "all providers exhausted",
                 "burn_warnings": load_burn_warnings(),
@@ -1392,6 +1581,11 @@ def main():
     bottleneck = recommended["bottleneck_pct"]
     max_cost = bottleneck_to_max_cost(bottleneck)
     max_workers = bottleneck_to_max_workers(bottleneck)
+
+    # Privacy summary (OBJ-18 S1) — computed BEFORE the warning string is
+    # frozen so any malformed-tag warnings it emits are surfaced in the
+    # output ``warning`` field.  Read-only census; does NOT affect routing.
+    privacy_summary = compute_privacy_summary(warnings=warnings)
 
     # Build warning if any provider had errors
     warning = None
@@ -1439,6 +1633,7 @@ def main():
             "max_task_cost": max_cost,
             "max_workers": max_workers,
             "privacy_level": privacy_level or "none",
+            "privacy_summary": privacy_summary,
             "valid_profiles": valid_profiles,
             "warning": warning,
             "burn_warnings": load_burn_warnings(),
