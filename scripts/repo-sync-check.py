@@ -359,6 +359,7 @@ def build_sync_body(uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_RE
     display_name = repo_basename(repo)
 
     sections.append(
+        "objective:OBJ-13 | cost:micro | model:worker\n\n"
         "OBJ-13: Sincronizacion automatica del repo\n\n"
         f"El cron de sincronizacion detecto cambios sin publicar en {repo_label} "
         f"(repo: {display_name}, remote: {remote}, branch: {branch}).\n\n"
