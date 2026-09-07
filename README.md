@@ -30,10 +30,51 @@ daemon.
 | Ollama Cloud | `GET /api/usage` | Session % + Weekly % | Yes (primary) |
 | NanoGPT | `GET /api/subscription/v1/usage` | Daily % + Weekly tokens % | Informational |
 | OpenRouter | `GET /api/v1/key` | USD (weekly/monthly) | Informational |
+| OpenCode Go | `GET /zen/go/v1/usage` | Rolling 5h + Weekly + Monthly % | Yes (pr-opencode) |
 
 Only Ollama Cloud's session/weekly windows map cleanly to the "should I
 keep spawning workers?" decision. NanoGPT and OpenRouter are reported as
 context.
+
+## Per-model cost ledger (MULTI-PROV-09)
+
+One model can silently burn most of an OpenCode Go 5h window (the Sep 7
+2026 incident: glm-5.2 alone took 82% of the $12 window). The
+`model-cost-ledger.py` script makes that visible without opening the
+console:
+
+- **Ledger**: `~/.hermes/quota-governor/model-cost-ledger.jsonl`
+  (append-only, one JSON row per session×model×task usage *delta*):
+  `{ts, window, profile, model, cost, request_count, tokens{in,out,cache_read}, session_id, task}`.
+  `window` is the ISO UTC start of the rolling 5h window, anchored to the
+  live `rolling.resetsAt` (windows roll; they are NOT fixed clock hours).
+- **Source of truth**: Hermes does not persist the API `cost` field
+  (`session_model_usage.estimated_cost_usd` is always 0 — verified Sep 7),
+  so the ledger estimates `cost = tokens × published prices`
+  (input, output+reasoning, cache_read; cache_write excluded). That is
+  exactly how OpenCode Go meters a window's USD budget, so the per-model
+  share is authoritative while subscription-covered and an upper bound
+  while burning prepaid balance. Prices/budget/warn-threshold are
+  overridable via `~/.hermes/quota-governor/model-cost.json`
+  (`{"prices": {model: [in, out, cache]}, "window_usd": 12.0,
+  "warn_fraction": 0.5}`) — recalibrate from console data without code
+  changes.
+- **Automatic sync**: quota-gate.py opportunistically syncs the ledger on
+  every cron run (throttled to ≤1 sync/20 min; the gate cron cadence is
+  30 min) — zero extra API calls, zero tokens.
+- **Gate integration**: the snapshot's `context.model_cost` carries the
+  current-window per-model shares, and any model over `warn_fraction`
+  (default 50%) of the window budget injects a
+  `WARNING: <model> consumed NN% of the OpenCode Go 5h window…` line into
+  `context.warning` for the task creator. All ledger failures degrade to
+  silence — observability never breaks the gate.
+- **Queries**: `python3 scripts/model-cost-ledger.py report [--json] [--last 24h]`
+  reproduces the console's per-model consumption table; `sync` forces an
+  immediate accumulation pass.
+- **Re-baselining**: delete BOTH `model-cost-ledger.jsonl` and
+  `model-cost-ledger.cursor.json` together (deleting only the ledger
+  would re-count from the cursor and lose history; deleting only the
+  cursor would double-count).
 
 ## Decision heuristic
 

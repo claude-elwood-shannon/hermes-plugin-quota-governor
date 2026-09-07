@@ -715,6 +715,58 @@ def worker_model_for(profile):
     """
     return PROFILE_WORKER_MODELS.get(profile, PROFILE_MODELS.get(profile))
 
+
+# ---------------------------------------------------------------------------
+# Per-model cost ledger (MULTI-PROV-09, t_5bdd7cfa)
+# ---------------------------------------------------------------------------
+# The ledger accumulates per-model consumption within OpenCode Go 5h
+# rolling windows from the token deltas Hermes records in each profile's
+# state.db (the API cost field is not persisted by Hermes — verified Sep 7
+# 2026).  Integration is deliberately non-fatal: observability must never
+# break the gate, so every helper here is wrapped in try/except and only
+# ADDS context fields/warnings.  See scripts/model-cost-ledger.py for the
+# estimation formula and its limitations.
+
+def _model_ledger_module():
+    """Lazily import model-cost-ledger.py (hyphenated filename)."""
+    global _MODEL_LEDGER_MOD
+    if _MODEL_LEDGER_MOD is _LEDGER_UNSET:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "model-cost-ledger.py")
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("model_cost_ledger", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _MODEL_LEDGER_MOD = mod
+        except Exception:
+            _MODEL_LEDGER_MOD = None
+    return _MODEL_LEDGER_MOD
+
+
+_LEDGER_UNSET = object()
+_MODEL_LEDGER_MOD = _LEDGER_UNSET
+
+
+def model_cost_context(rolling_resets_at=None):
+    """Best-effort per-model cost block for the gate snapshot.
+
+    Returns (context_dict_or_None, warning_list).  Opportunistically syncs
+    the ledger (max one sync per 20 min, cron cadence is 30 min so normally
+    every gate run refreshes it).  Any error degrades to (None, []).
+    """
+    try:
+        mod = _model_ledger_module()
+        if mod is None:
+            return None, []
+        mod.sync_model_cost_ledger_if_due()
+        shares = mod.current_window_shares(reset_at=rolling_resets_at)
+        warns = mod.model_window_warnings(reset_at=rolling_resets_at)
+        return (shares if shares and shares.get("models") else None), warns
+    except Exception:
+        return None, []
+
+
 # Tie-breaking preference order (lower = preferred)
 PROVIDER_PREFERENCE = {
     "pr-ollama": 0,
@@ -1263,6 +1315,18 @@ def main():
     recommended = select_provider(providers_list, privacy_level=privacy_level,
                                   parked=parked)
 
+    # --- Per-model cost ledger (MULTI-PROV-09, t_5bdd7cfa) ---
+    # Opportunistic sync + per-window shares/warnings.  Reuse the gate's
+    # own live rolling_resets_at (from the query above) so no second API
+    # call is needed for window anchoring.  Never fatal.
+    _ocg_reset = None
+    for p in providers_list:
+        if p.get("provider") == "opencode-go":
+            _ocg_reset = (p.get("raw") or {}).get("rolling_resets_at")
+    model_cost, model_cost_warnings = model_cost_context(_ocg_reset)
+    for w in model_cost_warnings:
+        warnings.append(w)
+
     # If privacy filtering eliminated all candidates, warn
     if recommended is None and privacy_level:
         capable_providers = PRIVACY_CAPABILITIES.get(privacy_level, set())
@@ -1313,6 +1377,8 @@ def main():
                 "burn_warnings": load_burn_warnings(),
             },
         }
+        if model_cost:
+            output["context"]["model_cost"] = model_cost
         print(json.dumps(output))
         return
 
@@ -1370,6 +1436,7 @@ def main():
             "valid_profiles": valid_profiles,
             "warning": warning,
             "burn_warnings": load_burn_warnings(),
+            "model_cost": model_cost,
         },
     }
     print(json.dumps(output))
