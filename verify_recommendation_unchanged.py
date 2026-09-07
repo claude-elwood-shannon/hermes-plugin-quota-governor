@@ -63,14 +63,36 @@ def old_gate_ref():
     top of the base commit.  After a rebase onto main, HEAD itself already
     contains the S1 changes, so the "old" side would be the modified gate
     and the diff would be meaningless (privacy_summary stripped from one
-    side only).  Anchor on the merge-base instead, falling back to HEAD.
+    side only).  Resolution order:
+      1. QUOTA_GATE_BASE_REF env override (explicit, for automation).
+      2. merge-base(HEAD, main) — correct while S1 sits on a feature branch.
+      3. HEAD~1 — once merged, the parent of the fix commit predates S1.
     """
-    out = subprocess.run(
-        ["git", "-C", REPO, "merge-base", "HEAD", "main"],
-        capture_output=True, text=True,
-    )
-    if out.returncode == 0 and out.stdout.strip():
-        return out.stdout.strip()
+    override = os.environ.get("QUOTA_GATE_BASE_REF")
+    if override:
+        return override
+
+    def git(*args):
+        r = subprocess.run(["git", "-C", REPO, *args],
+                           capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    # Pickaxe: the first commit that introduced the S1 census function;
+    # its parent is the true pre-S1 baseline.  Works on the feature branch
+    # AND after the merge onto main, where merge-base(HEAD, main) degenerates
+    # to HEAD and HEAD~N counting is positional/fragile.
+    introduced = git("log", "--format=%H", "--reverse", "-S",
+                     "compute_privacy_summary", "--", "scripts/quota-gate.py")
+    first = introduced.splitlines()[0] if introduced else ""
+    if first:
+        parent = git("rev-parse", f"{first}^")
+        if parent:
+            return parent
+
+    base = git("merge-base", "HEAD", "main")
+    head = git("rev-parse", "HEAD")
+    if base and head and base != head:
+        return base
     return "HEAD~1"
 
 
@@ -93,7 +115,7 @@ def extract_old_gate():
         f.write(out.stdout)
 
     cfg = subprocess.run(
-        ["git", "-C", REPO, "show", "HEAD:scripts/providers.json"],
+        ["git", "-C", REPO, "show", f"{ref}:scripts/providers.json"],
         capture_output=True, text=True,
     )
     if cfg.returncode == 0:
@@ -176,7 +198,8 @@ def capture_output(mod, kanban_db, scratch):
          mock.patch.object(mod, "get_existing_profiles",
                            lambda: set(EXPECTED_PROFILES)), \
          mock.patch.object(mod, "get_env", lambda key: FAKE_ENV.get(key)), \
-         mock.patch.object(mod, "model_cost_context", ledger_frozen), \
+         mock.patch.object(mod, "model_cost_context", ledger_frozen,
+                           create=True), \
          contextlib.redirect_stdout(buf):
         mod.main()
     return json.loads(buf.getvalue().strip())
