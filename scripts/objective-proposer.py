@@ -876,6 +876,119 @@ def record_proposal(
         log(f"Error recording proposal: {e}", "ERROR")
 
 
+# ── OBJ-02 cost tag guarantee (t_e3d17323) ──────────────────────────────────
+
+# Calibration categories for USD cost attribution (OBJ-02) — same set as
+# cost-tag-fix.py.  Every auto-created task body MUST carry a parseable
+# `cost:<category>` tag in its header: the USD calibration joins
+# model-cost-ledger.jsonl to tasks via this tag, so a missing tag is
+# silent data loss for the per-category table.
+COST_CATEGORIES = {"micro", "tiny", "small", "medium", "complex"}
+# Default when the proposer path did not pick one explicitly.
+DEFAULT_COST_TAG = "tiny"
+
+# Matches a cost segment both line-style (`cost:small`) and pipe-style
+# (`objective:OBJ-X | auto_created:true | cost:small | model:fast`).
+COST_SEGMENT_RE = re.compile(r"(?i)^cost[eé]?\s*:\s*([\w-]+)$")
+COST_INLINE_RE = re.compile(r"(?i)(cost[eé]?\s*:\s*)([\w-]+)")
+AUTO_CREATED_LINE_RE = re.compile(r"(?i)^\s*auto[_\s-]?created\s*:\s*true\s*$")
+# A pipe-style tag line that CONTAINS an auto_created:true segment.
+AUTO_CREATED_PIPE_LINE_RE = re.compile(
+    r"(?i)^\s*.*\|.*auto[_\s-]?created\s*:\s*true")
+AUTO_CREATED_INLINE_RE = re.compile(r"(?i)auto[_\s-]?created\s*:\s*true")
+
+
+def _header_lines(body: str) -> List[str]:
+    """Body lines before the first blank line (the tag header)."""
+    lines = body.splitlines()
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            return lines[:i]
+    return lines
+
+
+def body_header_cost_tag(body: str) -> Optional[str]:
+    """Canonical cost category from the body header, or None.
+
+    Handles both one-tag-per-line and pipe-separated headers.  Prose
+    mentions of 'cost:' below the header never count.
+    """
+    if not body:
+        return None
+    for ln in _header_lines(body):
+        for segment in ln.split("|"):
+            m = COST_SEGMENT_RE.match(segment.strip())
+            if m:
+                value = m.group(1).lower()
+                if value in COST_CATEGORIES:
+                    return value
+    return None
+
+
+def enforce_cost_tag(body: str, default: str = DEFAULT_COST_TAG) -> Tuple[str, str]:
+    """Guarantee a parseable `cost:<category>` tag in the body header.
+
+    Returns (new_body, action):
+      'keep'      — canonical tag already present (no-op)
+      'normalise' — a non-canonical cost segment was rewritten in place
+      'inject'    — no cost segment in header; `cost:<default>` inserted
+                    right after the auto_created line (or first line when
+                    there is no auto_created line)
+    Pure function; never touches prose below the header.
+    """
+    lines = body.splitlines(keepends=False)
+    end = len(lines)
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            end = i
+            break
+    header, rest = lines[:end], lines[end:]
+
+    cost_idx = None
+    for i, ln in enumerate(header):
+        for segment in ln.split("|"):
+            if COST_SEGMENT_RE.match(segment.strip()):
+                cost_idx = i
+                break
+        if cost_idx is not None:
+            break
+
+    if cost_idx is not None:
+        m = COST_INLINE_RE.search(header[cost_idx])
+        canon = m.group(2).lower() if m else ""
+        if canon in COST_CATEGORIES:
+            # Canonical VALUE present (any key case / spacing / pipe style) —
+            # every parser (backstop, usd-stats) reads it fine.  No-op.
+            return body, "keep"
+        # Unmappable value (xl, coste:, garbage, empty) → rewrite to default.
+        header[cost_idx] = COST_INLINE_RE.sub(
+            lambda mm: mm.group(1) + default, header[cost_idx], count=1
+        )
+        return "\n".join(header + rest), "normalise"
+
+    insert_at = 0
+    for i, ln in enumerate(header):
+        if AUTO_CREATED_LINE_RE.match(ln):
+            insert_at = i + 1
+            break
+        if AUTO_CREATED_PIPE_LINE_RE.match(ln):
+            # Pipe-style header (`objective:X | auto_created:true | model:fast`):
+            # append the tag to the SAME line so the header stays pipe-style
+            # and the backstop still sees auto_created:true in its segment.
+            header[i] = (
+                AUTO_CREATED_INLINE_RE.sub(
+                    lambda mm: mm.group(0) + f" | cost:{default}", ln, count=1
+                )
+            )
+            return "\n".join(header + rest), "inject"
+
+    header.insert(insert_at, f"cost:{default}")
+    new_body = "\n".join(header + rest)
+    if body.endswith("\n"):
+        new_body += "\n"
+    return new_body, "inject"
+
+
 # ── Task creation ────────────────────────────────────────────────────────────
 
 def create_triage_task(title: str, body: str) -> Optional[str]:
@@ -883,6 +996,14 @@ def create_triage_task(title: str, body: str) -> Optional[str]:
 
     Returns the task_id if successful, None otherwise.
     """
+    # OBJ-02 guarantee (t_e3d17323): every created task body must carry a
+    # parseable cost:<category> tag in its header, so the USD calibration
+    # (docs/quota-planner.md § USD cost calibration) can join ledger rows
+    # to tasks.  Deterministic, applied on every path that creates tasks.
+    body, cost_action = enforce_cost_tag(body)
+    if cost_action != "keep":
+        log(f"cost tag {cost_action} applied to proposal body: {title}")
+
     cmd = [
         HERMES_CLI, "kanban", "create",
         title,
