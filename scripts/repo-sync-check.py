@@ -2,19 +2,33 @@
 """
 repo-sync-check.py — OBJ-13: Automatic repo synchronization monitor.
 
-Checks the plugin repo at REPO for:
-  1. Uncommitted changes to tracked files (excluding .worktrees/)
-  2. Commits ahead of origin/main (committed but not pushed)
+Monitors one or more repositories and creates kanban tasks for commit+push
+when a repo has uncommitted or unpushed changes. Repos are driven by an
+external config file:
 
-If either condition is found, creates a kanban task for commit+push.
-Idempotent: tracks created sync tasks in repo-sync.jsonl and queries the
-board to avoid duplicate sync tasks.
+    ~/.hermes/quota-governor/repo-watch.json
 
-Design principles (mirrors diagnose-crash.py):
+a JSON array of objects:
+    {
+      "repo":     "REPO",  # absolute path
+      "remote":   "origin",            # remote ref (default "origin")
+      "assignee": "pr-nanogpt",        # profile (default "auto" -> DEFAULT_ASSIGNEE)
+      "enabled":  true                 # skip when false
+    }
+
+If the config file does NOT exist, the watchdog falls back to the historic
+hardcoded REPO_DIR (single-repo behavior, zero regression).
+
+Safety properties (mirrors diagnose-crash.py):
   - Dry-run by default. Never creates tasks without --execute.
-  - Silent on empty: exits 0 with empty stdout when repo is synced.
-  - Max 1 sync task per tick (avoid board flooding).
-  - Idempotent: checks board for existing pending sync tasks before creating.
+  - Silent on empty: exits 0 with empty stdout when every watched repo is synced.
+  - Max 1 sync task per tick total (flood prevention across all repos).
+  - Per-repo idempotency: queries the board for an existing pending sync task
+    for that repo before creating; tracks created tasks in repo-sync.jsonl.
+  - Oldest-desync priority: from the dirty repos that need a task, creates the
+    task for the repo that has been desynced the longest.
+  - Fail-safe config: a corrupt/malformed repo-watch.json aborts with no tasks
+    created; a bad/disabled repo entry is skipped, never fatal.
   - Push failure handling: task body includes backoff retry instructions.
 
 Usage:
@@ -39,10 +53,13 @@ REPO_DIR = "REPO"
 KANBAN_DB = os.path.expanduser("~/.hermes/kanban.db")
 SYNC_FILE = os.path.expanduser("~/.hermes/quota-governor/repo-sync.jsonl")
 LOG_FILE = os.path.expanduser("~/.hermes/logs/repo-sync-check.log")
+CONFIG_FILE = os.path.expanduser("~/.hermes/quota-governor/repo-watch.json")
 MAX_SYNC_PER_TICK = 1
-SYNC_VERSION = "1.0"
+SYNC_VERSION = "2.0"
 # Assignee for created sync tasks — profile with the most quota
 DEFAULT_ASSIGNEE = "pr-nanogpt"
+DEFAULT_BRANCH = "main"
+DEFAULT_REMOTE = "origin"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -56,6 +73,57 @@ def log(msg, level="INFO"):
         f.write(line + "\n")
     if VERBOSE or level in ("WARN", "ERROR"):
         print(line, file=sys.stderr)
+
+# ── Config loading ───────────────────────────────────────────────────────────
+
+def load_repo_configs():
+    """Return a list of repo config dicts.
+
+    Priority:
+      1. If repo-watch.json exists and is valid JSON, return its array
+         (each entry normalized with defaults). Corrupt/malformed config
+         raises ValueError so the caller can abort safely with no tasks.
+      2. Otherwise (file absent), return the legacy single-repo config so
+         today's behavior is unchanged.
+    """
+    if not os.path.isfile(CONFIG_FILE):
+        log(f"Config file {CONFIG_FILE} not found — falling back to single-repo {REPO_DIR}")
+        return [_normalize_config({"repo": REPO_DIR})]
+
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"Corrupt or unreadable config {CONFIG_FILE}: {e}", "ERROR")
+        raise ValueError(f"repo-watch.json is corrupt or unreadable: {e}")
+
+    if not isinstance(raw, list):
+        log(f"Config {CONFIG_FILE} is not a JSON array", "ERROR")
+        raise ValueError("repo-watch.json must be a JSON array of repo objects")
+
+    configs = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            log(f"Config entry is not an object: {entry!r} — skipping", "WARN")
+            continue
+        if "repo" not in entry or not isinstance(entry.get("repo"), str) or not entry.get("repo"):
+            log(f"Config entry missing valid 'repo' path: {entry!r} — skipping", "WARN")
+            continue
+        configs.append(_normalize_config(entry))
+    return configs
+
+def _normalize_config(entry):
+    """Apply defaults: remote=origin, branch=main, assignee=auto, enabled=True."""
+    return {
+        "repo": entry["repo"],
+        "remote": entry.get("remote", DEFAULT_REMOTE) or DEFAULT_REMOTE,
+        "branch": entry.get("branch", DEFAULT_BRANCH) or DEFAULT_BRANCH,
+        "assignee": entry.get("assignee", "auto"),
+        "enabled": entry.get("enabled", True),
+    }
+
+def repo_basename(repo_dir):
+    return os.path.basename(os.path.normpath(repo_dir)) or repo_dir
 
 # ── Git Helpers ──────────────────────────────────────────────────────────────
 
@@ -77,11 +145,11 @@ def git(args, cwd=REPO_DIR):
         out = out[:-1]
     return result.returncode, out, result.stderr.strip()
 
-def get_uncommitted_changes():
+def get_uncommitted_changes(cwd=REPO_DIR):
     """Return list of changed tracked files (excluding .worktrees/ and untracked)."""
-    rc, out, _ = git(["status", "--porcelain", "--untracked-files=no"])
+    rc, out, _ = git(["status", "--porcelain", "--untracked-files=no"], cwd=cwd)
     if rc != 0:
-        log(f"git status failed (rc={rc})", "ERROR")
+        log(f"git status failed (rc={rc}) in {cwd}", "ERROR")
         return []
     changes = []
     for line in out.splitlines():
@@ -99,21 +167,20 @@ def get_uncommitted_changes():
         changes.append({"status": status, "path": path})
     return changes
 
-def get_ahead_count():
-    """Return number of commits ahead of origin/main."""
-    rc, out, _ = git(["rev-list", "--count", "origin/main..main"])
+def get_ahead_count(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+    """Return number of commits ahead of <remote>/<branch>."""
+    rc, out, _ = git(["rev-list", "--count", f"{remote}/{branch}..{branch}"], cwd=cwd)
     if rc != 0:
-        # origin/main might not exist yet
-        log(f"git rev-list failed (rc={rc}): {out}", "WARN")
+        log(f"git rev-list failed (rc={rc}) in {cwd}", "WARN")
         return 0
     try:
         return int(out)
     except ValueError:
         return 0
 
-def get_ahead_commits():
-    """Return list of commit hashes and messages ahead of origin/main."""
-    rc, out, _ = git(["log", "--oneline", "origin/main..main"])
+def get_ahead_commits(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+    """Return list of commit hashes and messages ahead of <remote>/<branch>."""
+    rc, out, _ = git(["log", "--oneline", f"{remote}/{branch}..{branch}"], cwd=cwd)
     if rc != 0:
         return []
     commits = []
@@ -124,13 +191,62 @@ def get_ahead_commits():
         commits.append({"hash": parts[0], "message": parts[1] if len(parts) > 1 else ""})
     return commits
 
+def get_ahead_oldest_ts(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+    """Return the unix timestamp of the OLDEST commit ahead of <remote>/<branch>, or None."""
+    rc, out, _ = git(["log", "--format=%ct", f"{remote}/{branch}..{branch}"], cwd=cwd)
+    if rc != 0:
+        return None
+    times = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            times.append(int(line))
+        except ValueError:
+            continue
+    return min(times) if times else None
+
+def _min_mtime_for_changes(cwd, changes):
+    """Earliest mtime among changed tracked paths (robust to deleted/renamed)."""
+    mtimes = []
+    for c in changes[:200]:
+        p = os.path.join(cwd, c["path"])
+        try:
+            mtimes.append(os.path.getmtime(p))
+        except OSError:
+            continue
+    return min(mtimes) if mtimes else None
+
+def compute_desync_time(cwd, uncommitted, ahead_commits, remote, branch):
+    """Return the earliest timestamp at which this repo became desynced.
+
+    Combines the oldest ahead-commit time (committed-but-unpushed) with the
+    earliest mtime of uncommitted files. This is used to prioritize which
+    repo to sync first (oldest desync first). Returns None if no desync.
+    """
+    candidates = []
+    if ahead_commits:
+        ts = get_ahead_oldest_ts(cwd=cwd, remote=remote, branch=branch)
+        if ts:
+            candidates.append(ts)
+    if uncommitted:
+        ts = _min_mtime_for_changes(cwd, uncommitted)
+        if ts:
+            candidates.append(ts)
+    return min(candidates) if candidates else None
+
 # ── DB Helpers ───────────────────────────────────────────────────────────────
 
 def get_db_path():
     return os.environ.get("HERMES_KANBAN_DB", KANBAN_DB)
 
-def has_pending_sync_task(conn):
+def has_pending_sync_task(conn, repo=None):
     """Check if there's already an active (non-done, non-blocked) sync task.
+
+    When `repo` is provided, restrict the match to tasks whose title names
+    that repo (its basename) so multiple repos are independently idempotent.
+    Without repo, behaves exactly as before (any OBJ-13: Repo sync task).
 
     We look for tasks whose title starts with 'OBJ-13:' and are in an
     active state (todo, ready, running). Blocked tasks are excluded
@@ -138,15 +254,29 @@ def has_pending_sync_task(conn):
     human intervention — a new sync task should be created for any
     new changes detected.
     """
-    rows = conn.execute(
-        """
-        SELECT id, title, status FROM tasks
-        WHERE title LIKE 'OBJ-13: Repo sync%'
-          AND status IN ('todo', 'ready', 'running')
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-    ).fetchall()
+    if repo:
+        basename = repo_basename(repo)
+        rows = conn.execute(
+            """
+            SELECT id, title, status FROM tasks
+            WHERE title LIKE 'OBJ-13: Repo sync%'
+              AND title LIKE ?
+              AND status IN ('todo', 'ready', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (f"%{basename}%",),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, title, status FROM tasks
+            WHERE title LIKE 'OBJ-13: Repo sync%'
+              AND status IN ('todo', 'ready', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+        ).fetchall()
     return [dict(r) for r in rows] if rows else []
 
 # ── Idempotency ──────────────────────────────────────────────────────────────
@@ -170,13 +300,22 @@ def load_synced_records():
         log(f"Failed to load sync file: {e}", "WARN")
     return records
 
-def record_sync(sync_task_id, uncommitted, ahead_commits):
+def _record_pattern_key(repo_dir, remote):
+    """Composite identity for the ledger — per-repo idempotency marker."""
+    return f"{repo_dir}@{remote}"
+
+def record_sync(sync_task_id, uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
     """Append a sync record to repo-sync.jsonl."""
     os.makedirs(os.path.dirname(SYNC_FILE), exist_ok=True)
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": SYNC_VERSION,
         "sync_task_id": sync_task_id,
+        "repo": repo,
+        "remote": remote,
+        "branch": branch,
+        "pattern_key": _record_pattern_key(repo, remote),
+        "repo_basename": repo_basename(repo),
         "uncommitted_files": len(uncommitted),
         "ahead_commits": len(ahead_commits),
         "uncommitted_paths": [c["path"] for c in uncommitted][:20],
@@ -185,16 +324,44 @@ def record_sync(sync_task_id, uncommitted, ahead_commits):
     with open(SYNC_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
+def recently_synced_repo(repo_dir, remote=DEFAULT_REMOTE, window_seconds=3600):
+    """True if a ledger record exists for this repo within the last `window_seconds`."""
+    key = _record_pattern_key(repo_dir, remote)
+    cutoff = time.time() - window_seconds
+    for rec in load_synced_records():
+        rec_key = rec.get("pattern_key")
+        if rec_key is None:
+            # Legacy records lack pattern_key; fall back to repo field/path match.
+            rec_key = _legacy_key(rec)
+        if rec_key == key:
+            try:
+                ts = datetime.fromisoformat(rec.get("timestamp", "")).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if ts >= cutoff:
+                return True
+    return False
+
+def _legacy_key(rec):
+    """Best-effort identity for pre-v2 ledger entries (no pattern_key, no repo)."""
+    r = rec.get("repo")
+    if r:
+        return f"{r}@{rec.get('remote', DEFAULT_REMOTE)}"
+    # Old single-repo records: treat as the legacy REPO_DIR.
+    return f"{REPO_DIR}@{DEFAULT_REMOTE}"
+
 # ── Task Creation ────────────────────────────────────────────────────────────
 
-def build_sync_body(uncommitted, ahead_commits):
+def build_sync_body(uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH, assignee=None):
     """Build the body for the sync task."""
     sections = []
+    repo_label = repo
+    display_name = repo_basename(repo)
 
     sections.append(
         "OBJ-13: Sincronizacion automatica del repo\n\n"
-        "El cron de sincronizacion detecto cambios sin publicar en "
-        "REPO.\n\n"
+        f"El cron de sincronizacion detecto cambios sin publicar en {repo_label} "
+        f"(repo: {display_name}, remote: {remote}, branch: {branch}).\n\n"
     )
 
     if uncommitted:
@@ -216,14 +383,14 @@ def build_sync_body(uncommitted, ahead_commits):
     sections.append(
         "## Instrucciones\n\n"
         "1. Revisar los cambios con `git status` y `git diff` en "
-        "REPO\n"
+        f"{repo_label}\n"
         "2. Si hay cambios sin commitear que tocan codigo del plugin:\n"
         "   - Commitear con el nombre/email del usuario (NUNCA inventar datos):\n"
         "     git -c user.name='Claude Elwood Shannon' "
         "-c user.email='claude.el.shannon@proton.me' commit -m '<msg>'\n"
         "   - Excluir archivos de entorno/ruido (.worktrees/, __pycache__/, etc.)\n"
-        "3. Pushear a origin/main (Tor via SSH ProxyCommand ya configurado):\n"
-        "   git push origin main\n"
+        f"3. Pushear a {remote}/{branch} (Tor via SSH ProxyCommand ya configurado):\n"
+        f"   git push {remote} {branch}\n"
         "   (El SSH config usa ProxyCommand nc -x 127.0.0.1:9050 para github.com)\n"
         "   NOTA: NO usar 'torify git push' — causa doble proxy y falla.\n"
         "4. Si el push falla (Tor/red), reintentar con backoff:\n"
@@ -232,31 +399,41 @@ def build_sync_body(uncommitted, ahead_commits):
         "   - Esperar 5min, reintentar\n"
         "   - Si despues de 3 intentos falla, documentar el error y bloquear "
         "la tarea con kanban_block(reason='Push failed: <error>')\n"
-        "5. Verificar que origin/main coincide con local:\n"
-        "   git fetch origin && git rev-list --count origin/main..main\n"
+        f"5. Verificar que {remote}/{branch} coincide con local:\n"
+        f"   git fetch {remote} && git rev-list --count {remote}/{branch}..{branch}\n"
         "   Debe ser 0.\n"
         "6. Dejar evidencia: output de git push y git log en el summary.\n"
     )
 
     return "\n".join(sections)
 
-def create_sync_task(uncommitted, ahead_commits):
-    """Create a sync task via hermes kanban create CLI."""
-    body = build_sync_body(uncommitted, ahead_commits)
+def _resolve_assignee(cfg):
+    if cfg["assignee"] == "auto":
+        return DEFAULT_ASSIGNEE
+    return cfg["assignee"]
 
-    # Descriptive title with timestamp
+def create_sync_task(uncommitted, ahead_commits, cfg):
+    """Create a sync task via hermes kanban create CLI."""
+    repo = cfg["repo"]
+    remote = cfg["remote"]
+    branch = cfg["branch"]
+    assignee = _resolve_assignee(cfg)
+    basename = repo_basename(repo)
+    body = build_sync_body(uncommitted, ahead_commits, repo=repo, remote=remote, branch=branch, assignee=assignee)
+
+    # Descriptive title with repo basename + timestamp
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     parts = []
     if uncommitted:
         parts.append(f"{len(uncommitted)} uncommitted")
     if ahead_commits:
         parts.append(f"{len(ahead_commits)} unpushed")
-    title = f"OBJ-13: Repo sync needed ({', '.join(parts)}) [{ts}]"
+    title = f"OBJ-13: Repo sync {basename} needed ({', '.join(parts)}) [{ts}]"
 
     try:
         result = subprocess.run(
             ['hermes', 'kanban', 'create', title,
-             '--assignee', DEFAULT_ASSIGNEE,
+             '--assignee', assignee,
              '--workspace', 'scratch',
              '--body', body,
              '--created-by', 'repo-sync-check.py',
@@ -281,6 +458,59 @@ def create_sync_task(uncommitted, ahead_commits):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def _repo_needs_sync(cfg):
+    """Return (uncommitted, ahead_commits) or (None, None) if repo is clean/invalid.
+
+    Also verifies the repo dir is a valid git checkout; invalid repos are
+    skipped with a warning (fail-safe), never fatal.
+    """
+    repo = cfg["repo"]
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        log(f"Repo not found or not a git checkout at {repo} — skipping", "WARN")
+        return None, None
+    uncommitted = get_uncommitted_changes(cwd=repo)
+    ahead_commits = get_ahead_commits(cwd=repo, remote=cfg["remote"], branch=cfg["branch"])
+    if not uncommitted and not ahead_commits:
+        return [], []
+    return uncommitted, ahead_commits
+
+def _gather_dirty_repos(configs, db_path):
+    """Return list of {cfg, uncommitted, ahead_commits, desync_time, pending} for dirty repos."""
+    dirty = []
+    conn = None
+    try:
+        if os.path.isfile(db_path):
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+        for cfg in configs:
+            if not cfg["enabled"]:
+                log(f"Repo disabled in config: {cfg['repo']} — skipping", "INFO")
+                continue
+            uncommitted, ahead_commits = _repo_needs_sync(cfg)
+            if uncommitted is None:
+                continue
+            if not uncommitted and not ahead_commits:
+                continue
+            # If the board DB is unavailable we cannot consult it; treat as no
+            # pending task (do not let a missing DB block sync creation).
+            pending_id = None
+            if conn is not None:
+                pending = has_pending_sync_task(conn, repo=cfg["repo"])
+                pending_id = pending[0]["id"] if pending else None
+            desync_time = compute_desync_time(cfg["repo"], uncommitted, ahead_commits, cfg["remote"], cfg["branch"])
+            dirty.append({
+                "cfg": cfg,
+                "uncommitted": uncommitted,
+                "ahead_commits": ahead_commits,
+                "desync_time": desync_time,
+                "pending": bool(pending_id),
+                "pending_id": pending_id,
+            })
+    finally:
+        if conn:
+            conn.close()
+    return dirty
+
 def main():
     global VERBOSE
 
@@ -299,48 +529,63 @@ def main():
 
     VERBOSE = args.verbose
 
-    # Verify repo exists
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        log(f"Repo not found at {REPO_DIR}", "ERROR")
+    # Load repo configs. Corrupt config aborts safely with no tasks created.
+    try:
+        configs = load_repo_configs()
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
-
-    # Gather repo state
-    uncommitted = get_uncommitted_changes()
-    ahead_commits = get_ahead_commits()
-    ahead_count = len(ahead_commits)
-
-    if not uncommitted and ahead_count == 0:
-        # Repo is synced — silent exit for no_agent cron
-        if VERBOSE:
-            print("Repo is synced. No action needed.")
+    if not configs:
+        log("No enabled repos configured — nothing to do", "INFO")
         sys.exit(0)
 
-    log(f"Repo needs sync: {len(uncommitted)} uncommitted files, "
-        f"{ahead_count} commits ahead of origin/main", "INFO")
+    # Verify default-repo fallback still points at a valid checkout (legacy path).
+    if len(configs) == 1 and os.path.abspath(configs[0]["repo"]) == os.path.abspath(REPO_DIR):
+        if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+            log(f"Repo not found at {REPO_DIR}", "ERROR")
+            sys.exit(1)
 
-    # Check idempotency: is there already a pending sync task?
-    if not os.path.isfile(get_db_path()):
-        log(f"Kanban DB not found at {get_db_path()}", "WARN")
-    else:
-        conn = sqlite3.connect(get_db_path())
-        conn.row_factory = sqlite3.Row
-        try:
-            existing = has_pending_sync_task(conn)
-        finally:
-            conn.close()
+    db_path = get_db_path()
 
-        if existing:
-            log(f"Pending sync task already exists: {existing[0]['id']} "
-                f"(status={existing[0]['status']}). Not creating duplicate.", "INFO")
-            if VERBOSE:
-                print(f"SKIP: pending sync task {existing[0]['id']} already on board")
-            sys.exit(0)
+    # Gather dirty repos (respecting enabled flag and per-repo pending state).
+    dirty = _gather_dirty_repos(configs, db_path)
 
-    # Create the sync task
+    if not dirty:
+        # All watched repos synced (or no eligible desync) — silent exit.
+        if VERBOSE:
+            print("All watched repos are synced. No action needed.")
+        sys.exit(0)
+
+    # A repo that already has a pending sync task for IT is not eligible to
+    # create a new one this tick; it's already covered.
+    candidates = [d for d in dirty if not d["pending"]]
+
+    # Flood prevention: cap total new tasks at 1 per tick. Among eligible
+    # (non-pending) dirty repos, pick the one with the OLDEST desync.
+    if not candidates:
+        # Every dirty repo already has a pending task on the board.
+        if VERBOSE:
+            print("SKIP: all dirty repos already have pending sync tasks on board")
+        for d in dirty:
+            p = d.get("pending_id")
+            if p:
+                log(f"Repo {d['cfg']['repo']} already pending ({p}) — not creating duplicate", "INFO")
+        sys.exit(0)
+
+    candidates.sort(key=lambda d: d["desync_time"] if d["desync_time"] is not None else float("inf"))
+    target = candidates[0]
+    cfg = target["cfg"]
+    uncommitted = target["uncommitted"]
+    ahead_commits = target["ahead_commits"]
+    basename = repo_basename(cfg["repo"])
+
+    log(f"Repo {cfg['repo']} needs sync: {len(uncommitted)} uncommitted files, "
+        f"{len(ahead_commits)} commits ahead of {cfg['remote']}/{cfg['branch']}", "INFO")
+
     if args.execute:
-        sync_id = create_sync_task(uncommitted, ahead_commits)
+        sync_id = create_sync_task(uncommitted, ahead_commits, cfg)
         if sync_id:
-            record_sync(sync_id, uncommitted, ahead_commits)
+            record_sync(sync_id, uncommitted, ahead_commits, repo=cfg["repo"], remote=cfg["remote"], branch=cfg["branch"])
             # Print to stdout for cron delivery
             summary_parts = []
             if uncommitted:
@@ -349,7 +594,7 @@ def main():
                 summary_parts.append(f"{len(ahead_commits)} unpushed commits")
             print(
                 f"SYNC_TASK_CREATED: {sync_id} — "
-                f"{' and '.join(summary_parts)} in plugin repo"
+                f"{' and '.join(summary_parts)} in {basename}"
             )
         else:
             log("Failed to create sync task", "ERROR")
@@ -365,7 +610,9 @@ def main():
             summary_parts.append(f"{len(ahead_commits)} unpushed commits")
             for c in ahead_commits[:10]:
                 print(f"  UNPUSHED: {c['hash']} {c['message']}")
-        print(f"DRY-RUN: would create sync task ({', '.join(summary_parts)})")
+        if len(candidates) > 1:
+            print(f"Note: {len(candidates)} eligible dirty repos this tick; choosing oldest desync first.")
+        print(f"DRY-RUN: would create sync task for {basename} ({', '.join(summary_parts)})")
 
 if __name__ == "__main__":
     main()

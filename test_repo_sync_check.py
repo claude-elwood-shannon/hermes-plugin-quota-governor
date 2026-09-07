@@ -342,7 +342,11 @@ class TestRecordSync(unittest.TestCase):
                 self.assertEqual(data["ahead_commits"], 1)
                 self.assertEqual(data["uncommitted_paths"], ["foo.py"])
                 self.assertEqual(data["ahead_hashes"], ["abc1234"])
-                self.assertEqual(data["version"], "1.0")
+                self.assertEqual(data["version"], "2.0")
+                # Multi-repo: ledger records the repo/remote/branch identity
+                self.assertEqual(data["repo"], _mod.REPO_DIR)
+                self.assertEqual(data["remote"], "origin")
+                self.assertEqual(data["pattern_key"], f"{_mod.REPO_DIR}@origin")
 
     def test_record_truncates_long_lists(self):
         """Uncommitted paths and ahead hashes are truncated to 20."""
@@ -437,6 +441,275 @@ class TestMainDryRun(unittest.TestCase):
         with patch("repo_sync_check.get_db_path", return_value="/nonexistent.db"):
             _mod.main()
         # main() doesn't sys.exit in dry-run with changes (it just prints)
+
+
+# ── Multi-repo config tests ──────────────────────────────────────────────────
+
+class TestLoadRepoConfigs(unittest.TestCase):
+    """Tests for load_repo_configs()."""
+
+    def test_config_absent_falls_back_to_single_repo(self):
+        """No config file → legacy single-repo config (REPO_DIR)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("repo_sync_check.CONFIG_FILE", os.path.join(tmpdir, "missing.json")):
+                configs = _mod.load_repo_configs()
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0]["repo"], _mod.REPO_DIR)
+        self.assertTrue(configs[0]["enabled"])
+        self.assertEqual(configs[0]["remote"], "origin")
+
+    def test_valid_multi_repo(self):
+        """Valid config with 2+ repos → parsed with defaults applied."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = os.path.join(tmpdir, "repo-watch.json")
+            with open(cfg, "w") as f:
+                json.dump([
+                    {"repo": "/a/b", "enabled": True},
+                    {"repo": "/c/d", "enabled": False, "assignee": "pr-x", "remote": "upstream"},
+                    {"repo": "/e/f"},
+                ], f)
+            with patch("repo_sync_check.CONFIG_FILE", cfg):
+                configs = _mod.load_repo_configs()
+        self.assertEqual(len(configs), 3)
+        self.assertEqual(configs[0]["assignee"], "auto")
+        self.assertEqual(configs[0]["remote"], "origin")
+        self.assertEqual(configs[1]["enabled"], False)
+        self.assertEqual(configs[1]["assignee"], "pr-x")
+        self.assertEqual(configs[1]["remote"], "upstream")
+        self.assertEqual(configs[2]["enabled"], True)
+
+    def test_corrupt_config_raises(self):
+        """Corrupt JSON → ValueError (caller aborts, no tasks)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = os.path.join(tmpdir, "repo-watch.json")
+            with open(cfg, "w") as f:
+                f.write("{ not json !!!")
+            with patch("repo_sync_check.CONFIG_FILE", cfg):
+                with self.assertRaises(ValueError):
+                    _mod.load_repo_configs()
+
+    def test_non_array_config_raises(self):
+        """Valid JSON but not an array → ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = os.path.join(tmpdir, "repo-watch.json")
+            with open(cfg, "w") as f:
+                json.dump({"repo": "/a/b"}, f)
+            with patch("repo_sync_check.CONFIG_FILE", cfg):
+                with self.assertRaises(ValueError):
+                    _mod.load_repo_configs()
+
+    def test_entry_without_repo_skipped(self):
+        """Entries missing 'repo' are skipped, not fatal."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = os.path.join(tmpdir, "repo-watch.json")
+            with open(cfg, "w") as f:
+                json.dump([
+                    {"enabled": True},
+                    {"repo": "/ok/repo"},
+                ], f)
+            with patch("repo_sync_check.CONFIG_FILE", cfg):
+                configs = _mod.load_repo_configs()
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0]["repo"], "/ok/repo")
+
+
+class TestMultiRepoHasPendingPerRepo(unittest.TestCase):
+    """Per-repo board idempotency."""
+
+    def test_pending_for_other_repo_is_not_pending_for_this_repo(self):
+        """A pending task naming repo A must not block repo B."""
+        db = _make_kanban_db([
+            {"id": "t_a", "title": "OBJ-13: Repo sync myrepoA needed", "status": "todo"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(len(has_pending_sync_task(conn, repo="/x/myrepoB")), 0)
+            self.assertEqual(len(has_pending_sync_task(conn, repo="/x/myrepoA")), 1)
+        finally:
+            conn.close()
+
+    def test_pending_for_same_repo_matches(self):
+        """A pending task naming repo A blocks repo A regardless of timestamp."""
+        db = _make_kanban_db([
+            {"id": "t_a", "title": "OBJ-13: Repo sync myrepoA needed", "status": "running"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(len(has_pending_sync_task(conn, repo="/x/myrepoA")), 1)
+        finally:
+            conn.close()
+
+
+class TestGatherDirtyRepos(unittest.TestCase):
+    """Multi-repo orchestration: dirty detection, disabled skip, pending surfacing."""
+
+    def setUp(self):
+        self.patchers = []
+
+    def tearDown(self):
+        for p in self.patchers:
+            try:
+                p.stop()
+            except Exception:
+                pass
+
+    def _patch(self, target, **kw):
+        p = patch(target, **kw)
+        p.start()
+        self.patchers.append(p)
+        return p
+
+    def _configs(self, entries):
+        return [_mod._normalize_config(e) for e in entries]
+
+    def test_two_dirty_repos_both_gathered_with_desync_priority(self):
+        """2 dirty repos → both gathered; desync_time allows oldest-first pick."""
+        self._patch("repo_sync_check._repo_needs_sync",
+                    side_effect=[
+                        ([{"status": " M", "path": "a.py"}], []),
+                        ([{"status": " M", "path": "b.py"}], []),
+                    ])
+        self._patch("repo_sync_check.compute_desync_time",
+                    side_effect=[100, 50])
+        self._patch("repo_sync_check.os.path.isfile", return_value=False)
+
+        dirty = _mod._gather_dirty_repos(
+            self._configs([
+                {"repo": "/r/repoA"},
+                {"repo": "/r/repoB"},
+            ]),
+            db_path="/nonexistent.db",
+        )
+        self.assertEqual(len(dirty), 2)
+        # repoB has the older desync (50 < 100)
+        by_repo = {d["cfg"]["repo"]: d for d in dirty}
+        self.assertEqual(by_repo["/r/repoA"]["desync_time"], 100)
+        self.assertEqual(by_repo["/r/repoB"]["desync_time"], 50)
+
+    def test_disabled_repo_skipped(self):
+        """A repo disabled in config is not gathered."""
+        self._patch("repo_sync_check._repo_needs_sync",
+                    side_effect=[
+                        ([{"status": " M", "path": "a.py"}], []),  # only repoA called
+                    ])
+        self._patch("repo_sync_check.os.path.isfile", return_value=False)
+
+        dirty = _mod._gather_dirty_repos(
+            self._configs([
+                {"repo": "/r/repoA", "enabled": True},
+                {"repo": "/r/repoDisabled", "enabled": False},
+            ]),
+            db_path="/nonexistent.db",
+        )
+        self.assertEqual(len(dirty), 1)
+        self.assertEqual(dirty[0]["cfg"]["repo"], "/r/repoA")
+
+    def test_pending_is_surfaced(self):
+        """A repo with an existing pending board task is flagged as pending."""
+        self._patch("repo_sync_check._repo_needs_sync",
+                    side_effect=[
+                        ([{"status": " M", "path": "a.py"}], []),
+                    ])
+        db = _make_kanban_db([{"id": "t_p", "title": "OBJ-13: Repo sync repoA needed", "status": "todo"}])
+        self._patch("repo_sync_check.os.path.isfile", return_value=True)
+        with patch("repo_sync_check.sqlite3.connect", return_value=sqlite3.connect(db)):
+            dirty = _mod._gather_dirty_repos(
+                self._configs([{"repo": "/r/repoA"}]),
+                db_path=db,
+            )
+        self.assertEqual(len(dirty), 1)
+        self.assertTrue(dirty[0]["pending"])
+        self.assertEqual(dirty[0]["pending_id"], "t_p")
+
+
+class TestMainMultiRepo(unittest.TestCase):
+    """main() end-to-end multi-repo behavior."""
+
+    def setUp(self):
+        self.patchers = []
+
+    def tearDown(self):
+        for p in self.patchers:
+            try:
+                p.stop()
+            except Exception:
+                pass
+
+    def _patch(self, target, **kw):
+        p = patch(target, **kw)
+        p.start()
+        self.patchers.append(p)
+        return p
+
+    @patch("repo_sync_check.load_repo_configs")
+    @patch("repo_sync_check.get_db_path", return_value="/nonexistent.db")
+    @patch("repo_sync_check.os.path.isfile", return_value=False)
+    @patch("repo_sync_check._gather_dirty_repos")
+    def test_two_dirty_dry_run_creates_one_for_oldest(self, mock_gather, mock_isfile, mock_db, mock_load):
+        """Dry-run over 2 dirty repos → DRY-RUN names only the oldest-desync one."""
+        from unittest.mock import MagicMock
+        dirty = [
+            {
+                "cfg": _mod._normalize_config({"repo": "/r/repoA"}),
+                "uncommitted": [{"status": " M", "path": "a.py"}],
+                "ahead_commits": [],
+                "desync_time": 200,
+                "pending": False,
+                "pending_id": None,
+            },
+            {
+                "cfg": _mod._normalize_config({"repo": "/r/repoB"}),
+                "uncommitted": [{"status": " M", "path": "b.py"}],
+                "ahead_commits": [],
+                "desync_time": 100,  # older → this wins
+                "pending": False,
+                "pending_id": None,
+            },
+        ]
+        mock_gather.return_value = dirty
+        mock_load.return_value = [
+            _mod._normalize_config({"repo": "/r/repoA"}),
+            _mod._normalize_config({"repo": "/r/repoB"}),
+        ]
+        with patch("sys.stdout", new_callable=MagicMock) as out_mock:
+            _mod.main()
+        printed = "".join(call.args[0] for call in out_mock.write.call_args_list)
+        self.assertIn("repoB", printed)
+        self.assertIn("DRY-RUN", printed)
+
+    @patch("repo_sync_check.load_repo_configs", side_effect=ValueError("corrupt"))
+    @patch("repo_sync_check._gather_dirty_repos")
+    def test_corrupt_config_no_tasks(self, mock_gather, mock_load):
+        """Corrupt config → sys.exit(1) without creating any task."""
+        mock_gather.return_value = []
+        with self.assertRaises(SystemExit) as ctx:
+            _mod.main()
+        self.assertEqual(ctx.exception.code, 1)
+        mock_gather.assert_not_called()
+
+    @patch("repo_sync_check.load_repo_configs")
+    @patch("repo_sync_check.get_db_path", return_value="/nonexistent.db")
+    @patch("repo_sync_check.os.path.isfile", return_value=False)
+    @patch("repo_sync_check._gather_dirty_repos")
+    def test_all_pending_skips_new_task(self, mock_gather, mock_isfile, mock_db, mock_load):
+        """If every dirty repo already has a pending task, nothing is created."""
+        dirty = [
+            {
+                "cfg": _mod._normalize_config({"repo": "/r/repoA"}),
+                "uncommitted": [{"status": " M", "path": "a.py"}],
+                "ahead_commits": [],
+                "desync_time": 100,
+                "pending": True,
+                "pending_id": "t_p",
+            },
+        ]
+        mock_gather.return_value = dirty
+        mock_load.return_value = [_mod._normalize_config({"repo": "/r/repoA"})]
+        with self.assertRaises(SystemExit) as ctx:
+            _mod.main()
+        self.assertEqual(ctx.exception.code, 0)
 
 
 if __name__ == "__main__":
