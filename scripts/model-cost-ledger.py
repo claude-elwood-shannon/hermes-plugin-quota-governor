@@ -315,10 +315,19 @@ def sync_ledger(hermes_home=None, now=None):
     """Append usage DELTAS since the cursor to the ledger.
 
     Returns number of rows appended (0 = nothing new — cron-silent safe).
-    Cursor format: {"<session_id>|<model>|<task>": {"calls": int,
+    Cursor format: {"<profile>|<session_id>|<model>|<task>": {"calls": int,
     "in": int, "out": int, "cache": int, "reason": int, "ts": float}}.
     Negative deltas (DB reset/rewind) are clamped to zero and the cursor is
     realigned, so the ledger never contains negative consumption.
+
+    BUG FIX (t_4753d157, Sep 8 2026): The cursor key now includes ``profile``
+    and DB rows sharing the same (session_id, model, task) within a profile
+    are AGGREGATED (summed) before delta computation.  Without this, two rows
+    for the same key (e.g. a main-usage row and a reasoning-tokens row) caused
+    the cursor to oscillate between their values on each sync, emitting a
+    spurious full-delta on every other tick (~17 duplicate rows, ~$26.6 of
+    false costs in the Sep 7 data).  The profile prefix prevents the same
+    session_id in different profiles from sharing a cursor entry.
     """
     now = now if now is not None else time.time()
     cfg = load_config(hermes_home)
@@ -327,17 +336,45 @@ def sync_ledger(hermes_home=None, now=None):
     cursor = _load_json(cur_path, {})
     appended = 0
     out = []
-    for row in scan_opencode_go_usage(hermes_home):
+
+    # Aggregate raw DB rows by (profile, session_id, model, task) so that
+    # multiple rows sharing the same key within a profile are summed before
+    # delta computation — prevents cursor oscillation between sibling rows.
+    raw_rows = scan_opencode_go_usage(hermes_home)
+    agg = {}  # key -> aggregated dict
+    for row in raw_rows:
         ts = iso_to_epoch(row.get("last_seen"))
         if not ts:
             continue
-        key = "%s|%s|%s" % (row["session_id"], row["model"], row.get("task") or "")
+        key = "%s|%s|%s|%s" % (row["profile"], row["session_id"],
+                               row["model"], row.get("task") or "")
+        if key not in agg:
+            agg[key] = {
+                "profile": row["profile"],
+                "session_id": row["session_id"],
+                "model": row["model"],
+                "task": row.get("task") or "",
+                "calls": 0, "in": 0, "out": 0,
+                "cache": 0, "reason": 0, "ts": ts,
+            }
+        a = agg[key]
+        a["calls"] += row.get("api_call_count") or 0
+        a["in"] += row.get("input_tokens") or 0
+        a["out"] += row.get("output_tokens") or 0
+        a["cache"] += row.get("cache_read_tokens") or 0
+        a["reason"] += row.get("reasoning_tokens") or 0
+        # Keep the latest last_seen timestamp
+        if ts > a["ts"]:
+            a["ts"] = ts
+
+    for key, row in agg.items():
+        ts = row["ts"]
         prev = cursor.get(key) or {}
-        tot_calls = row.get("api_call_count") or 0
-        tot_in = row.get("input_tokens") or 0
-        tot_out = row.get("output_tokens") or 0
-        tot_cache = row.get("cache_read_tokens") or 0
-        tot_reason = row.get("reasoning_tokens") or 0
+        tot_calls = row["calls"]
+        tot_in = row["in"]
+        tot_out = row["out"]
+        tot_cache = row["cache"]
+        tot_reason = row["reason"]
         d_calls = max(tot_calls - (prev.get("calls") or 0), 0)
         d_in = max(tot_in - (prev.get("in") or 0), 0)
         d_out = max(tot_out - (prev.get("out") or 0), 0)
@@ -358,7 +395,7 @@ def sync_ledger(hermes_home=None, now=None):
             "request_count": d_calls,
             "tokens": {"in": d_in, "out": d_out + d_reason, "cache_read": d_cache},
             "session_id": row["session_id"],
-            "task": row.get("task") or "",
+            "task": row["task"],
         })
         appended += 1
     if out:

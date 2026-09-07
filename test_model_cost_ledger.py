@@ -203,7 +203,38 @@ class TestSyncLedger(unittest.TestCase):
         n = _mod.sync_ledger(self.home, now=1_800_000_200)
         self.assertEqual(n, 0)  # reset -> no positive delta -> no row
         cur = _mod._load_json(_mod.cursor_path(self.home), {})
-        self.assertEqual(cur["s1|qwen3.8-flash|"]["calls"], 1)  # realigned
+        self.assertEqual(cur["pr-opencode|s1|qwen3.8-flash|"]["calls"], 1)  # realigned
+
+    def test_duplicate_key_aggregation(self):
+        """Two DB rows with same (session, model, task='') must be aggregated,
+        not cause cursor oscillation (regression test for t_4753d157)."""
+        # Insert a second row with same key but different billing_base_url
+        db = sqlite3.connect(os.path.join(self.home, "profiles/pr-opencode/state.db"))
+        db.execute(
+            "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("s1", "qwen3.8-flash", "opencode-go", "https://opencode.ai/zen/go/v2",
+             "", "", 5, 10_000, 2_000, 5_000, 0, 5_000,
+             0.0, 0.0, "unknown", "none",
+             "2026-09-07T01:05:00+00:00", "2026-09-07T01:05:00+00:00"),
+        )
+        db.commit()
+        db.close()
+        # First sync: should aggregate both s1 rows (10+5=15 calls)
+        n = _mod.sync_ledger(self.home, now=1_800_000_000)
+        # s1 aggregated (15 calls) + s2 (4 calls) = 2 rows
+        self.assertEqual(n, 2)
+        rows = self._ledger_rows()
+        q = [r for r in rows if r["model"] == "qwen3.8-flash"][0]
+        self.assertEqual(q["request_count"], 15)  # 10 + 5
+        self.assertEqual(q["tokens"]["in"], 110_000)  # 100_000 + 10_000
+        # Second sync: should be idempotent (no oscillation)
+        n2 = _mod.sync_ledger(self.home, now=1_800_000_100)
+        self.assertEqual(n2, 0)
+        self.assertEqual(len(self._ledger_rows()), 2)
+        # Third sync: still idempotent
+        n3 = _mod.sync_ledger(self.home, now=1_800_000_200)
+        self.assertEqual(n3, 0)
+        self.assertEqual(len(self._ledger_rows()), 2)
 
     def test_if_due_throttles(self):
         n1 = _mod.sync_model_cost_ledger_if_due(self.home, now=1_800_000_000)
