@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-REPO = "REPO/.worktrees/t_179df1d6"
+REPO = os.path.dirname(os.path.abspath(__file__))
 REAL_DB = "~/.hermes/kanban.db"
 GATE = os.path.join(REPO, "scripts", "quota-gate.py")
 
@@ -54,6 +54,29 @@ env = dict(os.environ)
 env["HERMES_KANBAN_DB"] = db_copy
 env.pop("QUOTA_GATE_PRIVACY", None)
 
+# Baseline census of the REAL board (pre-injection), computed with the
+# gate's own parser so the expectation tracks board drift instead of a
+# frozen Sep-7 snapshot.
+import importlib.util
+_gspec = importlib.util.spec_from_file_location("qg_for_e2e", GATE)
+assert _gspec and _gspec.loader
+qg = importlib.util.module_from_spec(_gspec)
+_gspec.loader.exec_module(qg)
+
+
+def bucket_of(body):
+    raw = qg._parse_privacy_tag_raw(body or "")
+    return qg._PRIVACY_SUMMARY_BUCKETS.get(raw.lower(), "none") if raw else "none"
+
+base_conn = sqlite3.connect(REAL_DB)
+base_rows = base_conn.execute(
+    "SELECT status, body FROM tasks WHERE status IN ('ready','running',"
+    "'blocked','todo','triage')").fetchall()
+base_conn.close()
+from collections import Counter
+baseline = Counter(bucket_of(b) for _, b in base_rows)
+print("real-board baseline census:", dict(baseline))
+
 proc = subprocess.run(
     [sys.executable, GATE],
     stdin=subprocess.DEVNULL,
@@ -75,10 +98,15 @@ print("recommended_profile:", ctx.get("recommended_profile"))
 print("privacy_summary:", json.dumps(summary, sort_keys=True))
 print("warning:", warning)
 
-# 9 real untagged active + 1 malformed (counted as none) = 10 none
-# 1 high (t_e2e_high_ollama) + 1 medium (t_e2e_medium_opencode)
-#   + 1 low (t_e2e_low_nanogpt); done-high NOT counted (terminal)
-expected = {"high": 1, "medium": 1, "low": 1, "none": 10}
+# Expected = real-board baseline + injection delta:
+#   +1 high (t_e2e_high_ollama) +1 medium (t_e2e_medium_opencode)
+#   +1 low (t_e2e_low_nanogpt) +1 none (t_e2e_bad malformed → none)
+#   done-high NOT counted (terminal status)
+expected = dict(baseline)
+expected["high"] = expected.get("high", 0) + 1
+expected["medium"] = expected.get("medium", 0) + 1
+expected["low"] = expected.get("low", 0) + 1
+expected["none"] = expected.get("none", 0) + 1
 if summary == expected:
     print(f"\nE2E PASS: summary {summary} == expected {expected}")
     rc = 0
