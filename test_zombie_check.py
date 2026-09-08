@@ -485,7 +485,9 @@ class TestRoutingUnchangedByZombieGuard(unittest.TestCase):
         whether or not a zombie exists (the guard acts on the OUTPUT,
         after selection)."""
         result = select_provider(self.MOCK_PROVIDERS, privacy_level=None)
-        self.assertEqual(result["profile"], "pr-ollama")
+        # OBJ-26: preference-first everywhere → pr-nanogpt (pref 0) wins
+        # for public/no-privacy; the zombie guard still acts only on output.
+        self.assertEqual(result["profile"], "pr-nanogpt")
 
 
 if __name__ == "__main__":

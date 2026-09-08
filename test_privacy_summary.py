@@ -539,13 +539,16 @@ class TestRoutingUnchanged(unittest.TestCase):
                                           warnings=warnings)
         # The summary is pure output — select_provider does not take it.
         result = select_provider(self.MOCK_PROVIDERS, privacy_level=None)
-        self.assertEqual(result["profile"], "pr-ollama")
+        # OBJ-26: preference-first everywhere → pr-nanogpt (pref 0) wins
+        # over pr-ollama (pref 1) for public/no-privacy too.
+        self.assertEqual(result["profile"], "pr-nanogpt")
         self.assertEqual(summary, {"high": 0, "medium": 0, "low": 0, "none": 0})
 
     def test_baseline_routing_no_privacy(self):
-        """Availability-first: ollama 80% wins over nanogpt 60%."""
+        """OBJ-26 preference-first: nanogpt (pref 0) wins over ollama (pref 1)
+        for public/no-privacy, regardless of availability."""
         result = select_provider(self.MOCK_PROVIDERS, privacy_level=None)
-        self.assertEqual(result["profile"], "pr-ollama")
+        self.assertEqual(result["profile"], "pr-nanogpt")
 
     def test_baseline_routing_sensitive(self):
         """Sensitive → preference-first: nanogpt wins regardless of quota."""

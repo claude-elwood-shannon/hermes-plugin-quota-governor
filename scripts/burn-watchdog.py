@@ -235,12 +235,17 @@ def provider_cost(provider: Dict[str, Any]) -> Optional[float]:
 
     Priority: entry ``cost`` → raw ``cost`` → raw ``activity_cost``
     (ollama pay-as-you-go) → entry ``usd_balance`` (nanogpt prepaid
-    balance, OBJ-26: exact POST /api/check-balance probe — the burn is
-    the BALANCE DROP, so the meter is the balance itself and the delta
-    logic below derives spend automatically).
+    balance, OBJ-26: exact POST /api/check-balance probe).
     Returns None when the snapshot carries no real USD meter for this
     provider (the watchdog then falls back to the percent-delta x
     window_usd_cap estimate).
+
+    OBJ-26 SIGN CONVENTION: the ``cost``/``activity_cost`` meters are
+    CUMULATIVE SPEND (higher = more burned), but the nanogpt
+    ``usd_balance`` meter is a DECREASING BALANCE (lower = more burned).
+    Callers must treat the returned value as opaque and derive the tick
+    spend with ``cost_meter_delta`` / ``meter_is_balance`` — never with a
+    plain ``now - last`` difference.
     """
     for key in ("cost",):
         val = provider.get(key)
@@ -265,6 +270,19 @@ def provider_cost(provider: Dict[str, Any]) -> Optional[float]:
         except (TypeError, ValueError):
             pass
     return None
+
+
+def meter_is_balance(provider: Dict[str, Any]) -> bool:
+    """True when provider_cost() returned the nanogpt DECREASING balance
+    (OBJ-26) rather than a cumulative-spend meter: no ``cost`` /
+    ``activity_cost`` anywhere, but ``balance.usd_balance`` present."""
+    if provider.get("cost") is not None:
+        return False
+    raw = provider.get("raw", {}) if isinstance(provider.get("raw"), dict) else {}
+    if raw.get("cost") is not None or raw.get("activity_cost") is not None:
+        return False
+    bal = provider.get("balance") or {}
+    return isinstance(bal, dict) and bal.get("usd_balance") is not None
 
 
 def is_burning(provider: Dict[str, Any]) -> bool:
@@ -388,7 +406,14 @@ def analyze_provider(
     if cost_now is not None:
         last_cost = prior.get("last_cost")
         if last_cost is not None:
-            cost_delta = _clamp(cost_now - float(last_cost))
+            if meter_is_balance(provider):
+                # OBJ-26: DECREASING balance meter — spend = last - now.
+                # A rise is a top-up / external credit, NOT negative burn:
+                # clamp it to 0 (the balance ledger re-baselines its own
+                # window on top-ups, so the budget stays consistent).
+                cost_delta = _clamp(float(last_cost) - cost_now)
+            else:
+                cost_delta = _clamp(cost_now - float(last_cost))
         # else: first observation with a cost meter — seed the baseline; the
         # next tick's delta measures only what was burned between ticks.
 

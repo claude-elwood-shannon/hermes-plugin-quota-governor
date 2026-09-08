@@ -152,13 +152,15 @@ mock_providers = [
 ]
 
 result = quota_gate.select_provider(mock_providers, privacy_level=None)
-check("no privacy → picks highest availability (openrouter 90%)",
-      result is not None and result["profile"] == "pr-openrouter",
+# OBJ-26: preference-first for ALL levels — pr-nanogpt (pref 0) wins even
+# with lower availability (openrouter 90% is no longer first).
+check("no privacy → preference-first picks pr-nanogpt (OBJ-26)",
+      result is not None and result["profile"] == "pr-nanogpt",
       f"got {result['profile'] if result else 'None'}")
 
 result = quota_gate.select_provider(mock_providers, privacy_level="public")
-check("public → same as no filtering (openrouter 90%)",
-      result is not None and result["profile"] == "pr-openrouter",
+check("public → same preference-first (pr-nanogpt, OBJ-26)",
+      result is not None and result["profile"] == "pr-nanogpt",
       f"got {result['profile'] if result else 'None'}")
 
 
@@ -309,12 +311,12 @@ def simulate_main(providers_list, privacy_level):
         },
     }
 
-# Public → wakeAgent true, picks openrouter (highest availability)
+# Public → wakeAgent true, preference-first → pr-nanogpt (OBJ-26)
 out = simulate_main(mock_providers, "public")
 check("e2e public → wakeAgent:true",
       out["wakeAgent"] is True)
-check("e2e public → profile pr-openrouter",
-      out["context"]["recommended_profile"] == "pr-openrouter",
+check("e2e public → profile pr-nanogpt (preference-first, OBJ-26)",
+      out["context"]["recommended_profile"] == "pr-nanogpt",
       f"got {out['context']['recommended_profile']}")
 check("e2e public → privacy_level public",
       out["context"]["privacy_level"] == "public")
@@ -396,8 +398,10 @@ check("parse_privacy_tag('privacy:low') → public",
 out_low = simulate_main(mock_low, low_level)
 check("e2e low → wakeAgent:true",
       out_low["wakeAgent"] is True)
-check("e2e low → routes to pr-ollama (public, highest availability)",
-      out_low["context"]["recommended_profile"] == "pr-ollama",
+# OBJ-26: preference-first — pr-nanogpt (pref 0) wins over pr-ollama even
+# with ollama at 95% availability; the low→Ollama criterion predates OBJ-26.
+check("e2e low → routes to pr-nanogpt (preference-first, OBJ-26)",
+      out_low["context"]["recommended_profile"] == "pr-nanogpt",
       f"got {out_low['context']['recommended_profile']}")
 check("e2e low → privacy_level public",
       out_low["context"]["privacy_level"] == "public")
@@ -453,10 +457,11 @@ check("sensitive preference-first: ollama=100, nanogpt=1 → nanogpt wins",
       result is not None and result["profile"] == "pr-nanogpt",
       f"got {result['profile'] if result else 'None'}")
 
-# Verify public does NOT use preference-first (availability-first instead)
+# OBJ-26: public ALSO uses preference-first now — pr-nanogpt (pref 0)
+# wins over pr-ollama regardless of the 95-vs-30 availability gap.
 result_pub = quota_gate.select_provider(mock_pref, privacy_level="public")
-check("public availability-first: ollama=95, nanogpt=30 → ollama wins (not preference)",
-      result_pub is not None and result_pub["profile"] == "pr-ollama",
+check("public preference-first (OBJ-26): ollama=95, nanogpt=30 → nanogpt wins",
+      result_pub is not None and result_pub["profile"] == "pr-nanogpt",
       f"got {result_pub['profile'] if result_pub else 'None'}")
 
 # Fallback: nanogpt errored → ollama selected (preference-first respects errors)
@@ -526,10 +531,10 @@ check("sensitive 3-prov: openrouter excluded, nanogpt preferred over ollama (90 
       result is not None and result["profile"] == "pr-nanogpt",
       f"got {result['profile'] if result else 'None'}")
 
-# Public: all eligible, availability-first → openrouter (100%)
+# Public: all eligible, preference-first (OBJ-26) → pr-nanogpt (pref 0)
 result = quota_gate.select_provider(mock_3, privacy_level="public")
-check("public 3-prov: availability-first → openrouter (100%)",
-      result is not None and result["profile"] == "pr-openrouter",
+check("public 3-prov: preference-first → pr-nanogpt (OBJ-26)",
+      result is not None and result["profile"] == "pr-nanogpt",
       f"got {result['profile'] if result else 'None'}")
 
 
@@ -684,10 +689,11 @@ check("sensitive → opencode-go (100%) excluded, ollama (10%) wins",
       result is not None and result["profile"] == "pr-ollama",
       f"got {result['profile'] if result else 'None'}")
 
-# But public → opencode-go is eligible (availability-first)
+# But public → opencode-go is eligible; OBJ-26 preference-first still puts
+# pr-ollama (pref 1) above pr-opencode (pref 2) in the public lane.
 result = quota_gate.select_provider(mock_with_opencode, privacy_level="public")
-check("public → opencode-go (100%) wins (availability-first)",
-      result is not None and result["profile"] == "pr-opencode",
+check("public → pr-ollama (pref 1 beats opencode-go pref 2, OBJ-26)",
+      result is not None and result["profile"] == "pr-ollama",
       f"got {result['profile'] if result else 'None'}")
 
 

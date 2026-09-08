@@ -195,6 +195,89 @@ class TestSignalExtraction(BaseWatchdogTest):
         self.assertEqual(wd.provider_cost({"cost": "1.5", "raw": {"cost": "9"}}), 1.5)
         self.assertIsNone(wd.provider_cost({"raw": {}}))
 
+    def test_provider_cost_nanogpt_balance_meter(self):
+        """OBJ-26: balance.usd_balance is the nanogpt meter (last priority)."""
+        prov = {"provider": "nanogpt", "balance": {"usd_balance": "15.49"}}
+        self.assertEqual(wd.provider_cost(prov), 15.49)
+        self.assertTrue(wd.meter_is_balance(prov))
+
+    def test_meter_is_balance_false_for_spend_meters(self):
+        """cost / activity_cost meters are cumulative spend, not balance."""
+        self.assertFalse(wd.meter_is_balance({"provider": "nanogpt",
+                                              "cost": 1.0}))
+        self.assertFalse(wd.meter_is_balance({"provider": "nanogpt",
+                                              "raw": {"cost": 1.0}}))
+        self.assertFalse(wd.meter_is_balance({"provider": "nanogpt",
+                                              "raw": {"activity_cost": 0.5}}))
+        self.assertFalse(wd.meter_is_balance({"provider": "nanogpt",
+                                              "raw": {}}))
+
+
+class TestNanogptBalanceBurnObj26(BaseWatchdogTest):
+    """OBJ-26: the nanogpt meter is a DECREASING balance — spend = last-now.
+
+    Regression for the sign bug: a cumulative-spend style ``now - last``
+    clamps balance DRAIN to 0, making the watchdog blind to nanogpt burn.
+    """
+
+    CONFIG = {
+        "nanogpt": {
+            "enabled": True,
+            "burn_rate_warn_usd_per_min": 0.05,
+            "burn_total_warn_usd": 0.20,
+            "burn_total_stop_usd": 1.00,
+            "window_usd_cap": None,
+        }
+    }
+
+    @staticmethod
+    def _nanogpt(balance, burning=True):
+        return {
+            "profile": "pr-nanogpt", "provider": "nanogpt",
+            "model": "z-ai/glm-5.2", "availability": 100.0,
+            "bottleneck_pct": 0.0, "bottleneck_window": "weekly_tokens+balance",
+            "burning_balance": burning, "error": "",
+            "raw": {"covered_first": True},
+            "balance": {"usd_balance": balance, "level": "warn"},
+        }
+
+    def _snap(self, balance):
+        return _mk_snapshot([self._nanogpt(balance)])
+
+    def test_balance_drop_accumulates_burn(self):
+        self.write_config(self.CONFIG)
+        gate = self.stub_gate(self._snap(15.49))
+        self.assertEqual(wd.run_tick(gate_path=gate, now=1_700_000_000), [])
+
+        # $0.30 drained in 10 min → rate 0.03/min < warn-rate, but cum >= 0.20.
+        self.write_gate(gate, self._snap(15.19))
+        alerts = wd.run_tick(gate_path=gate, now=1_700_000_600)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("BURN-WARN nanogpt", alerts[0])
+        self.assertIn("$0.30", alerts[0])
+
+    def test_balance_rise_is_topup_not_negative_burn(self):
+        self.write_config(self.CONFIG)
+        gate = self.stub_gate(self._snap(10.0))
+        self.assertEqual(wd.run_tick(gate_path=gate, now=1_700_000_000), [])
+        # Balance RISES (top-up): must clamp to 0, never negative spend.
+        self.write_gate(gate, self._snap(20.0))
+        alerts = wd.run_tick(gate_path=gate, now=1_700_000_600)
+        self.assertEqual(alerts, [])
+        state = self.read_state()
+        self.assertEqual(state["nanogpt"]["cum_cost_usd"], 0.0)
+
+    def test_balance_stop_at_threshold(self):
+        self.write_config(self.CONFIG)
+        gate = self.stub_gate(self._snap(15.49))
+        self.assertEqual(wd.run_tick(gate_path=gate, now=1_700_000_000), [])
+        # Drain $1.10 in ~10 min: cum >= stop 1.00 → STOP + daemon kill.
+        with patch.object(wd, "kill_daemon", return_value=None):
+            self.write_gate(gate, self._snap(14.39))
+            alerts = wd.run_tick(gate_path=gate, now=1_700_000_600)
+        self.assertTrue(any("BURN-STOP nanogpt" in a for a in alerts))
+        self.assertTrue(os.path.exists(wd.STOP_FILE))
+
 
 class TestLeakSequence(BaseWatchdogTest):
     """Reproduce the Sep 7 2026 opencode-go leak and verify WARN then STOP."""
