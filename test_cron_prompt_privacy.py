@@ -88,6 +88,8 @@ markers = [
     ("privacy:confidential", "confidential case handled"),
     ("wakeAgent:false", "wakeAgent:false guidance present"),
     ("privacy_routed:", "privacy_routed tracking format present"),
+    ("LANGUAGE RULE", "language rule present (all task text in Spanish)"),
+    ("correct spelling and accents", "Spanish spelling/acents requirement explicit"),
 ]
 for marker, desc in markers:
     check(desc, marker in prompt,
