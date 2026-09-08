@@ -212,7 +212,7 @@ def get_active_objectives() -> Dict[str, Dict[str, Any]]:
 def get_completed_objectives_info() -> Dict[str, Dict[str, Any]]:
     """Get info about completed tasks grouped by objective."""
     rows = query_kanban_db(
-        "SELECT id, title, body, status, completed_at "
+        "SELECT id, title, body, status, completed_at, started_at "
         "FROM tasks WHERE status IN ('done', 'archived') AND completed_at IS NOT NULL "
         "ORDER BY completed_at DESC"
     )
@@ -225,6 +225,7 @@ def get_completed_objectives_info() -> Dict[str, Dict[str, Any]]:
             if obj_id not in obj_info:
                 obj_info[obj_id] = {
                     "last_completed_at": row["completed_at"],
+                    "last_started_at": row["started_at"],
                     "completed_count": 0,
                 }
             obj_info[obj_id]["completed_count"] += 1
@@ -234,6 +235,14 @@ def get_completed_objectives_info() -> Dict[str, Dict[str, Any]]:
                 or row["completed_at"] > obj_info[obj_id]["last_completed_at"]
             ):
                 obj_info[obj_id]["last_completed_at"] = row["completed_at"]
+            # Track most recent start (t_fbe97066: a done task that was
+            # worked on minutes before the sweep counts as recent progress
+            # even if its completion predates the stale threshold)
+            if row["started_at"] and (
+                "last_started_at" not in obj_info[obj_id]
+                or row["started_at"] > obj_info[obj_id].get("last_started_at") or 0
+            ):
+                obj_info[obj_id]["last_started_at"] = row["started_at"]
 
     return obj_info
 
@@ -498,15 +507,30 @@ def detect_stale_objectives() -> Optional[Pattern]:
         # Check if this objective has had any recent completions
         comp_info = completed_info.get(obj_id, {})
         last_completed = comp_info.get("last_completed_at", 0)
+        statuses = info.get("statuses", [])
 
         if last_completed and last_completed > stale_threshold_ts:
             continue  # Had recent progress
 
+        # t_fbe97066 fix: skip objectives with work currently in flight.
+        # A task running/ready at evaluation time IS progress, even if the
+        # objective's last completion is older than the threshold (e.g. a
+        # task running since minutes ago finishing soon after the sweep).
+        if any(s in ("running", "ready") for s in statuses):
+            continue
+
         # Check if it was created recently (still warming up)
         # If all tasks are just 'triage' or 'todo', it might be new
-        statuses = info.get("statuses", [])
+        # (blocked tasks stay detectable: a stuck objective IS stale material)
         if all(s in ("triage", "todo") for s in statuses):
             continue  # Not started yet, not stale
+
+        # t_fbe97066 fix: also honor recent activity on the just-closed
+        # task (started_at) — a task that started recently shows progress
+        # even if it has not completed yet or completed long after.
+        last_started = comp_info.get("last_started_at", 0)
+        if last_started and last_started > stale_threshold_ts:
+            continue
 
         stale_objectives.append((obj_id, info))
 

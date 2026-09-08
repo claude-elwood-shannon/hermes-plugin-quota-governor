@@ -342,9 +342,13 @@ class TestDetectStaleObjectives(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_stale_objective_detected(self):
-        """Objective with no recent completion and running tasks is stale."""
+        """Objective with no recent completion and only blocked tasks is stale.
+
+        t_fbe97066: running/ready tasks mean work in flight, which is NOT
+        stale — blocked-only is the detectable case for a stale objective.
+        """
         old_ts = datetime.now(timezone.utc).timestamp() - (10 * 86400)
-        active = {"OBJ-05": {"task_ids": ["t_1", "t_2"], "statuses": ["running", "blocked"], "titles": ["T1", "T2"]}}
+        active = {"OBJ-05": {"task_ids": ["t_1", "t_2"], "statuses": ["blocked", "blocked"], "titles": ["T1", "T2"]}}
         completed = {"OBJ-05": {"last_completed_at": old_ts, "completed_count": 1}}
         with patch("objective_proposer.get_active_objectives", return_value=active):
             with patch("objective_proposer.get_completed_objectives_info", return_value=completed):
@@ -362,6 +366,65 @@ class TestDetectStaleObjectives(unittest.TestCase):
             with patch("objective_proposer.get_completed_objectives_info", return_value=completed):
                 result = detect_stale_objectives()
         self.assertIsNone(result)
+
+    def test_running_task_not_stale(self):
+        """t_fbe97066 regression: 1 done >7d + 1 running → no stale alert.
+
+        Mirrors the OBJ-07 false positive (t_905aaaac): the sweep fired
+        while t_e6197896 was running. Work in flight is progress.
+        """
+        old_ts = datetime.now(timezone.utc).timestamp() - (10 * 86400)
+        active = {"OBJ-07": {"task_ids": ["t_a", "t_b"], "statuses": ["done", "running"], "titles": ["TA", "TB"]}}
+        completed = {"OBJ-07": {"last_completed_at": old_ts, "completed_count": 1}}
+        with patch("objective_proposer.get_active_objectives", return_value=active):
+            with patch("objective_proposer.get_completed_objectives_info", return_value=completed):
+                result = detect_stale_objectives()
+        self.assertIsNone(result)
+
+    def test_ready_task_not_stale(self):
+        """t_fbe97066 regression: a ready (queued) task also counts as work in flight."""
+        old_ts = datetime.now(timezone.utc).timestamp() - (10 * 86400)
+        active = {"OBJ-11": {"task_ids": ["t_a", "t_b"], "statuses": ["done", "ready"], "titles": ["TA", "TB"]}}
+        completed = {"OBJ-11": {"last_completed_at": old_ts, "completed_count": 1}}
+        with patch("objective_proposer.get_active_objectives", return_value=active):
+            with patch("objective_proposer.get_completed_objectives_info", return_value=completed):
+                result = detect_stale_objectives()
+        self.assertIsNone(result)
+
+    def test_recent_start_on_done_task_not_stale(self):
+        """t_fbe97066 regression: done task started recently (closed after sweep
+        window opened) counts as progress via last_started_at."""
+        now_ts = datetime.now(timezone.utc).timestamp()
+        active = {"OBJ-08": {"task_ids": ["t_a"], "statuses": ["done"], "titles": ["TA"]}}
+        completed = {
+            "OBJ-08": {
+                "last_completed_at": now_ts - (10 * 86400),
+                "last_started_at": now_ts - 600,  # started 10 min ago
+                "completed_count": 1,
+            }
+        }
+        with patch("objective_proposer.get_active_objectives", return_value=active):
+            with patch("objective_proposer.get_completed_objectives_info", return_value=completed):
+                result = detect_stale_objectives()
+        self.assertIsNone(result)
+
+    def test_old_start_on_done_task_still_stale(self):
+        """Done task with old started_at AND old completed_at stays stale
+        (no in-flight work, no recent activity)."""
+        old_ts = datetime.now(timezone.utc).timestamp() - (10 * 86400)
+        active = {"OBJ-12": {"task_ids": ["t_a", "t_b"], "statuses": ["done", "blocked"], "titles": ["TA", "TB"]}}
+        completed = {
+            "OBJ-12": {
+                "last_completed_at": old_ts,
+                "last_started_at": old_ts - 3600,
+                "completed_count": 1,
+            }
+        }
+        with patch("objective_proposer.get_active_objectives", return_value=active):
+            with patch("objective_proposer.get_completed_objectives_info", return_value=completed):
+                result = detect_stale_objectives()
+        self.assertIsNotNone(result)
+        self.assertIn("OBJ-12", result.title)
 
 
 # ── Tests: detect_missing_test_coverage ──────────────────────────────────────
