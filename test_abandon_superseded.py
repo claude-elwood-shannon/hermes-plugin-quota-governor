@@ -127,6 +127,34 @@ class TestCandidateRule(Sandbox):
         ])
         self.assertEqual(self._plan_ids(), [])
 
+    def test_objective_tag_in_footer_supersedes(self):
+        # OBJ-20 bug: t_3cd3dd45 carries objective:OBJ-20 only in the footer
+        # (below the first blank line). objective_of() must scan the WHOLE
+        # body so the superseding task joins the OBJ-20 group and the lost
+        # task t_1725897f is stamped. Footer scan must NOT suppress the stamp
+        # (has_abandoned_stamp stays header-only).
+        self._mk([
+            ("t_1725897f", "Fix X", "archived",
+             "objective:OBJ-20 cost:small provider:pr-ollama\n\nprose", _ts(2026, 8, 30), None),
+            ("t_3cd3dd45", "Fix X", "archived",
+             "Investigar 403\n\nnotas\nobjective:OBJ-20", _ts(2026, 9, 2), _ts(2026, 9, 3)),
+        ])
+        plans = ab.find_candidates(str(self.db))
+        self.assertEqual([p["id"] for p in plans], ["t_1725897f"])
+        self.assertIn("t_3cd3dd45", plans[0]["superseded_by"])
+
+    def test_footer_objective_crossref_without_matching_title_is_not_candidate(self):
+        # Negative: a later completed footer-objective task that merely shares
+        # the objective but is unrelated (different title, no id reference)
+        # must NOT supersede the lost task.
+        self._mk([
+            ("t_aaaaaaaa", "Fix the thing", "archived",
+             "objective:OBJ-20 cost:small\n\ntexto", _ts(2026, 8, 30), None),
+            ("t_bbbbbbbb", "Totally unrelated work", "archived",
+             "headline here\n\nobjective:OBJ-20 body", _ts(2026, 9, 2), _ts(2026, 9, 4)),
+        ])
+        self.assertEqual(self._plan_ids(), [])
+
     def test_unrelated_objective_ignored(self):
         self._mk([
             ("t_aaaaaaaa", "Fix X", "archived",

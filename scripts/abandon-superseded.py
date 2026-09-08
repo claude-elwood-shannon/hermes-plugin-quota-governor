@@ -99,7 +99,11 @@ def header_bounds(lines: List[str]) -> int:
 
 
 def objective_of(body: str) -> Optional[str]:
-    m = OBJECTIVE_RE.search(header_of(body or ""))
+    # Search the WHOLE body, not just the tag header: some tasks carry the
+    # objective: tag only in the footer (below the first blank line), and a
+    # header-only match would silently drop them from their objective group
+    # (OBJ-20: t_3cd3dd45 / t_88a02809). Stamps stay header-only (below).
+    m = OBJECTIVE_RE.search(body or "")
     return m.group(1).upper() if m else None
 
 
