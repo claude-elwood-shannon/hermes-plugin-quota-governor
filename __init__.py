@@ -37,6 +37,14 @@ Wires seven behaviours:
    assignee is not a valid profile (the LLM agent sometimes invents names
    like 'alice', violating Guardrail G1).  OBJ-08.  Same pattern as #7:
    enforce G1 in code rather than relying on prompt compliance.
+
+9. ``kanban_task_claimed`` hook (OBJ-24 F3, same hook, observer) — reads
+   ``forecast.json`` (predictor EMA) and runs the per-task budget check
+   (``budget_check.py``) in OBSERVER mode: it logs the decision the
+   enforce mode WOULD take (reassign to the provider with more headroom,
+   or back to triage when the task exceeds 10% of its provider's free
+   quota).  No veto in phase 3.0 — the veto lands with ``--enforce``
+   after a week without false positives.
 """
 
 from __future__ import annotations
@@ -64,6 +72,14 @@ _SAMPLE_EVERY_N_TOOL_CALLS = 50  # query quota every 50 tool calls
 # --- verify-task.py path (OBJ-11 Phase 2) ------------------------------------
 
 _VERIFY_TASK_SCRIPT = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+
+# --- budget_check.py path (OBJ-24 F3) -----------------------------------------
+
+_BUDGET_CHECK_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "scripts",
+    "budget_check.py",
+)
 
 # --- privacy-router-fix.py path (OBJ-18 follow-up) ---------------------------
 
@@ -98,6 +114,7 @@ def _on_kanban_task_claimed(
     1. Query current quota.
     2. Record the observation in the state file.
     3. If quota is critically low, write a stop-signal for the cron layer.
+    4. Spawn budget_check.py (OBJ-24 F3, observer) after the quota work.
     """
     try:
         snapshot = gov.query_quota()
@@ -119,6 +136,41 @@ def _on_kanban_task_claimed(
             gov.write_stop_signal(reason=reason)
     except Exception as exc:
         logger.debug("quota-governor kanban_task_claimed failed: %s", exc)
+
+    # OBJ-24 F3: per-task budget check (observer in phase 3.0). Best-effort
+    # and non-blocking: any failure is logged and swallowed.
+    if task_id:
+        try:
+            _spawn_budget_check(task_id)
+        except Exception as exc:
+            logger.debug("quota-governor budget-check spawn failed: %s", exc)
+
+
+def _spawn_budget_check(task_id: str) -> None:
+    """OBJ-24 F3: run budget_check.py (observer) for a claimed task.
+
+    Non-blocking, best-effort, silent: the script is OBSERVER-only in
+    phase 3.0 (logs what --enforce WOULD do; stdout captured to devnull).
+    Fires from kanban_task_claimed so the decision lands next to the
+    claim; the no-agent cron wrapper (budget-check-cron.sh, every 15m)
+    is the periodic backstop.
+    """
+    if not os.path.exists(_BUDGET_CHECK_SCRIPT):
+        logger.debug("budget_check.py not found at %s — skipping",
+                     _BUDGET_CHECK_SCRIPT)
+        return
+    try:
+        subprocess.Popen(
+            ["/usr/bin/python3.12", _BUDGET_CHECK_SCRIPT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach: never block the dispatcher
+        )
+        logger.debug("budget_check.py spawned after claim of %s", task_id)
+    except Exception as exc:
+        logger.debug("failed to spawn budget_check.py for %s: %s",
+                     task_id, exc)
 
 
 def _spawn_verify_task(task_id: str) -> None:

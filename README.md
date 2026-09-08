@@ -124,6 +124,53 @@ anyway. The gate snapshot now carries `context.zombie_check`:
   `test_cron_prompt_zombie.py` (active-prompt + deploy-drift regression),
   `e2e_zombie_live.py` (live gate vs the real board + injected-zombie copy).
 
+## Predictive quota system (OBJ-24)
+
+Three no_agent pieces that observe and forecast WITHOUT burning tokens
+(the LLM workers keep burning where they already burn; the predictive
+layer never spends tokens):
+
+**F1 — time-series collector** (`quota-metrics.py`, cron every 15m): samples
+board counts + all providers' last-good pct and appends to
+`~/.hermes/profiles/pr-ollama/quota-governor/metrics-history.jsonl`. Zero
+extra API calls (the tick's last-good IS the sample). Tests: `test_quota_metrics.py`.
+
+**F2 — EMA predictor** (`quota-forecast.py`, cron every 15m after metrics):
+for each provider, exponential moving average of the weekly burn rate
+(%/min) over a 6h window (alpha 0.3), with pairs closer than 120s discarded
+(unsynchronised last-good refreshes produce absurd rates). Projects the
+90% milestone (governor stop) and 100% (exhaustion) for the WEEKLY window
+(all three providers reset Monday ~02:00 CEST). Output `forecast.json`:
+`{provider: {pct_now, burn_rate_pct_per_min, eta_90_iso, eta_100_iso,
+eta_90_hours, confidence, samples, pairs_used}}` plus
+`next_weekly_reset_iso` / `hours_to_reset`. Tests: `test_quota_forecast.py`.
+
+Gate integration (`--suggest` mode, wrapper `forecast-gate.sh`): injects
+`context.forecast_warning` with the fired decision rules —
+- `eta_90 < 1h` → board off (wakeAgent stays as-is in suggest mode),
+- `eta_90 < hours_to_reset - 2h` (COLCHÓN) → max_workers=1 + cost cap.
+The plain gate (no flags) produces byte-identical output as before —
+zero regression. Real veto only with `--enforce` after 7 days of
+backtest (flag already parsed; wired in `forecast_context`). Tests:
+`test_forecast_gate.py`.
+
+**F3 — per-task budget** (`budget_check.py`, cron every 15m + observer
+spawn from `kanban_task_claimed`): crosses (a) the OBJ-07 calibration
+(`docs/quota-planner.md` §2.4: tiny 0.5%, small 2.1%, medium 4%,
+complex 24.8% of the Ollama window; micro 0.25% by order of magnitude),
+(b) the provider's free quota from the F2 forecast, (c) the F2 ETA.
+If the task's cost class exceeds 10% of its provider's remaining free
+quota, it logs `reassign` (to the provider with most headroom) or
+`triage` (no alternative has room). Phase 3.0 is OBSERVER-only (log
+pattern); the real veto runs with `--enforce` after a week without
+false positives. Tests: `test_budget_check.py`, `test_budget_hook.py`.
+
+Completeness criterion (from the task): with 24h of history the forecast
+must hit the 90% milestone with <20% error at reset time; zero quota
+wasted (board active while quota > margin, board self-off when
+eta_90 < 1h); the 15m tick, gate and burn-watchdog keep operating
+unchanged (metrics/forecast are additive and no_agent).
+
 ## Decision heuristic
 
 The governor uses a **three-state model** (`run`, `paying`, `stop`) that
