@@ -98,6 +98,10 @@ def _patch_main_isolation(patchers, tmpdir):
                           os.path.join(tmpdir, "repo-sync-check.log")))
     patchers.append(patch("repo_sync_check.get_db_path",
                           return_value=os.path.join(tmpdir, "nonexistent.db")))
+    # Deploy-drift check must not read the real repo/scripts or real
+    # deploy dirs in main-flow tests: point it at an empty sandbox.
+    patchers.append(patch("repo_sync_check.REPO_DIR", tmpdir))
+    patchers.append(patch("repo_sync_check.DEPLOY_DIRS", []))
     # Defense in depth: even with isolation, never honor execute mode.
     patchers.append(patch.dict(os.environ, {"REPO_SYNC_EXECUTE": ""}))
 
@@ -387,7 +391,7 @@ class TestRecordSync(unittest.TestCase):
                 self.assertEqual(data["ahead_commits"], 1)
                 self.assertEqual(data["uncommitted_paths"], ["foo.py"])
                 self.assertEqual(data["ahead_hashes"], ["abc1234"])
-                self.assertEqual(data["version"], "2.0")
+                self.assertEqual(data["version"], "3.0")
                 # Multi-repo: ledger records the repo/remote/branch identity
                 self.assertEqual(data["repo"], _mod.REPO_DIR)
                 self.assertEqual(data["remote"], "origin")
@@ -767,6 +771,190 @@ class TestMainMultiRepo(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             _mod.main()
         self.assertEqual(ctx.exception.code, 0)
+
+
+# ── Deploy-drift tests (OBJ-06 / t_b8511377) ─────────────────────────────────
+
+class TestMd5OfFile(_LogIsolationMixin, unittest.TestCase):
+    """md5_of_file(): digest, missing file, unreadable file."""
+
+    def test_digest_matches_known(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("hello\n")
+            path = f.name
+        try:
+            import hashlib
+            expected = hashlib.md5(b"hello\n").hexdigest()
+            self.assertEqual(_mod.md5_of_file(path), expected)
+        finally:
+            os.unlink(path)
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(_mod.md5_of_file("/nonexistent/x/y.txt"))
+
+    def test_unreadable_returns_none_and_does_not_raise(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("secret")
+            path = f.name
+        try:
+            os.chmod(path, 0)
+            if os.access(path, os.R_OK):
+                self.skipTest("running as root — chmod 0 still readable")
+            self.assertIsNone(_mod.md5_of_file(path))
+        finally:
+            os.chmod(path, 0o644)
+            os.unlink(path)
+
+
+class TestCheckDeployDrift(_LogIsolationMixin, unittest.TestCase):
+    """check_deploy_drift(): stale/no-deployed/subdir semantics."""
+
+    def _sandbox(self):
+        tmp = tempfile.mkdtemp(prefix="drift-test-")
+        repo_scripts = os.path.join(tmp, "repo", "scripts")
+        os.makedirs(repo_scripts)
+        return tmp, repo_scripts
+
+    def test_no_drift_when_all_deployed_copies_match(self):
+        tmp, repo_scripts = self._sandbox()
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(repo_scripts, "a.py"), "w").write("v1")
+        open(os.path.join(dep, "a.py"), "w").write("v1")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            self.assertEqual(_mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts)), [])
+
+    def test_stale_copy_reported_with_md5s(self):
+        tmp, repo_scripts = self._sandbox()
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(repo_scripts, "a.py"), "w").write("v2")
+        open(os.path.join(dep, "a.py"), "w").write("v1")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0]["script"], "a.py")
+        self.assertEqual(drift[0]["repo_md5"], _mod.md5_of_file(os.path.join(repo_scripts, "a.py")))
+        self.assertEqual(len(drift[0]["stale_copies"]), 1)
+        self.assertEqual(drift[0]["stale_copies"][0]["md5"], _mod.md5_of_file(os.path.join(dep, "a.py")))
+        self.assertIn("mtime", drift[0]["stale_copies"][0])
+
+    def test_no_deployed_script_not_reported(self):
+        """Script exists only in repo → no-deployed, NOT stale (criterion)."""
+        tmp, repo_scripts = self._sandbox()
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(repo_scripts, "never-deployed.py"), "w").write("x")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
+        self.assertEqual(drift, [])
+
+    def test_subdirs_ignored(self):
+        tmp, repo_scripts = self._sandbox()
+        os.makedirs(os.path.join(repo_scripts, "__pycache__"))
+        with patch("repo_sync_check.DEPLOY_DIRS", []):
+            self.assertEqual(_mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts)), [])
+
+    def test_missing_scripts_dir_returns_empty(self):
+        with patch("repo_sync_check.DEPLOY_DIRS", []):
+            self.assertEqual(_mod.check_deploy_drift(repo_dir="/nonexistent"), [])
+
+    def test_one_stale_one_synced_copy(self):
+        """A script with 2 deployed copies: only the diverging one is stale."""
+        tmp, repo_scripts = self._sandbox()
+        d1 = os.path.join(tmp, "d1"); os.makedirs(d1)
+        d2 = os.path.join(tmp, "d2"); os.makedirs(d2)
+        open(os.path.join(repo_scripts, "a.py"), "w").write("v2")
+        open(os.path.join(d1, "a.py"), "w").write("v1")  # stale
+        open(os.path.join(d2, "a.py"), "w").write("v2")  # synced
+        with patch("repo_sync_check.DEPLOY_DIRS", [d1, d2]):
+            drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(len(drift[0]["stale_copies"]), 1)
+        self.assertEqual(drift[0]["stale_copies"][0]["dir"], d1)
+
+
+class TestReportDeployDrift(_LogIsolationMixin, unittest.TestCase):
+    """report_deploy_drift(): stdout alert format."""
+
+    def test_alert_line_and_copies(self):
+        drift = [{
+            "script": "tick.sh",
+            "repo_md5": "aaa",
+            "repo_path": "/r/scripts/tick.sh",
+            "stale_copies": [{"dir": "/d", "path": "/d/tick.sh", "md5": "bbb", "mtime": 0}],
+        }]
+        out = io.StringIO()
+        with patch("sys.stdout", new=out):
+            _mod.report_deploy_drift(drift)
+        printed = out.getvalue()
+        self.assertIn("DEPLOY_DRIFT", printed)
+        self.assertIn("tick.sh", printed)
+        self.assertIn("aaa", printed)
+        self.assertIn("bbb", printed)
+        self.assertIn("STALE", printed)
+        self.assertIn("mtime", printed)
+
+
+class TestMainDeployDrift(_LogIsolationMixin, unittest.TestCase):
+    """main() integration: drift alert printed, no-deployed stays silent."""
+
+    def _make_sandbox(self, tmp):
+        """Create repo/scripts/stale.sh (repo copy v2) + deploy copy (v1).
+
+        Returns (repo_root, dep): REPO_DIR must point at the repo ROOT
+        (check_deploy_drift appends 'scripts/' itself).
+        """
+        repo_root = os.path.join(tmp, "repo")
+        repo_scripts = os.path.join(repo_root, "scripts")
+        os.makedirs(repo_scripts)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(repo_scripts, "stale.sh"), "w").write("repo-v2")
+        open(os.path.join(dep, "stale.sh"), "w").write("deploy-v1")
+        return repo_root, dep
+
+    def _run_main_in_sandbox(self, tmp):
+        repo_root, dep = self._make_sandbox(tmp)
+        out = io.StringIO()
+        with patch("sys.argv", ["repo-sync-check.py"]), \
+             patch("repo_sync_check.REPO_DIR", repo_root), \
+             patch("repo_sync_check.DEPLOY_DIRS", [dep]), \
+             patch("repo_sync_check.CONFIG_FILE", os.path.join(tmp, "repo-watch.json")), \
+             patch("repo_sync_check.LOG_FILE", os.path.join(tmp, "log")), \
+             patch("repo_sync_check.get_db_path", return_value=os.path.join(tmp, "db")), \
+             patch("repo_sync_check.os.path.isdir", return_value=True), \
+             patch("repo_sync_check.get_uncommitted_changes", return_value=[]), \
+             patch("repo_sync_check.get_ahead_commits", return_value=[]), \
+             patch("sys.stdout", new=out):
+            with self.assertRaises(SystemExit) as ctx:
+                _mod.main()
+        return ctx.exception.code, out.getvalue()
+
+    def test_drift_alert_printed_even_when_git_synced(self):
+        code, printed = self._run_main_in_sandbox(tempfile.mkdtemp(prefix="drift-main-"))
+        self.assertEqual(code, 0)
+        self.assertIn("DEPLOY_DRIFT", printed)
+        self.assertIn("stale.sh", printed)
+
+    def test_no_deployed_does_not_break_silent_exit(self):
+        tmp = tempfile.mkdtemp(prefix="drift-main2-")
+        repo_root = os.path.join(tmp, "repo")
+        repo_scripts = os.path.join(repo_root, "scripts")
+        os.makedirs(repo_scripts)
+        open(os.path.join(repo_scripts, "only-repo.sh"), "w").write("x")  # never deployed
+        out = io.StringIO()
+        with patch("sys.argv", ["repo-sync-check.py"]), \
+             patch("repo_sync_check.REPO_DIR", repo_root), \
+             patch("repo_sync_check.DEPLOY_DIRS", []), \
+             patch("repo_sync_check.CONFIG_FILE", os.path.join(tmp, "repo-watch.json")), \
+             patch("repo_sync_check.LOG_FILE", os.path.join(tmp, "log")), \
+             patch("repo_sync_check.get_db_path", return_value=os.path.join(tmp, "db")), \
+             patch("repo_sync_check.os.path.isdir", return_value=True), \
+             patch("repo_sync_check.get_uncommitted_changes", return_value=[]), \
+             patch("repo_sync_check.get_ahead_commits", return_value=[]), \
+             patch("sys.stdout", new=out):
+            with self.assertRaises(SystemExit) as ctx:
+                _mod.main()
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertNotIn("DEPLOY_DRIFT", out.getvalue())
+        self.assertNotIn("only-repo.sh", out.getvalue())
 
 
 if __name__ == "__main__":

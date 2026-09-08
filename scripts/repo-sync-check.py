@@ -35,8 +35,16 @@ Usage:
   python3 repo-sync-check.py              # dry-run, prints decisions to stdout
   python3 repo-sync-check.py --execute    # create sync tasks
   python3 repo-sync-check.py --verbose    # verbose output (debug)
+
+Deploy-drift (OBJ-06 / t_b8511377):
+  Every run also md5-compares each repo scripts/ file against its deployed
+  copies in ~/.hermes/scripts/ and ~/.hermes/profiles/*/scripts/. A repo-only
+  script (never deployed) is NOT an alert. Divergence prints a DEPLOY_DRIFT
+  alert on stdout (cron delivery) — alert-only, never auto-deploys.
 """
 
+import glob
+import hashlib
 import sqlite3
 import os
 import sys
@@ -55,7 +63,17 @@ SYNC_FILE = os.path.expanduser("~/.hermes/quota-governor/repo-sync.jsonl")
 LOG_FILE = os.path.expanduser("~/.hermes/logs/repo-sync-check.log")
 CONFIG_FILE = os.path.expanduser("~/.hermes/quota-governor/repo-watch.json")
 MAX_SYNC_PER_TICK = 1
-SYNC_VERSION = "2.0"
+SYNC_VERSION = "3.0"
+# Deploy-drift (OBJ-06/t_b8511377): deployed copies of the repo's scripts/.
+# Scripts are deployed to ~/.hermes/scripts/ and ~/.hermes/profiles/*/scripts/.
+# A script present in the repo but NOT deployed anywhere is "no-deployed"
+# (not stale). A script whose deployed md5 differs from the repo md5 is drift.
+DEPLOY_DIRS = (
+    [os.path.expanduser("~/.hermes/scripts")]
+    + sorted(
+        glob.glob(os.path.expanduser("~/.hermes/profiles/*/scripts"))
+    )
+)
 # Assignee for created sync tasks — profile with the most quota
 DEFAULT_ASSIGNEE = "pr-nanogpt"
 DEFAULT_BRANCH = "main"
@@ -235,6 +253,112 @@ def compute_desync_time(cwd, uncommitted, ahead_commits, remote, branch):
         if ts:
             candidates.append(ts)
     return min(candidates) if candidates else None
+
+# ── Deploy-drift (OBJ-06 / t_b8511377) ──────────────────────────────────────
+#
+# The git-vs-origin sweep above cannot catch the failure mode where the
+# repo is clean but the DEPLOYED copies of scripts/ are stale (that is how
+# quota-governor-tick ran the Aug-27 version until Sep-08). This section
+# audits repo scripts vs their deployed copies. Alert-only: never
+# auto-deploys, never mutates deployed files.
+
+
+def md5_of_file(path):
+    """Return the md5 hex digest of a file, or None if unreadable."""
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError as e:
+        log(f"md5_of_file({path}) failed: {e}", "WARN")
+        return None
+    return h.hexdigest()
+
+
+def check_deploy_drift(repo_dir=None, deploy_dirs=None):
+    """Compare each repo scripts/ file against its deployed copies.
+
+    Returns a list of drift dicts. Semantics:
+      - file deployed in >= 1 DEPLOY_DIRS and every deployed md5 == repo md5
+            → in sync, not reported.
+      - file deployed but at least one deployed md5 differs from repo md5
+            → drift (stale deployed copy).
+      - file present ONLY in the repo (no deployed copy anywhere)
+            → no-deployed, NOT reported (explicit acceptance criterion).
+      - repo file unreadable → skipped with a WARN (fail-safe).
+    """
+    if repo_dir is None:
+        repo_dir = REPO_DIR
+    if deploy_dirs is None:
+        deploy_dirs = DEPLOY_DIRS
+    scripts_dir = os.path.join(repo_dir, "scripts")
+    if not os.path.isdir(scripts_dir):
+        log(f"No scripts/ dir under {repo_dir} — deploy-drift check skipped", "WARN")
+        return []
+
+    drift = []
+    for name in sorted(os.listdir(scripts_dir)):
+        repo_path = os.path.join(scripts_dir, name)
+        if not os.path.isfile(repo_path):
+            continue  # subdirs (__pycache__ etc.) are not deployable scripts
+        repo_md5 = md5_of_file(repo_path)
+        if repo_md5 is None:
+            continue
+
+        deployed = []
+        for d in deploy_dirs:
+            dep_path = os.path.join(d, name)
+            if not os.path.isfile(dep_path):
+                continue
+            dep_md5 = md5_of_file(dep_path)
+            if dep_md5 is None:
+                continue  # unreadable deployed copy: skip this copy
+            try:
+                mtime = os.path.getmtime(dep_path)
+            except OSError:
+                mtime = None
+            deployed.append({
+                "dir": d,
+                "path": dep_path,
+                "md5": dep_md5,
+                "mtime": mtime,
+            })
+
+        if not deployed:
+            continue  # no-deployed: script exists only in the repo — OK
+
+        stale = [d for d in deployed if d["md5"] != repo_md5]
+        if stale:
+            drift.append({
+                "script": name,
+                "repo_md5": repo_md5,
+                "repo_path": repo_path,
+                "stale_copies": stale,
+            })
+    return drift
+
+
+def _fmt_ts(ts):
+    """Unix timestamp → 'YYYY-MM-DD HH:MM:SS' local time, or 'unknown'."""
+    if ts is None:
+        return "unknown"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+def report_deploy_drift(drift):
+    """Print a human-readable deploy-drift alert to stdout (cron delivery)."""
+    print("DEPLOY_DRIFT: deployed scripts differ from repo — manual deploy needed (no auto-deploy)")
+    for d in drift:
+        print(f"  {d['script']}: repo md5 {d['repo_md5']}")
+        for s in d["stale_copies"]:
+            print(
+                f"    deploy {s['path']} md5 {s['md5']} "
+                f"(mtime {_fmt_ts(s['mtime'])}) — STALE"
+            )
 
 # ── DB Helpers ───────────────────────────────────────────────────────────────
 
@@ -547,6 +671,17 @@ def main():
             sys.exit(1)
 
     db_path = get_db_path()
+
+    # Deploy-drift audit (alert-only, before the git sync sweep so a drift
+    # alert is delivered even if the sweep later exits early). Never fatal:
+    # any error here must not break the historic git-vs-origin behavior.
+    try:
+        drift = check_deploy_drift(repo_dir=REPO_DIR)
+        if drift:
+            report_deploy_drift(drift)
+            log(f"Deploy drift detected in {len(drift)} script(s)", "WARN")
+    except Exception as e:
+        log(f"Deploy-drift check failed (non-fatal): {e}", "WARN")
 
     # Gather dirty repos (respecting enabled flag and per-repo pending state).
     dirty = _gather_dirty_repos(configs, db_path)
