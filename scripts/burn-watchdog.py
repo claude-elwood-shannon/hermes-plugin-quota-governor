@@ -234,9 +234,13 @@ def provider_cost(provider: Dict[str, Any]) -> Optional[float]:
     """A per-provider USD burn meter from the snapshot, if present.
 
     Priority: entry ``cost`` → raw ``cost`` → raw ``activity_cost``
-    (ollama pay-as-you-go). Returns None when the snapshot carries no real
-    USD meter for this provider (the watchdog then falls back to the
-    percent-delta x window_usd_cap estimate).
+    (ollama pay-as-you-go) → entry ``usd_balance`` (nanogpt prepaid
+    balance, OBJ-26: exact POST /api/check-balance probe — the burn is
+    the BALANCE DROP, so the meter is the balance itself and the delta
+    logic below derives spend automatically).
+    Returns None when the snapshot carries no real USD meter for this
+    provider (the watchdog then falls back to the percent-delta x
+    window_usd_cap estimate).
     """
     for key in ("cost",):
         val = provider.get(key)
@@ -253,6 +257,13 @@ def provider_cost(provider: Dict[str, Any]) -> Optional[float]:
                 return float(val)
             except (TypeError, ValueError):
                 pass
+    # OBJ-26: nanogpt exact prepaid balance travels at entry level.
+    bal = provider.get("balance") or {}
+    if isinstance(bal, dict) and bal.get("usd_balance") is not None:
+        try:
+            return float(bal["usd_balance"])
+        except (TypeError, ValueError):
+            pass
     return None
 
 

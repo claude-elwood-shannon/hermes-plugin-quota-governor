@@ -167,6 +167,117 @@ PRIVACY_PROVIDER_PREFERENCE = {
 # Levels that trigger preference-first routing (vs availability-first)
 _PREFERENCE_FIRST_LEVELS = set(PRIVACY_PROVIDER_PREFERENCE.keys())
 
+# ---------------------------------------------------------------------------
+# OBJ-26 (t_a8b1656a): NanoGPT as the PREFERRED provider
+# ---------------------------------------------------------------------------
+# User preference (2026-09-08): pr-nanogpt is the FIRST choice for inference
+# (behind privacy restrictions), sustained by a prepaid USD balance, with a
+# moderate spend/result tradeoff — don't burn the balance, don't waste the
+# subscription quota by idling.
+#
+# Routing change: availability-first sorting is REPLACED by preference-first
+# sorting for ALL levels, with pr-nanogpt first.  pr-ollama keeps priority
+# for privacy:sensitive (already encoded in PRIVACY_PROVIDER_PREFERENCE).
+#
+# COVERED-FIRST (within pr-nanogpt): subscription-covered models (verified
+# via x_nanogpt_pricing costUsd=0, paymentSource=USD on live calls) are used
+# while subscription quota remains (>10% weekly left); balance-only models
+# (e.g. qwen3.5-4b) drain the prepaid balance and are only exposed when
+# subscription is nearly exhausted OR no covered model can do the task.
+#
+# BUDGET: NANO_GPT_MAX_BALANCE_SPEND (USD per subscription window, default
+# 5.0, override in model-cost.json "nanogpt_max_balance_spend_usd") caps
+# autonomous balance spend; nanogpt-balance-ledger.py tracks the exact
+# balance via POST /api/check-balance and gates balance-only models at the
+# cap (subscription models keep working — NanoGPT never fully dies).
+
+# Preference-first for everything (OBJ-26): lower wins; availability breaks
+# ties.  pr-ollama stays above pr-nanogpt ONLY for privacy:sensitive (map
+# above); for public/no-privacy NanoGPT is the preferred provider.
+GENERAL_PROVIDER_PREFERENCE = {
+    "pr-nanogpt": 0,
+    "pr-ollama": 1,
+    "pr-opencode": 2,
+    "pr-openrouter": 3,
+}
+
+# Subscription quota threshold: below this weekly remainder, balance-only
+# models become eligible (covered-first relaxes to keep results flowing
+# instead of idling with quota "wasted" — the user asked for BOTH savings
+# and results; this is the equilibrium point).
+NANOGPT_SUB_GUARDRAIL_PCT = 90.0
+
+# Overage policy: balance-only models are only eligible when the account's
+# paidSpendPolicyAllowsBalance routing flag is true (live-verified 8-sep:
+# false while overage disabled — the gate must NOT drain balance before
+# OBJ-26 deliberately enables it; also implies the balance exists).
+_NANOGPT_BALANCE_MOD = _LEDGER_UNSET_PLACEHOLDER = object()
+
+
+def _nanogpt_balance_module():
+    """Lazily import nanogpt-balance-ledger.py (hyphenated filename)."""
+    global _NANOGPT_BALANCE_MOD
+    if _NANOGPT_BALANCE_MOD is _LEDGER_UNSET_PLACEHOLDER:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "nanogpt-balance-ledger.py")
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "nanogpt_balance_ledger", path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot load spec for {path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _NANOGPT_BALANCE_MOD = mod
+        except Exception:
+            _NANOGPT_BALANCE_MOD = None
+    return _NANOGPT_BALANCE_MOD
+
+
+def nanogpt_budget_context(hermes_home=None):
+    """Best-effort OBJ-26 balance budget block for the gate snapshot.
+
+    Returns (context_dict_or_None, warning_list).  Never fatal: any error
+    degrades to (None, []).
+    """
+    try:
+        mod = _nanogpt_balance_module()
+        if mod is None:
+            return None, []
+        # Budget ceiling: env var wins, else model-cost.json override,
+        # else module default (5.00 USD / subscription window).
+        max_spend = os.environ.get("NANO_GPT_MAX_BALANCE_SPEND")
+        if max_spend:
+            try:
+                max_spend = float(max_spend)
+            except ValueError:
+                max_spend = None
+        if max_spend is None:
+            try:
+                with open(os.path.join(mod.state_dir(hermes_home),
+                                       "model-cost.json"),
+                          encoding="utf-8") as fh:
+                    max_spend = json.load(fh).get(
+                        "nanogpt_max_balance_spend_usd")
+                max_spend = float(max_spend) if max_spend is not None else None
+            except (OSError, ValueError, TypeError):
+                max_spend = None
+        ctx, warn = mod.budget_context(max_spend_usd=max_spend)
+        return ctx, ([warn] if warn else [])
+    except Exception:
+        return None, []
+
+
+def _covered_models_safe():
+    """Covered-model set from the balance module (never raises)."""
+    try:
+        mod = _nanogpt_balance_module()
+        if mod is None:
+            return None, "module unavailable"
+        return mod.fetch_covered_models()
+    except Exception as exc:
+        return None, str(exc)
+
 # Try to import the plugin's providers module for query functions.
 # If import fails, we fall back to inline implementations.
 _PLUGIN_PATH = os.path.expanduser(
@@ -912,12 +1023,37 @@ def compute_ollama_status():
     }
 
 
-def compute_nanogpt_status():
-    """Build a ProviderStatus dict for NanoGPT."""
+def compute_nanogpt_status(budget=None):
+    """Build a ProviderStatus dict for NanoGPT.
+
+    OBJ-26: *budget* is the nanogpt_balance context dict (may be None).
+    When present it feeds the availability calculation:
+
+    COVERED-FIRST policy — the availability reflects the routing surface
+    the rest of the gate can use:
+      - subscription quota healthy (weekly remainder >10%): covered models
+        are usable; balance-only models (qwen3.5-4b) drain the prepaid
+        balance so they are NOT part of availability (the plan's models
+        suffice; wasting quota idling is exactly what the user rejected).
+      - subscription nearly exhausted (<=10% left) and balance budget
+        allows: availability is blended — the remaining subscription slice
+        plus the balance budget's spendable headroom (capped at 100).
+      - balance budget exhausted (level "stop"): balance-only headroom
+        contributes nothing.
+
+    The covered/balance model split travels in ``raw`` (model sets for the
+    task creator) and the budget block in ``balance``.
+    """
     raw = query_nanogpt()
     state = raw.get("state")
     daily_pct = raw.get("daily_pct")
     weekly_pct = raw.get("weekly_tokens_pct")
+
+    budget = budget or {}
+    level = budget.get("level")
+    balance_usd = budget.get("usd_balance")
+    max_spend = budget.get("window_max_spend_usd")
+    spent = budget.get("window_spent_usd")
 
     # Skip if account not active
     if state != "active":
@@ -932,28 +1068,36 @@ def compute_nanogpt_status():
             "raw": raw,
         }
 
-    # Compute bottleneck
-    pcts = []
-    if daily_pct is not None:
-        pcts.append(("daily", daily_pct))
-    if weekly_pct is not None:
-        pcts.append(("weekly_tokens", weekly_pct))
+    covered_models, _cov_err = _covered_models_safe()
 
-    if not pcts:
-        # No usage data — assume fully available
-        return {
-            "profile": "pr-nanogpt",
-            "provider": "nanogpt",
-            "model": PROFILE_MODELS["pr-nanogpt"],
-            "availability": 100.0,
-            "bottleneck_pct": 0.0,
-            "bottleneck_window": "unknown",
-            "error": "",
-            "raw": raw,
-        }
+    # Covered-first availability (OBJ-26). Budget numbers missing ->
+    # behave covered-first conservative: subscription only.
+    weekly_left = (100.0 - weekly_pct) if weekly_pct is not None else None
+    budget_open = level in ("ok", "warn")
+    if weekly_left is None:
+        # No usage data — assume fully available (subscription surface)
+        availability = 100.0
+        bottleneck_window = "unknown"
+        bottleneck_pct = 0.0
+    elif weekly_left > (100.0 - NANOGPT_SUB_GUARDRAIL_PCT):
+        # Subscription healthy: covered models carry everything.
+        availability = weekly_left
+        bottleneck_window = "weekly_tokens"
+        bottleneck_pct = weekly_pct
+    else:
+        # Subscription nearly exhausted: blend the balance headroom in.
+        if budget is not None and budget_open and \
+                balance_usd is not None and max_spend:
+            headroom_usd = min(max(float(balance_usd), 0.0),
+                               max(float(max_spend) - float(spent or 0.0), 0.0))
+            balance_slice = min(headroom_usd / max_spend * 100.0, 100.0)
+        else:
+            balance_slice = 0.0
+        availability = min(weekly_left + balance_slice, 100.0)
+        bottleneck_window = "weekly_tokens+balance"
+        bottleneck_pct = max(weekly_pct or 0.0, 100.0 - availability)
 
-    bottleneck_window, bottleneck_pct = max(pcts, key=lambda x: x[1])
-    availability = max(100.0 - bottleneck_pct, 0.0)
+    availability = max(min(availability, 100.0), 0.0)
 
     return {
         "profile": "pr-nanogpt",
@@ -963,8 +1107,15 @@ def compute_nanogpt_status():
         "bottleneck_pct": round(bottleneck_pct, 1),
         "bottleneck_window": bottleneck_window,
         "error": "",
-        "raw": {"daily_pct": daily_pct, "weekly_tokens_pct": weekly_pct,
-                "state": state},
+        "raw": {
+            "daily_pct": daily_pct, "weekly_tokens_pct": weekly_pct,
+            "state": state,
+            "covered_first": True,
+            "covered_model_count": (len(covered_models)
+                                    if covered_models is not None else None),
+            "coverage_unknown": covered_models is None,
+        },
+        "balance": budget or None,
     }
 
 
@@ -1539,7 +1690,8 @@ def parse_privacy_level():
     return None
 
 
-def select_provider(providers_list, privacy_level=None, parked=None):
+def select_provider(providers_list, privacy_level=None, parked=None,
+                    nanogpt_budget=None):
     """Pick the provider with the most available quota.
 
     *parked* (t_7da69d59): set of profile names marked ``parked: true`` in
@@ -1553,15 +1705,19 @@ def select_provider(providers_list, privacy_level=None, parked=None):
     are first filtered to those capable of handling that privacy level
     before the normal availability scoring is applied.
 
+    *nanogpt_budget* (OBJ-26): the context["nanogpt_balance"] dict when
+    available.  When its level is "stop", pr-nanogpt drops out of the
+    candidate set entirely (budget exhausted; NanoGPT re-enters next
+    window).  Subscription-covered routing inside pr-nanogpt is handled in
+    compute_nanogpt_status, not here.
+
     Routing mode:
-      * **availability-first** (default, and for ``public``): providers are
-        sorted by availability descending, then by PROVIDER_PREFERENCE as
-        tie-breaker.
-      * **preference-first** (for ``sensitive`` and ``confidential``):
-        providers are sorted by PRIVACY_PROVIDER_PREFERENCE first, then by
-        availability as tie-breaker.  This ensures the OBJ-18 criterion
-        (high → NanoGPT) is satisfied even when a less-preferred provider
-        has more spare quota.
+      * **preference-first** (OBJ-26, all levels): providers are sorted by
+        the applicable preference map first, availability as tie-breaker.
+        sensitive/confidential use PRIVACY_PROVIDER_PREFERENCE (NanoGPT
+        first for sensitive, from OBJ-18); public/no-privacy now uses
+        GENERAL_PROVIDER_PREFERENCE (NanoGPT first — user preference,
+        balance-sustained) instead of the old availability-first order.
 
     Returns the best ProviderStatus dict, or None if all exhausted
     (or if no provider satisfies the privacy constraint).
@@ -1581,32 +1737,27 @@ def select_provider(providers_list, privacy_level=None, parked=None):
             capable = _PROVIDER_PRIVACY.get(p["provider"], set())
             if privacy_level not in capable:
                 continue
+        # OBJ-26 budget stop: exhausted balance budget removes pr-nanogpt
+        if (nanogpt_budget and p["profile"] == "pr-nanogpt"
+                and nanogpt_budget.get("level") == "stop"):
+            continue
         candidates.append(p)
 
     if not candidates:
         return None
 
-    # Determine routing mode: preference-first for sensitive/confidential,
-    # availability-first for public and no-privacy.
-    use_preference_first = (
-        privacy_level is not None
-        and privacy_level in _PREFERENCE_FIRST_LEVELS
-    )
-
-    if use_preference_first:
+    # Routing mode: preference-first ALWAYS (OBJ-26). The map depends on
+    # the privacy level; sensitive keeps NanoGPT-first from OBJ-18 too.
+    if privacy_level in _PREFERENCE_FIRST_LEVELS:
         pref_map = PRIVACY_PROVIDER_PREFERENCE[privacy_level]
-        # Sort by privacy preference (ascending), then availability (descending)
-        candidates.sort(
-            key=lambda p: (
-                pref_map.get(p["profile"], 99),
-                -p["availability"],
-            )
-        )
     else:
-        # Availability-first (public or no privacy)
-        candidates.sort(
-            key=lambda p: (-p["availability"], PROVIDER_PREFERENCE.get(p["profile"], 99))
+        pref_map = GENERAL_PROVIDER_PREFERENCE
+    candidates.sort(
+        key=lambda p: (
+            pref_map.get(p["profile"], 99),
+            -p["availability"],
         )
+    )
 
     top = candidates[0]
 
@@ -1648,11 +1799,15 @@ def main():
         })
         warnings.append(f"ollama: {exc}")
 
-    # NanoGPT
+    # --- NanoGPT ---
     nanogpt_key = get_env("NANO_GPT_API_KEY")
     if nanogpt_key:
+        # OBJ-26: balance budget block (exact /api/check-balance probe,
+        # weekly budget state, covered-model list). Never fatal.
+        ng_budget, ng_budget_warnings = nanogpt_budget_context()
+        warnings.extend(ng_budget_warnings)
         try:
-            providers_list.append(compute_nanogpt_status())
+            providers_list.append(compute_nanogpt_status(budget=ng_budget))
         except Exception as exc:
             providers_list.append({
                 "profile": "pr-nanogpt",
@@ -1665,6 +1820,8 @@ def main():
                 "raw": {},
             })
             warnings.append(f"nanogpt: {exc}")
+    else:
+        ng_budget = None
     # else: not configured — skip silently
 
     # OpenRouter
@@ -1714,9 +1871,10 @@ def main():
     for p in providers_list:
         p["parked"] = p["profile"] in parked
 
-    # --- Select recommended provider (with privacy filtering) ---
+    # --- Select recommended provider (with privacy filtering + OBJ-26
+    #     balance-budget stop) ---
     recommended = select_provider(providers_list, privacy_level=privacy_level,
-                                  parked=parked)
+                                  parked=parked, nanogpt_budget=ng_budget)
 
     # --- Per-model cost ledger (MULTI-PROV-09, t_5bdd7cfa) ---
     # Opportunistic sync + per-window shares/warnings.  Reuse the gate's
@@ -1820,6 +1978,8 @@ def main():
         }
         if model_cost:
             output["context"]["model_cost"] = model_cost
+        if ng_budget:
+            output["context"]["nanogpt_balance"] = ng_budget
         if forecast_warning:
             output["context"]["forecast_warning"] = forecast_warning
         print(json.dumps(output))
@@ -1891,6 +2051,8 @@ def main():
             "model_cost": model_cost,
         },
     }
+    if ng_budget:
+        output["context"]["nanogpt_balance"] = ng_budget
     if forecast_warning:
         output["context"]["forecast_warning"] = forecast_warning
     print(json.dumps(output))

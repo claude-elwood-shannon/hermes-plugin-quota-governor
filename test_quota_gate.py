@@ -63,6 +63,7 @@ from quota_gate import (
     PROVIDER_PREFERENCE,
     PRIVACY_CAPABILITIES,
 )
+import quota_gate  # for patch.object / qualified access in OBJ-26 tests
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -463,6 +464,15 @@ class TestComputeOllamaStatus(unittest.TestCase):
 
 class TestComputeNanogptStatus(unittest.TestCase):
 
+    def setUp(self):
+        # Test isolation (OBJ-26 review): _covered_models_safe() would hit
+        # the LIVE NanoGPT API (the balance module's _env_key() reads the
+        # real profile .env regardless of HERMES_HOME). Inject the set.
+        p = patch("quota_gate._covered_models_safe",
+                  return_value=({"z-ai/glm-5.3-flash", "z-ai/glm-5.2"}, None))
+        p.start()
+        self.addCleanup(p.stop)
+
     @patch("quota_gate.query_nanogpt")
     def test_active_with_usage(self, mock_query):
         mock_query.return_value = {
@@ -488,6 +498,104 @@ class TestComputeNanogptStatus(unittest.TestCase):
         result = compute_nanogpt_status()
         self.assertEqual(result["availability"], 100.0)
         self.assertEqual(result["bottleneck_pct"], 0.0)
+
+
+class TestNanogptCoveredFirstObj26(unittest.TestCase):
+    """OBJ-26: covered-first availability + balance budget blend/stop.
+
+    All tests inject the covered-model set (no live API) via
+    quota_gate._covered_models_safe.
+    """
+
+    def setUp(self):
+        p = patch("quota_gate._covered_models_safe",
+                  return_value=({"z-ai/glm-5.3-flash", "z-ai/glm-5.2"}, None))
+        p.start()
+        self.addCleanup(p.stop)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_healthy_covered_first(self, mock_query):
+        """Sub <90% used: availability = weekly remainder; covered-first."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": 30.0, "weekly_tokens_pct": 50.0}
+        budget = {"level": "ok", "usd_balance": 15.49,
+                  "window_spent_usd": 0.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        self.assertEqual(result["availability"], 50.0)
+        self.assertEqual(result["bottleneck_window"], "weekly_tokens")
+        self.assertTrue(result["raw"]["covered_first"])
+        self.assertEqual(result["raw"]["covered_model_count"], 2)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_exhausted_balance_blend(self, mock_query):
+        """Sub >90% used + budget open: balance headroom blends in."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        budget = {"level": "ok", "usd_balance": 15.49,
+                  "window_spent_usd": 0.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        # 5% sub remainder + 100% balance slice → capped at 100.
+        self.assertEqual(result["availability"], 100.0)
+        self.assertEqual(result["bottleneck_window"], "weekly_tokens+balance")
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_exhausted_partial_headroom(self, mock_query):
+        """Headroom is min(balance, budget remainder), scaled to 100."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        budget = {"level": "warn", "usd_balance": 2.0,
+                  "window_spent_usd": 3.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        # headroom = min(2.0, 2.0) = 2.0 → slice 40% → 5 + 40 = 45.
+        self.assertEqual(result["availability"], 45.0)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_exhausted_budget_stop(self, mock_query):
+        """Budget stop → balance slice contributes nothing (sub only)."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        budget = {"level": "stop", "usd_balance": 15.49,
+                  "window_spent_usd": 5.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        self.assertEqual(result["availability"], 5.0)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_budget_none_conservative(self, mock_query):
+        """No budget context → covered-first conservative (sub only)."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        result = compute_nanogpt_status(budget=None)
+        self.assertEqual(result["availability"], 5.0)
+        self.assertTrue(result["raw"]["coverage_unknown"] in (True, False))
+
+
+class TestNanogptBudgetStopRoutingObj26(unittest.TestCase):
+    """OBJ-26: budget level 'stop' removes pr-nanogpt from candidates."""
+
+    def test_stop_drops_nanogpt_other_provider_wins(self):
+        providers = [
+            _provider(profile="pr-ollama", availability=10),
+            _provider(profile="pr-nanogpt", availability=100),
+        ]
+        result = select_provider(providers, nanogpt_budget={"level": "stop"})
+        self.assertEqual(result["profile"], "pr-ollama")
+
+    def test_stop_nanogpt_only_returns_none(self):
+        providers = [_provider(profile="pr-nanogpt", availability=100)]
+        result = select_provider(providers, nanogpt_budget={"level": "stop"})
+        self.assertIsNone(result)
+
+    def test_warn_keeps_nanogpt(self):
+        providers = [_provider(profile="pr-nanogpt", availability=50)]
+        result = select_provider(providers, nanogpt_budget={"level": "warn"})
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_nanogpt_budget_context_module_unavailable(self):
+        """Module load failure degrades to (None, []) — never fatal."""
+        with patch("quota_gate._nanogpt_balance_module", return_value=None):
+            ctx, warn = quota_gate.nanogpt_budget_context()
+        self.assertIsNone(ctx)
+        self.assertEqual(warn, [])
 
 
 class TestComputeOpenrouterStatus(unittest.TestCase):
@@ -575,13 +683,17 @@ class TestSelectProviderNonPrivacy(unittest.TestCase):
         self.assertIsNone(None)
 
     def test_tiebreak_by_preference(self):
-        """When availability is equal, lower preference number wins."""
+        """When availability is equal, lower preference number wins.
+
+        OBJ-26: preference-first for ALL levels; pr-nanogpt is the preferred
+        provider (GENERAL_PROVIDER_PREFERENCE 0) for public/no-privacy.
+        """
         providers = [
             _provider(profile="pr-nanogpt", availability=50),
             _provider(profile="pr-ollama", availability=50),
         ]
         result = select_provider(providers)
-        self.assertEqual(result["profile"], "pr-ollama")  # preference 0
+        self.assertEqual(result["profile"], "pr-nanogpt")  # preference 0 (OBJ-26)
 
     def test_paying_mode_fallback_to_free(self):
         """If top provider is in paying mode, but a free one exists, pick free."""
@@ -593,13 +705,18 @@ class TestSelectProviderNonPrivacy(unittest.TestCase):
         self.assertEqual(result["profile"], "pr-nanogpt")
 
     def test_paying_mode_no_free_stays(self):
-        """If all providers are in paying mode, stay with top availability."""
+        """If all providers are in paying mode, stay with the top pick.
+
+        OBJ-26: preference-first for ALL levels — top is pr-nanogpt
+        (GENERAL_PROVIDER_PREFERENCE 0) even with lower availability;
+        with no free provider there is nothing to fall back to.
+        """
         providers = [
             _provider(profile="pr-ollama", availability=5, bottleneck=100),
             _provider(profile="pr-nanogpt", availability=3, bottleneck=100),
         ]
         result = select_provider(providers)
-        self.assertEqual(result["profile"], "pr-ollama")  # higher avail
+        self.assertEqual(result["profile"], "pr-nanogpt")  # preference 0 (OBJ-26)
 
 
 # ── OpenCode Go (MULTI-PROV-06) ─────────────────────────────────────────────
@@ -775,14 +892,20 @@ class TestComputeOpenCodeGoStatus(unittest.TestCase):
         self.assertEqual(st["bottleneck_window"], "unknown")
 
     def test_select_provider_considers_opencode_go(self):
-        """pr-opencode wins when it has the most availability (public)."""
+        """pr-opencode ranks by preference, not raw availability.
+
+        OBJ-26: preference-first for public/no-privacy too. opencode-go
+        keeps its availability win ONLY when no higher-preference provider
+        is in the candidate set; pr-ollama (preference 1) beats
+        pr-opencode (2) regardless of availability gap.
+        """
         providers = [
             _provider(profile="pr-ollama", availability=10, bottleneck=90),
             _provider(profile="pr-opencode", availability=85, bottleneck=15,
                       provider="opencode-go"),
         ]
         result = select_provider(providers)
-        self.assertEqual(result["profile"], "pr-opencode")
+        self.assertEqual(result["profile"], "pr-ollama")
 
     def test_select_provider_excludes_opencode_go_for_sensitive(self):
         """sensitive excludes opencode-go (public only, unaudited ZDR)."""
@@ -934,6 +1057,8 @@ class TestGateOutputContainsPeakAndWorkerModel(unittest.TestCase):
         with patch.object(_mod, "parse_privacy_level", return_value=None), \
              patch.object(_mod, "compute_ollama_status", return_value=fake), \
              patch.object(_mod, "get_env", return_value=None), \
+             patch.object(_mod, "nanogpt_budget_context",
+                          return_value=(None, [])), \
              patch.object(_mod, "select_provider", return_value=dict(fake)), \
              patch.object(_mod, "get_existing_profiles",
                           return_value={"pr-ollama", "pr-nanogpt", "pr-opencode"}):
@@ -961,8 +1086,17 @@ class TestGateOutputContainsPeakAndWorkerModel(unittest.TestCase):
         burning["burning_balance"] = True
         fine = self._fake_provider(profile="pr-ollama", provider="ollama-cloud",
                                    availability=80.0, bottleneck=20.0)
+
+        def fake_get_env(key):
+            # opencode-go key present (so the burning provider is appended);
+            # NanoGPT key absent (test isolation — no live balance probe).
+            return "k" if key == "OPENCODE_GO_API_KEY" else None
+
         with patch.object(_mod, "parse_privacy_level", return_value=None), \
              patch.object(_mod, "compute_ollama_status", return_value=fine), \
+             patch.object(_mod, "get_env", side_effect=fake_get_env), \
+             patch.object(_mod, "nanogpt_budget_context",
+                          return_value=(None, [])), \
              patch.object(_mod, "compute_nanogpt_status", side_effect=Exception("no key")), \
              patch.object(_mod, "compute_opencode_go_status", return_value=burning), \
              patch.object(_mod, "select_provider", return_value=dict(fine)), \
@@ -1036,13 +1170,19 @@ class TestParkedSelection(unittest.TestCase):
         self.assertEqual(result["profile"], "pr-nanogpt")
 
     def test_parked_none_keeps_legacy_behavior(self):
+        """No parked profiles → the OBJ-26 preference order applies.
+
+        pr-nanogpt is GENERAL_PROVIDER_PREFERENCE 0: it wins over
+        pr-openrouter even with lower availability (the old behavior —
+        availability-first with openrouter winning — is gone).
+        """
         providers = [
             _provider(profile="pr-nanogpt", availability=50),
             _provider(profile="pr-openrouter", availability=100,
                       provider="openrouter"),
         ]
         result = select_provider(providers)
-        self.assertEqual(result["profile"], "pr-openrouter")
+        self.assertEqual(result["profile"], "pr-nanogpt")
 
     def test_all_candidates_parked_returns_none(self):
         providers = [

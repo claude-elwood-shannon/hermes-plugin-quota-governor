@@ -75,6 +75,25 @@ def main():
         row["nanogpt_weekly_pct"] = ng.get("weekly_tokens_pct")
         if ng.get("weekly_tokens_pct") is not None:
             ok += 1
+    # OBJ-26: nanogpt balance budget (exact /api/check-balance probe via
+    # nanogpt-balance-ledger.py, 60s cache) + level + weekly budget state.
+    try:
+        sys.path.insert(0, "REPO/scripts")
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "nanogpt_balance_ledger",
+            "REPO/scripts/nanogpt-balance-ledger.py")
+        if _spec is None or _spec.loader is None:
+            raise ImportError("cannot load nanogpt-balance-ledger spec")
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        ctx, _warn = _mod.budget_context()
+        if ctx:
+            row["nanogpt_balance_usd"] = ctx.get("usd_balance")
+            row["nanogpt_budget_level"] = ctx.get("level")
+            row["nanogpt_window_spent_usd"] = ctx.get("window_spent_usd")
+    except Exception:
+        pass  # F1 must never fail for the balance column
     og2 = from_last_good("opencode_go")
     if og2:
         row["opencode_rolling_pct"] = og2.get("rolling_pct")

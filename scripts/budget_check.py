@@ -64,6 +64,50 @@ PROFILE_PROVIDER = {
 ELEGIBLE_STATUSES = ("ready", "todo", "triage")
 
 
+# ── OBJ-26: estado del presupuesto de balance de pr-nanogpt ──────────────────
+
+_NANOGPT_BUDGET = {"loaded": False, "ctx": None}
+
+
+def _nanogpt_budget_ctx():
+    """nanogpt_balance budget context (gate-compatible, cached per run)."""
+    if _NANOGPT_BUDGET["loaded"]:
+        return _NANOGPT_BUDGET["ctx"]
+    _NANOGPT_BUDGET["loaded"] = True
+    try:
+        import importlib.util
+        path = ("REPO/scripts/"
+                "nanogpt-balance-ledger.py")
+        spec = importlib.util.spec_from_file_location(
+            "nanogpt_balance_ledger", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load spec for {path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ctx, _warn = mod.budget_context()
+        _NANOGPT_BUDGET["ctx"] = ctx
+    except Exception:
+        _NANOGPT_BUDGET["ctx"] = None
+    return _NANOGPT_BUDGET["ctx"]
+
+
+def _nanogpt_budget_level():
+    """'ok'|'warn'|'stop'|None (None = budget context unavailable)."""
+    ctx = _nanogpt_budget_ctx()
+    return ctx.get("level") if ctx else None
+
+
+def _nanogpt_subscription_free():
+    """Weekly subscription remainder (%) for pr-nanogpt tasks."""
+    ctx = _nanogpt_budget_ctx()
+    if not ctx:
+        return None
+    pct = ctx.get("weekly_tokens_pct")
+    if pct is None:
+        return None
+    return max(100.0 - float(pct), 0.0)
+
+
 # ── Helpers de estado ─────────────────────────────────────────────────────────
 
 def load_forecast():
@@ -161,6 +205,21 @@ def evaluate(db_path=KANBAN_DB, forecast=None, enforce=False,
         cls = parse_cost_tag(r["body"]) or DEFAULT_CLASS
         class_pct = COST_CLASS_PCT.get(cls, COST_CLASS_PCT[DEFAULT_CLASS])
         free = provider_free_pct(forecast, profile)
+
+        # OBJ-26: pr-nanogpt tasks ALSO obey the balance budget. When the
+        # gate budget level is "stop", the balance-only slice is closed:
+        # the real remaining capacity is the subscription remainder
+        # (covered models keep working), so cap free at it. Without
+        # forecast data, fall back to the subscription remainder so F3
+        # still gates instead of skipping pr-nanogpt silently.
+        if profile == "pr-nanogpt":
+            ng_level = _nanogpt_budget_level()
+            sub_free = _nanogpt_subscription_free()
+            if ng_level == "stop" and sub_free is not None:
+                free = sub_free if free is None else min(free, sub_free)
+            elif free is None and sub_free is not None:
+                free = sub_free
+
         if free is None:
             continue  # sin datos del provider: no veto (falsos positivos=0)
         free_needed = free * MAX_FREE_FRACTION_PCT / 100.0
