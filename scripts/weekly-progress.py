@@ -1,4 +1,4 @@
-#!/usr/bin/python3.12
+#!/usr/bin/env python3
 """weekly-progress.py — OBJ-08: multi-objective progress tracker + weekly report.
 
 Closes the loop described in
@@ -21,8 +21,22 @@ STATUS RULES (derived from §4 "Reglas de completitud" + board reality):
                       >7d later, same convention as objective-backup.py).
   - awaiting_human  : all done but the objective is on MANUAL_VERIFY_OBJECTIVES
                       (§4: the governor must not self-declare these complete).
-  - needs_attention : tasks were lost (archived WITHOUT completed_at =
-                      gave_up/crashed/reclaimed) — completion evidence is gone.
+  - needs_attention : tasks were lost (archived WITHOUT completed_at = gave_up/
+                      crashed/reclaimed) — completion evidence is gone.
+
+Lost-task semantics (OBJ-08 follow-up, t_78acb6dc):
+  An archived-without-completed_at task counts as RESOLVED, not lost, when its
+  tag header carries an explicit `abandoned: <reason>` line. The convention:
+  a human/board-cleanup stamps the note when archiving a gave-up attempt whose
+  work was superseded (re-attempted and/or completed by other tasks of the
+  same objective). Tasks lost WITHOUT the note keep needs_attention forever —
+  an orphan whose work was never replaced must still be visible. The stamp is
+  written by abandon-superseded.py (same tag-header convention as cost-tag-fix
+  and objective: tags); the detector NEVER trusts prose mentions.
+  Known hole (accepted): tasks archived by the pressure-relief auto-archiver
+  WITH completed_at set are counted as complete (pre-existing convention);
+  tasks force-archived from running WITHOUT a stamp and WITHOUT supersession
+  evidence stay lost, which is the intended fail-loud default.
 
 Idempotency: the JSON is fully regenerated from the board on every run and
 written atomically (tmp + os.replace). Re-running never duplicates or
@@ -81,7 +95,7 @@ OBJECTIVES_DOC = Path(os.environ.get(
     "WP_OBJECTIVES_DOC",
     BASE_HOME / "profiles" / "pr-ollama" / "docs" / "autonomous-objectives.md"))
 
-PROGRESS_VERSION = "2.0"
+PROGRESS_VERSION = "2.1"
 
 # §4: OBJ-01 is the base of everything — human verification required.
 MANUAL_VERIFY_OBJECTIVES = {"OBJ-01"}
@@ -92,6 +106,10 @@ MANUAL_VERIFY_OBJECTIVES = {"OBJ-01"}
 OBJECTIVE_RE = re.compile(r"\bobjective\s*:\s*(OBJ-([A-Za-z0-9][A-Za-z0-9._-]*))", re.I)
 DOC_HEADER_RE = re.compile(r"^###+\s*(OBJ-\d+)\b", re.I)
 OPEN_STATUSES = {"running", "ready", "todo", "blocked", "triage"}
+# OBJ-08/t_78acb6dc: an archived task WITHOUT completed_at is only "resolved"
+# (abandoned attempt superseded by other work of the same objective) when the
+# tag header carries this explicit stamp. Header-only: prose never counts.
+ABANDONED_TAG_RE = re.compile(r"^abandoned\s*:", re.I)
 
 
 def header_of(body: str) -> str:
@@ -102,6 +120,16 @@ def header_of(body: str) -> str:
             break
         lines.append(line)
     return "\n".join(lines)
+
+
+def header_lines(body: str) -> List[str]:
+    """Tag header as a list of lines (same convention as header_of)."""
+    return header_of(body).splitlines()
+
+
+def is_abandoned(body: str) -> bool:
+    """True iff the tag HEADER carries an `abandoned:` line (t_78acb6dc)."""
+    return any(ABANDONED_TAG_RE.match(ln) for ln in header_lines(body or ""))
 
 
 def iso(ts: Optional[int]) -> Optional[str]:
@@ -138,6 +166,10 @@ def load_task_objectives(db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
             "id": r["id"], "title": r["title"] or "", "status": r["status"],
             "created_at": r["created_at"], "started_at": r["started_at"],
             "completed_at": r["completed_at"],
+            # OBJ-08/t_78acb6dc: header carries an explicit abandoned: stamp
+            # (see abandon-superseded.py) -> archived-without-completed_at
+            # counts as RESOLVED, not lost.
+            "abandoned": is_abandoned(r["body"] or ""),
         })
     return tasks_by_obj
 
@@ -189,7 +221,8 @@ def build_progress(tasks_by_obj: Dict[str, List[Dict[str, Any]]],
         completed = [t for t in tasks if t["status"] == "done"
                      or (t["status"] == "archived" and t["completed_at"])]
         lost = [t for t in tasks if t["status"] == "archived"
-                and not t["completed_at"]]
+                and not t["completed_at"]
+                and not t.get("abandoned")]
         open_t = [t for t in tasks if t["status"] in OPEN_STATUSES]
         if open_t:
             status = "in_progress"
