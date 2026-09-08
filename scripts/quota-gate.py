@@ -85,6 +85,16 @@ import time
 import urllib.error
 import urllib.request
 
+# Modo sugerente (OBJ-24 F2): --suggest inyecta forecast_warning en el
+# contexto (OBSERVADOR, nunca cambia wakeAgent ni la recomendación).
+# Veto real solo con --enforce tras una semana sin falsos positivos.
+_SUGGEST = "--suggest" in sys.argv[1:]
+_ENFORCE = "--enforce" in sys.argv[1:]
+
+# Colchón (horas) antes del reset semanal para disparar la regla de
+# reducción de workers del predictor (criterio OBJ-24 F2).
+FORECAST_COLCHON_H = 2.0
+
 # Guardrail G1: only these profiles may receive auto-created tasks.
 # The autonomous task creator must NEVER assign to any other profile.
 # pr-opencode added in MULTI-PROV-06 (OpenCode Go provider).
@@ -349,6 +359,75 @@ def load_burn_warnings():
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def load_forecast():
+    """Read the OBJ-24 F2 predictor output (forecast.json).
+
+    Written by quota-forecast.py (no_agent cron, every 15m after
+    quota-metrics). Absent/unparseable -> {} (never breaks the gate).
+    """
+    path = os.path.join(_cache_dir(), "forecast.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def forecast_context(forecast):
+    """Build the ``forecast_warning`` block for the creator context (F2).
+
+    Decision rule (criterio definido en la tarea OBJ-24):
+      - ETA_90 < margen hasta el reset (2h de colchón): reducir max_workers
+        a 1 y marcar max_task_cost en el contexto (suggest level: warn).
+      - ETA_90 < 1h: wakeAgent:false (board se apaga solo).
+
+    En modo --suggest TODO es observador: devuelve un dict con la(s)
+    regla(s) disparadas y los providers afectados; el gate solo lo anota
+    en context.forecast_warning. Con --enforce (F2, tras 7 días de
+    backtest) el caller decide cómo aplicar el veto.
+    """
+    if not isinstance(forecast, dict) or not forecast.get("enabled"):
+        return None
+
+    reset_h = forecast.get("hours_to_reset")
+    try:
+        reset_h = float(reset_h) if reset_h is not None else None
+    except (TypeError, ValueError):
+        reset_h = None
+
+    providers = forecast.get("providers") or {}
+    fired = []
+    shutdown = False
+    for prov, f in providers.items():
+        if not isinstance(f, dict):
+            continue
+        eta90 = f.get("eta_90_hours")
+        try:
+            eta90 = float(eta90) if eta90 is not None else None
+        except (TypeError, ValueError):
+            eta90 = None
+        if eta90 is None or eta90 < 0:
+            continue
+        if eta90 < 1.0:
+            fired.append(f"{prov}: eta_90={eta90:.2f}h (<1h) → board off")
+            shutdown = True
+        elif reset_h is not None and eta90 < (reset_h - FORECAST_COLCHON_H):
+            fired.append(
+                f"{prov}: eta_90={eta90:.2f}h < margen reset "
+                f"({reset_h:.1f}h) → max_workers=1, cap cost")
+    if not fired:
+        return None
+    return {
+        "mode": "suggest" if _SUGGEST and not _ENFORCE else "enforce",
+        "hours_to_reset": reset_h,
+        "rules": fired,
+        "shutdown": shutdown,
+        "note": ("predictor EMA (6h, alpha 0.3) sobre metrics-history — "
+                 "observador; veto real solo con --enforce tras 7d de backtest"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1699,6 +1778,12 @@ def main():
                 recommended_profile, recommended["model"]
             )
 
+    # --- Predictor EMA (OBJ-24 F2) — modo --suggest: observador ---
+    # Solo se activa con --suggest (wrapper forecast-gate.sh); el gate del
+    # cron (sin flags) sigue produciendo el mismo JSON que antes — cero
+    # regresión. forecast.json ausente/corrupto -> None (silencio).
+    forecast_warning = forecast_context(load_forecast()) if _SUGGEST else None
+
     if recommended is None or zombie_check["has_zombie"]:
         # All providers exhausted/errored, no allowed profile exists,
         # privacy filtering eliminated all candidates — OR the
@@ -1735,6 +1820,8 @@ def main():
         }
         if model_cost:
             output["context"]["model_cost"] = model_cost
+        if forecast_warning:
+            output["context"]["forecast_warning"] = forecast_warning
         print(json.dumps(output))
         return
 
@@ -1804,6 +1891,8 @@ def main():
             "model_cost": model_cost,
         },
     }
+    if forecast_warning:
+        output["context"]["forecast_warning"] = forecast_warning
     print(json.dumps(output))
 
 
