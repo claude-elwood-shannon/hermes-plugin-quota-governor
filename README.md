@@ -165,6 +165,24 @@ quota, it logs `reassign` (to the provider with most headroom) or
 pattern); the real veto runs with `--enforce` after a week without
 false positives. Tests: `test_budget_check.py`, `test_budget_hook.py`.
 
+**F2 backtest harness** (`backtest-f2.py`, cron every 15m after forecast):
+measures whether F2 actually hits the close criterion. Each run (1) SNAPS
+the current `forecast.json` into an append-only ledger
+(`~/.hermes/quota-governor/forecast-backtest.jsonl`) — the snapshot mode
+that survives forecast.json's per-tick overwrite; (2) EVALUATES every open
+snapshot/provider against the real crossing time in metrics-history:
+`error_pct = |t_cross_actual − eta_90_pred| / margin_to_reset × 100`
+(<20 → OK, else FAIL); before the milestone is crossed the error stays
+OPEN (never counted as failure), and snapshots past the milestone, without
+a usable ETA, or whose weekly window elapsed with no crossing resolve to
+NA. (3) Appends a daily OK/FAIL/OPEN verdict per provider whenever it
+changes; stdout announces only a NEW FAIL (watchdog pattern). Gate
+`--enforce` unlocks after 7 consecutive days of this ledger with no FAIL.
+Zero API calls — reads only forecast.json + metrics-history.jsonl. Tests:
+`test_backtest_f2.py` (15 cases incl. the tolerant-degradation set).
+Register:
+`HERMES_HOME=~/.hermes/profiles/pr-ollama hermes cron create "every 15m" --name backtest-f2 --script backtest-f2-cron.sh --no-agent --deliver local`
+
 Completeness criterion (from the task): with 24h of history the forecast
 must hit the 90% milestone with <20% error at reset time; zero quota
 wasted (board active while quota > margin, board self-off when
