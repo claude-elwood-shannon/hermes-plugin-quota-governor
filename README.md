@@ -99,6 +99,31 @@ consumed per provider from the model-cost + burn ledgers).
 - Cron (register once):
   `hermes cron create weekly-progress --name weekly-progress --script weekly-progress-cron.sh --no-agent --deliver local "0 23 * * 0"`
 
+## Deterministic zombie guard (OBJ-21)
+
+Guardrail G3 of the autonomous-task-creator prompt ("any running task older
+than 45 minutes → `[SILENT]`") used to live only in the prompt, so its
+enforcement was stochastic — a tick could mis-read the board and feed work
+anyway. The gate snapshot now carries `context.zombie_check`:
+
+```json
+{"has_zombie": false, "count": 0, "threshold_minutes": 45.0, "tasks": []}
+```
+
+- **Age base**: `last_heartbeat_at` (worker liveness), falling back to
+  `started_at`; only `status='running'` rows are examined — measuring the
+  age of a COMPLETED task is meaningless (that exact mistake produced the
+  false "87 min zombie" report behind OBJ-21).
+- **Decisional, not informational**: when `has_zombie` is true the gate
+  forces `wakeAgent:false` and appends a `zombie_guard:` line to
+  `context.warning` (creator silenced regardless of what the LLM sees).
+  The recommendation fields stay visible in the context for auditability.
+- **Prompt kept as second line of defence**: G3 remains in the creator
+  prompt (reworded as "defense in depth") — the gate is the enforcement.
+- Tests: `test_zombie_check.py` (19 cases incl. the done-task regression),
+  `test_cron_prompt_zombie.py` (active-prompt + deploy-drift regression),
+  `e2e_zombie_live.py` (live gate vs the real board + injected-zombie copy).
+
 ## Decision heuristic
 
 The governor uses a **three-state model** (`run`, `paying`, `stop`) that

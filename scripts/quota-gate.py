@@ -35,7 +35,8 @@ Parked profiles (t_7da69d59, Sep 2026):
   ``parked: true`` flag).
 
 Output (last line, JSON):
-  {"wakeAgent": false}  — skip this tick, all providers exhausted
+  {"wakeAgent": false}  — skip this tick, all providers exhausted,
+                        or a zombie worker guard fired (G3 deterministic)
   {"wakeAgent": true, "context": {
       "providers": [...],              # each entry carries "parked": bool
       "recommended_profile": "pr-...",
@@ -48,6 +49,8 @@ Output (last line, JSON):
       "max_workers": N,
       "privacy_level": "public|sensitive|confidential|none",
       "privacy_summary": {"high": N, "medium": N, "low": N, "none": N},
+      "zombie_check": {"has_zombie": bool, "count": N, "threshold_minutes": 45,
+                       "tasks": [...]},            # OBJ-21 G3 deterministic
       "warning": null
   }}
 
@@ -56,6 +59,12 @@ tags found in the bodies of active (non-terminal) tasks in kanban.db.
 It does NOT influence provider routing — it only reports how many
 active tasks carry each privacy tag so the task creator and user can
 see the privacy demand landscape.  Routing by privacy is S2.
+
+zombie_check (OBJ-21, t_e793b2b9) IS decisional: when a running task's
+live age (heartbeat preferred, else started_at) exceeds 45 minutes the
+gate forces wakeAgent:false — the G3 creator-silence rule, now
+deterministic instead of prompt-dependent.  The prompt keeps G3 as a
+second line of defence.
 
 The JSON context is consumed by the autonomous-task-creator cron prompt.
 The agent reads recommended_profile and recommended_model to decide which
@@ -1154,6 +1163,30 @@ _PRIVACY_SUMMARY_BUCKETS = {
 # because they represent pending work that will eventually run.
 _ACTIVE_STATUSES_FOR_PRIVACY = ("ready", "running", "blocked", "todo", "triage")
 
+# ---------------------------------------------------------------------------
+# Deterministic zombie guard (OBJ-21, t_e793b2b9, Sep 2026)
+# ---------------------------------------------------------------------------
+# Guardrail G3 of the autonomous-task-creator prompt ("if any running task is
+# older than 45 minutes → respond [SILENT]") used to live ONLY in the prompt,
+# so its enforcement was stochastic: one tick may apply it, the next may
+# mis-read the board and feed work anyway.  The gate now computes the same
+# check deterministically and forces wakeAgent:false when a zombie exists,
+# regardless of what the LLM sees.  The prompt instruction stays as a second
+# line of defence.
+#
+# Threshold 45 min mirrors G3 (raised from 10 min on Sep 7 2026 — normal
+# workers run 12–40 min, so 10 min produced false zombies and silenced the
+# creator all night).
+#
+# Age base follows health_checks.check_zombie_workers(): prefer the worker's
+# last_heartbeat_at (liveness), fall back to started_at when no heartbeat has
+# been recorded yet.  A task with BOTH timestamps NULL counts as a zombie
+# (undispatched/undated running row).  Measuring age from started_at of an
+# already-COMPLETED task is meaningless — the query only looks at
+# status='running' rows (that exact mistake produced the false "87 min
+# zombie" report that motivated OBJ-21).
+ZOMBIE_RUNNING_MINUTES = 45.0
+
 # Delimiter-aware privacy tag regexes (OBJ-18 S1).
 #
 # The tag must start at a line start, after whitespace, or after an
@@ -1299,6 +1332,100 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
                 )
 
     return summary
+
+
+def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
+    """Deterministic G3 zombie guard (OBJ-21, t_e793b2b9, Sep 2026).
+
+    Scans kanban.db for tasks with status ``running`` whose live age
+    exceeds ZOMBIE_RUNNING_MINUTES (45 min — the G3 threshold), so the
+    creator-silence decision no longer depends on the LLM reading the
+    board correctly.  Age is measured ONLY from live running rows,
+    preferring ``last_heartbeat_at`` (worker liveness) over
+    ``started_at`` — measuring from the started_at of a completed task
+    is what produced the false "87 min zombie" report behind OBJ-21.
+
+    Args:
+        kanban_db_path: Path to kanban.db.  Defaults to
+            ``$HERMES_KANBAN_DB`` env var, then ``~/.hermes/kanban.db``.
+        warnings: Optional list to append warning strings to.
+        now: Frozen epoch seconds (tests); defaults to time.time().
+
+    Returns:
+        dict: {"has_zombie": bool, "count": int, "threshold_minutes": 45.0,
+               "tasks": [ {id, title, assignee, age_minutes,
+                           age_source, minutes_over_threshold}, ... ]}
+        Tasks sorted by age descending, capped at the 5 oldest (the
+        decision signal and the worst offenders, not a full census).
+    """
+    if warnings is None:
+        warnings = []
+    result = {
+        "has_zombie": False,
+        "count": 0,
+        "threshold_minutes": ZOMBIE_RUNNING_MINUTES,
+        "tasks": [],
+    }
+    if now is None:
+        now = time.time()
+
+    # Resolve the kanban.db path (same order as compute_privacy_summary)
+    if kanban_db_path is None:
+        kanban_db_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not kanban_db_path:
+        kanban_db_path = os.path.expanduser("~/.hermes/kanban.db")
+
+    if not os.path.isfile(kanban_db_path):
+        # No kanban.db — nothing to guard.  Not an error, fail open.
+        return result
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(kanban_db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, title, assignee, started_at, last_heartbeat_at "
+            "FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        # DB error — fail open (no zombie declared) + warning.
+        warnings.append(f"zombie_check: kanban.db read failed: {exc}")
+        return result
+
+    zombies = []
+    for row in rows:
+        hb = row["last_heartbeat_at"]
+        started = row["started_at"]
+        if hb is not None:
+            base, source = float(hb), "heartbeat"
+        elif started is not None:
+            base, source = float(started), "started_at"
+        else:
+            # No heartbeat and no started_at — undated running row,
+            # treat as zombie (health_checks precedent).
+            base, source = 0, "unknown"
+
+        age_minutes = max(0.0, (now - base) / 60.0)
+        if age_minutes > ZOMBIE_RUNNING_MINUTES + 1e-9:
+            zombies.append({
+                "id": row["id"],
+                "title": row["title"],
+                "assignee": row["assignee"] or "unknown",
+                "age_minutes": round(age_minutes, 1),
+                "age_source": source,
+                "minutes_over_threshold": round(
+                    age_minutes - ZOMBIE_RUNNING_MINUTES, 1
+                ),
+            })
+
+    zombies.sort(key=lambda t: t["age_minutes"], reverse=True)
+    result["count"] = len(zombies)
+    result["has_zombie"] = bool(zombies)
+    # Signal + worst offenders only; a full census is not needed to
+    # silence the creator (and keeps the snapshot small).
+    result["tasks"] = zombies[:5]
+    return result
 
 
 def parse_privacy_level():
@@ -1537,6 +1664,21 @@ def main():
     existing_profiles = get_existing_profiles()
     valid_profiles = sorted(existing_profiles & ALLOWED_PROFILES)
 
+    # --- Deterministic zombie guard (OBJ-21) ---
+    # G3 of the creator prompt (any running task > 45 min → [SILENT])
+    # enforced HERE, deterministically: if a zombie exists the gate forces
+    # wakeAgent:false regardless of the recommendation.  Computed once,
+    # before both output branches, so the context always carries it.
+    zombie_check = compute_zombie_check(warnings=warnings)
+    if zombie_check["has_zombie"]:
+        worst = zombie_check["tasks"][0]
+        warnings.append(
+            f"zombie_guard: {zombie_check['count']} task(s) running >"
+            f"{int(ZOMBIE_RUNNING_MINUTES)} min "
+            f"(oldest {worst['id']} {worst['age_minutes']}min via "
+            f"{worst['age_source']}) — creator silenced (G3 deterministic)"
+        )
+
     if recommended is not None:
         recommended_profile = validate_recommended_profile(
             recommended["profile"], existing_profiles, warnings,
@@ -1557,20 +1699,35 @@ def main():
                 recommended_profile, recommended["model"]
             )
 
-    if recommended is None:
-        # All providers exhausted/errored, or no allowed profile exists,
-        # or privacy filtering eliminated all candidates
+    if recommended is None or zombie_check["has_zombie"]:
+        # All providers exhausted/errored, no allowed profile exists,
+        # privacy filtering eliminated all candidates — OR the
+        # deterministic zombie guard fired (OBJ-21: G3 enforced here).
         privacy_summary = compute_privacy_summary(warnings=warnings)
+        if recommended is not None:
+            # Zombie guard overrode a live recommendation: keep the
+            # recommendation fields visible in the context so the SILENT
+            # rationale is auditable, but never wake the agent.
+            rec_profile = recommended["profile"]
+            rec_model = recommended["model"]
+            rec_cost = bottleneck_to_max_cost(recommended["bottleneck_pct"])
+            rec_workers = bottleneck_to_max_workers(recommended["bottleneck_pct"])
+        else:
+            rec_profile = None
+            rec_model = None
+            rec_cost = None
+            rec_workers = 0
         output = {
             "wakeAgent": False,
             "context": {
                 "providers": providers_list,
-                "recommended_profile": None,
-                "recommended_model": None,
-                "max_task_cost": None,
-                "max_workers": 0,
+                "recommended_profile": rec_profile,
+                "recommended_model": rec_model,
+                "max_task_cost": rec_cost,
+                "max_workers": rec_workers,
                 "privacy_level": privacy_level or "none",
                 "privacy_summary": privacy_summary,
+                "zombie_check": zombie_check,
                 "valid_profiles": valid_profiles,
                 "warning": "; ".join(warnings) if warnings else "all providers exhausted",
                 "burn_warnings": load_burn_warnings(),
@@ -1638,6 +1795,9 @@ def main():
             "max_workers": max_workers,
             "privacy_level": privacy_level or "none",
             "privacy_summary": privacy_summary,
+            # OBJ-21: always present.  Reaches this branch only when
+            # has_zombie is False (a zombie forces the early return above).
+            "zombie_check": zombie_check,
             "valid_profiles": valid_profiles,
             "warning": warning,
             "burn_warnings": load_burn_warnings(),

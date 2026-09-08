@@ -14,9 +14,9 @@ Method:
        - Mock get_existing_profiles (no `hermes` CLI call).
        - Same temp kanban.db, active tasks WITHOUT privacy tags.
   4. Run main() of each version, capture the JSON output.
-  5. Diff: strip the additive privacy_summary key from the new output
-     and compare the full JSON against the old output.  They must be
-     identical after canonical (sorted-keys) serialisation.
+  5. Diff: strip the additive privacy_summary and zombie_check keys from
+     the new output and compare the full JSON against the old output.
+     They must be identical after canonical (sorted-keys) serialisation.
 
 Exit 0 = recommendation identical (acceptance met).
 Exit 1 = any difference (prints the diff).
@@ -30,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest.mock as mock
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -81,6 +82,16 @@ def old_gate_ref():
     # its parent is the true pre-S1 baseline.  Works on the feature branch
     # AND after the merge onto main, where merge-base(HEAD, main) degenerates
     # to HEAD and HEAD~N counting is positional/fragile.
+    #
+    # OBJ-21 note: the baseline must predate BOTH additive features.  When
+    # verifying the zombie guard, use QUOTA_GATE_BASE_REF=<migration commit>
+    # (6d73746, Sep-8 worker-model migration) — the pre-S1 baseline picked
+    # below also predates that migration, so the worker_models map
+    # legitimately differs (z-ai/glm-5.3-flash) and the default run
+    # reports a spurious DIFFERENT hunk.  Both baselines are supported:
+    # additive keys are stripped from BOTH sides in the diff (below), so
+    # the verifier is baseline-agnostic; only genuinely pre-migration
+    # comparisons need the env override.
     introduced = git("log", "--format=%H", "--reverse", "-S",
                      "compute_privacy_summary", "--", "scripts/quota-gate.py")
     first = introduced.splitlines()[0] if introduced else ""
@@ -129,7 +140,8 @@ def make_untagged_kanban_db():
     """Temp kanban.db with active tasks WITHOUT privacy tags.
 
     Includes one done task WITH a privacy tag to prove terminal tasks
-    are not censused.
+    are not censused.  Schema carries last_heartbeat_at so the OBJ-21
+    zombie guard reads the same column set as the real board.
     """
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -139,21 +151,32 @@ def make_untagged_kanban_db():
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT,
             assignee TEXT, created_at INTEGER,
-            started_at INTEGER, completed_at INTEGER
+            started_at INTEGER, last_heartbeat_at INTEGER, completed_at INTEGER
         )
     """)
     tasks = [
-        ("t_a", "Refactor health checks", "**Goal**\nno privacy tag here", "ready"),
-        ("t_b", "Docs update", "Just documentation work", "running"),
-        ("t_c", "Sync repos", "sync repos, no tags", "blocked"),
-        ("t_d", "Backlog idea", "future idea in triage", "triage"),
-        ("t_e", "Done task", "privacy:high\nbut terminal status", "done"),
+        # (id, title, body, status, last_heartbeat_at, started_at)
+        # hb=0 → epoch 1970.  The OBJ-21 zombie guard treats a running row
+        # with heartbeat 0 as age ~56 years... which WOULD fire the guard
+        # and change wakeAgent.  So the "running" task gets a RECENT
+        # heartbeat (time.time() minus 5 min — a live worker) to keep the
+        # recommendation comparison meaningful.  0 is fine for the other
+        # (non-running) statuses: the guard only reads running rows.
+        ("t_a", "Refactor health checks", "**Goal**\nno privacy tag here",
+         "ready", 0, 0),
+        ("t_b", "Docs update", "Just documentation work", "running",
+         int(time.time() - 5 * 60), int(time.time() - 10 * 60)),
+        ("t_c", "Sync repos", "sync repos, no tags", "blocked", 0, 0),
+        ("t_d", "Backlog idea", "future idea in triage", "triage", 0, 0),
+        ("t_e", "Done task", "privacy:high\nbut terminal status", "done",
+         0, 0),
     ]
-    for tid, title, body, status in tasks:
+    for tid, title, body, status, hb, started in tasks:
         conn.execute(
-            "INSERT INTO tasks (id, title, body, status, assignee, created_at) "
-            "VALUES (?, ?, ?, ?, 'pr-nanogpt', 0)",
-            (tid, title, body, status),
+            "INSERT INTO tasks (id, title, body, status, assignee, created_at, "
+            "started_at, last_heartbeat_at) "
+            "VALUES (?, ?, ?, ?, 'pr-nanogpt', 0, ?, ?)",
+            (tid, title, body, status, started, hb),
         )
     conn.commit()
     conn.close()
@@ -217,26 +240,44 @@ def main():
         old_out = capture_output(old_mod, kanban_db, scratch_old)
         new_out = capture_output(new_mod, kanban_db, scratch_new)
 
-    # The ONLY allowed difference: the additive privacy_summary key.
-    ctx = dict(new_out.get("context", {}))
-    summary = ctx.pop("privacy_summary", None)
-    new_stripped = dict(new_out)
-    new_stripped["context"] = ctx
+    # The ONLY allowed differences: the additive keys (OBJ-18 S1 census +
+    # OBJ-21 zombie guard).  Both are additive context keys; stripping
+    # them must leave the OLD recommendation output byte-identical.
+    # Stripped from BOTH sides: with a pre-S1 baseline the old output
+    # carries none of them (nothing removed), but with a post-S1 baseline
+    # (e.g. QUOTA_GATE_BASE_REF=6d73746, the Sep-8 worker-model migration
+    # used to verify the zombie guard in isolation) the old output already
+    # carries privacy_summary — stripping only from new would show a
+    # spurious "key removed" hunk.
+    def _strip_additive(out):
+        ctx = dict(out.get("context", {}))
+        stripped = {}
+        for additive_key in ("privacy_summary", "zombie_check"):
+            val = ctx.pop(additive_key, None)
+            if val is not None:
+                stripped[additive_key] = val
+        out2 = dict(out)
+        out2["context"] = ctx
+        return out2, stripped
 
-    old_s = json.dumps(old_out, sort_keys=True, indent=2)
+    old_stripped, old_extra = _strip_additive(old_out)
+    new_stripped, new_extra = _strip_additive(new_out)
+    stripped = dict(old_extra)
+    stripped.update(new_extra)
+
+    old_s = json.dumps(old_stripped, sort_keys=True, indent=2)
     new_s = json.dumps(new_stripped, sort_keys=True, indent=2)
 
     print("=" * 70)
     print("OLD output (HEAD, keys sorted):")
     print(old_s)
     print("=" * 70)
-    print("NEW output (privacy_summary stripped):")
+    print("NEW output (additive keys stripped):")
     print(new_s)
     print("=" * 70)
 
-    if summary is not None:
-        print("NEW additive field privacy_summary:",
-              json.dumps(summary, sort_keys=True))
+    for key, val in stripped.items():
+        print(f"NEW additive field {key}:", json.dumps(val, sort_keys=True))
 
     os.unlink(kanban_db)
     os.unlink(old_path)
@@ -246,11 +287,23 @@ def main():
         # sanity: 4 active untagged tasks → all-none; the done task with
         # privacy:high must NOT be counted (terminal status).
         expected = {"high": 0, "medium": 0, "low": 0, "none": 4}
+        summary = stripped.get("privacy_summary")
         if summary != expected:
             print(f"WARNING: privacy_summary unexpected: {summary} "
                   f"(expected {expected})")
             return 1
         print(f"privacy_summary sanity: {summary} == expected {expected} OK")
+        # OBJ-21 sanity: the untagged board has NO running tasks →
+        # the zombie guard must report zero zombies (fail-open board).
+        zombie = stripped.get("zombie_check")
+        if zombie is None:
+            print("WARNING: zombie_check additive key missing")
+            return 1
+        if zombie.get("has_zombie") or zombie.get("count") != 0:
+            print(f"WARNING: zombie_check unexpected on quiet board: {zombie}")
+            return 1
+        print(f"zombie_check sanity: no zombies on the quiet board OK "
+              f"(threshold {zombie.get('threshold_minutes')} min)")
         return 0
     print("\nVERDICT: DIFFERENT — recommendation output CHANGED:")
     import difflib
