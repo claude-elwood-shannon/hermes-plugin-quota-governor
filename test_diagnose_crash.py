@@ -52,6 +52,7 @@ from diagnose_crash import (
     build_diagnostic_body,
     MAX_DIAGNOSTICS_PER_TICK,
     CRASH_LOG_MAX_CHARS,
+    DIAGNOSER_VERSION,
     DIAGNOSIS_WINDOW_HOURS,
 )
 
@@ -74,6 +75,7 @@ def _make_kanban_db(tasks=None, runs=None, events=None) -> str:
             status TEXT,
             consecutive_failures INTEGER DEFAULT 0,
             last_failure_error TEXT,
+            created_by TEXT,
             created_at INTEGER,
             started_at INTEGER,
             completed_at INTEGER
@@ -107,8 +109,9 @@ def _make_kanban_db(tasks=None, runs=None, events=None) -> str:
     for t in (tasks or []):
         conn.execute(
             "INSERT INTO tasks (id, title, body, assignee, status, "
-            "consecutive_failures, last_failure_error, created_at, started_at, completed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "consecutive_failures, last_failure_error, created_by, "
+            "created_at, started_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 t.get("id", "t_test"),
                 t.get("title", "test task"),
@@ -117,6 +120,7 @@ def _make_kanban_db(tasks=None, runs=None, events=None) -> str:
                 t.get("status", "blocked"),
                 t.get("consecutive_failures", 3),
                 t.get("last_failure_error", "crash"),
+                t.get("created_by", None),
                 t.get("created_at", now),
                 t.get("started_at", now),
                 t.get("completed_at", None),
@@ -203,6 +207,34 @@ class TestGetCrashBlockedTasks(unittest.TestCase):
         result = get_crash_blocked_tasks(conn)
         conn.close()
         self.assertEqual(result, [])
+
+    def test_skips_self_created_diagnostic(self):
+        """v1.1 recursion hardening: tasks created by diagnose-crash.py itself
+        (created_by='diagnose-crash.py') are NEVER candidates."""
+        db = _make_kanban_db(
+            tasks=[{"id": "t_008", "status": "blocked", "consecutive_failures": 3,
+                    "created_by": "diagnose-crash.py"}],
+            events=[{"task_id": "t_008", "kind": "gave_up"}],
+        )
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = get_crash_blocked_tasks(conn)
+        conn.close()
+        self.assertEqual(result, [])
+
+    def test_other_created_by_still_found(self):
+        """created_by set to another creator → still a valid candidate."""
+        db = _make_kanban_db(
+            tasks=[{"id": "t_009", "status": "blocked", "consecutive_failures": 3,
+                    "created_by": "objective-proposer.py"}],
+            events=[{"task_id": "t_009", "kind": "gave_up"}],
+        )
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = get_crash_blocked_tasks(conn)
+        conn.close()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], "t_009")
 
     def test_multiple_crash_tasks(self):
         db = _make_kanban_db(
@@ -483,7 +515,9 @@ class TestRecordDiagnosis(unittest.TestCase):
                 self.assertEqual(data["consecutive_failures"], 3)
                 self.assertEqual(data["trigger_outcome"], "crashed")
                 self.assertIn("segfault", data["error"])
-                self.assertEqual(data["version"], "1.0")
+                # Follow the deployed script's version instead of hardcoding,
+                # so the test cannot drift again on a version bump.
+                self.assertEqual(data["version"], DIAGNOSER_VERSION)
 
     def test_error_truncated_to_200(self):
         with tempfile.TemporaryDirectory() as tmpdir:
