@@ -80,6 +80,25 @@ console:
   would re-count from the cursor and lose history; deleting only the
   cursor would double-count).
 
+## Weekly objective progress (OBJ-08)
+
+`scripts/weekly-progress.py` regenerates
+`~/.hermes/quota-governor/objective-progress.json` in the multi-objective
+structure of `autonomous-objectives.md` §4 (one entry per `OBJ-NN`: status,
+`last_task_created`, `tasks_completed`) purely from the `objective:OBJ-NN`
+header tags in kanban.db, and renders the ISO-week report §7 calls for into
+`~/.hermes/profiles/pr-ollama/docs/weekly-reports/YYYY-WW-weekly-summary.md`
+(objectives completed vs in progress, tasks completed in the window, quota
+consumed per provider from the model-cost + burn ledgers).
+
+- Dry-run by default; `--execute` writes (atomic tmp+rename, fully
+  regenerated -> idempotent).
+- `awaiting_human_verification` for OBJ-01 (§4: human check required);
+  `needs_attention` when tagged tasks were lost (archived without
+  `completed_at`).
+- Cron (register once):
+  `hermes cron create weekly-progress --name weekly-progress --script weekly-progress-cron.sh --no-agent --deliver local "0 23 * * 0"`
+
 ## Decision heuristic
 
 The governor uses a **three-state model** (`run`, `paying`, `stop`) that
