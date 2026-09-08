@@ -9,8 +9,8 @@ reset de los 3 providers (lunes ~02:00 CEST).
 
 Entrada:  metrics-history.jsonl (filas de quota-metrics.py)
 Salida:   forecast.json
-            {provider: {pct_now, burn_rate_pct_per_min, eta_90_iso,
-                        eta_100_iso, confidence}}
+            {providers: {provider: {pct_now, burn_rate_pct_per_min,
+                                    eta_90_iso, eta_100_iso, confidence}}}
 Stdout:   SOLO en anomalia (patron watchdog). Silencio = forecast OK.
 
 Reglas de decision (consumidas por el gate vía --suggest):
@@ -197,7 +197,7 @@ def main():
             "samples": len(pares),
             "pairs_used": n,
         }
-        forecast[prov] = fprov
+        forecast["providers"][prov] = fprov
         ok += 1
 
     forecast["providers_ok"] = ok

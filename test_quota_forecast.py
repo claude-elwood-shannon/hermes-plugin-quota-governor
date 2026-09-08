@@ -122,7 +122,12 @@ class TestCollect(Base):
         d = self.read_out()
         self.assertTrue(d["enabled"])
         self.assertEqual(d["providers_ok"], 3)
-        og = d["pr-ollama"]
+        # CONTRATO writer↔consumers (OBJ-24): los datos por provider van
+        # anidados en "providers" — el gate (quota-gate.py) y el budget
+        # check (budget_check.py) leen SOLO forecast["providers"].
+        self.assertEqual(set(d["providers"]), {
+            "pr-ollama", "pr-nanogpt", "pr-opencode"})
+        og = d["providers"]["pr-ollama"]
         # 4 pasos de 15 min subiendo 2% => 0.1333 %/min
         self.assertAlmostEqual(og["burn_rate_pct_per_min"], 2 / 15, places=3)
         self.assertEqual(og["pct_now"], 76.0)
@@ -139,7 +144,7 @@ class TestCollect(Base):
         self.write_history([vieja] + rows)
         qf.main()
         d = self.read_out()
-        self.assertEqual(d["pr-ollama"]["samples"], 4)
+        self.assertEqual(d["providers"]["pr-ollama"]["samples"], 4)
 
     def test_history_vacia_enabled_false(self):
         rc = qf.main()
@@ -164,14 +169,14 @@ class TestCollect(Base):
         qf.main()
         d = self.read_out()
         self.assertEqual(d["providers_ok"], 2)
-        self.assertNotIn("pr-nanogpt", d)
+        self.assertNotIn("pr-nanogpt", d["providers"])
 
     def test_pct_100_clampea(self):
         rows = self._rows(base_pct=99.5, steps=2)
         self.write_history(rows)
         qf.main()
         d = self.read_out()
-        self.assertLessEqual(d["pr-ollama"]["pct_now"], 100.0)
+        self.assertLessEqual(d["providers"]["pr-ollama"]["pct_now"], 100.0)
 
     def test_dedupe_mismo_ts(self):
         rows = self._rows(steps=3)
@@ -181,8 +186,8 @@ class TestCollect(Base):
         qf.main()
         d = self.read_out()
         # el duplicado gana (última fila con ese ts)
-        self.assertEqual(d["pr-ollama"]["pct_now"], 99.9)
-        self.assertEqual(d["pr-ollama"]["samples"], 3)
+        self.assertEqual(d["providers"]["pr-ollama"]["pct_now"], 99.9)
+        self.assertEqual(d["providers"]["pr-ollama"]["samples"], 3)
 
 
 class TestResetEpoch(unittest.TestCase):

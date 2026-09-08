@@ -141,9 +141,12 @@ for each provider, exponential moving average of the weekly burn rate
 (unsynchronised last-good refreshes produce absurd rates). Projects the
 90% milestone (governor stop) and 100% (exhaustion) for the WEEKLY window
 (all three providers reset Monday ~02:00 CEST). Output `forecast.json`:
-`{provider: {pct_now, burn_rate_pct_per_min, eta_90_iso, eta_100_iso,
-eta_90_hours, confidence, samples, pairs_used}}` plus
-`next_weekly_reset_iso` / `hours_to_reset`. Tests: `test_quota_forecast.py`.
+`{providers: {provider: {pct_now, burn_rate_pct_per_min, eta_90_iso,
+eta_100_iso, eta_90_hours, confidence, samples, pairs_used}}}` plus
+`next_weekly_reset_iso` / `hours_to_reset`. The per-provider data is
+NESTED under `providers` — that is the shape the gate (`--suggest`) and
+`budget_check.py` consume (OBJ-24 contract; top-level provider keys were
+a writer bug and are gone). Tests: `test_quota_forecast.py`.
 
 Gate integration (`--suggest` mode, wrapper `forecast-gate.sh`): injects
 `context.forecast_warning` with the fired decision rules —
