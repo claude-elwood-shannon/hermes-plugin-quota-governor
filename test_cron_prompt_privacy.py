@@ -21,6 +21,7 @@ Checks:
   6. prompt carries the privacy_routed tracking format
   7. prompt handles the confidential/wakeAgent:false case
   8. privacy-gate.sh deployed in the profile scripts dir and executable
+  9. no enabled shadow clones of the creator in ANY profile's jobs.json
 """
 import json
 import os
@@ -102,6 +103,33 @@ check("section is followed by guardrails (prompt not truncated)",
 # 8. privacy-gate.sh deployed and executable
 check("privacy-gate.sh deployed", os.path.isfile(GATE_SH), GATE_SH)
 check("privacy-gate.sh executable", os.access(GATE_SH, os.X_OK), GATE_SH)
+
+# 9. no shadow clones of the creator in any profile (t_628ed14a, Sep 8 2026):
+# a prompt-rewrite on Sep 7 programmatically cloned the creator into the
+# pr-nanogpt profile (job 0b9a2b17116f-nanogpt) without the PRIVACY-AWARE
+# section; it created fake "evidence" tasks and duplicated board-feeding.
+# The design is ONE multi-profile creator (pr-ollama); a second creator
+# anywhere is a regression.
+import glob
+
+clone_jobs = []
+for jobs_path in glob.glob(os.path.join(HOME, ".hermes/profiles/*/cron/jobs.json")):
+    try:
+        with open(jobs_path) as fh:
+            data = json.load(fh)
+        for j in data.get("jobs", []):
+            name = j.get("name") or ""
+            jid = j.get("id") or ""
+            if j.get("enabled") and (
+                name.startswith("autonomous-task-creator")
+                and name != "autonomous-task-creator"
+                or jid.startswith("0b9a2b17116f-")
+            ):
+                clone_jobs.append(f"{jobs_path}:{jid}")
+    except Exception:
+        pass
+check("no enabled shadow clones of the creator in any profile",
+      not clone_jobs, f"(found: {clone_jobs})")
 
 print(f"\nResults: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
