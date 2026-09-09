@@ -166,6 +166,25 @@ fi
 
 log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY_REQS} cost=\$${COST} -> ${ACTION} max=${DESIRED_MAX} -- ${REASON}"
 
+# ── Observation row (OBJ-26a follow-up, t_92d7f0d6) ──────────────────────────
+# The tick decides but never persisted a snapshot; the in-process hooks do
+# not fire in no_agent cron. tick-observation.py appends a quota_tick row
+# (event=quota_tick) carrying the decision plus the OBJ-26a per-request
+# ledger accumulators (request_balance_usd / request_covered_usd,
+# cross-profile merge inside the script). Best-effort: never breaks the tick;
+# placed BEFORE any early exit so every decision path records.
+PLUGIN_DIR="${PLUGIN_DIR:-REPO}"
+HERMES_HOME="$HERMES_HOME" PLUGIN_DIR="$PLUGIN_DIR" \
+    python3 "$PLUGIN_DIR/scripts/tick-observation.py" \
+    --action "$ACTION" \
+    --max-workers "$DESIRED_MAX" \
+    --session-pct "$SESSION_PCT" \
+    --weekly-pct "$WEEKLY_PCT" \
+    --session-reqs "$SESSION_REQS" \
+    --weekly-reqs "$WEEKLY_REQS" \
+    --cost "$COST" \
+    --reason "$REASON" >/dev/null 2>&1 || true
+
 # Paying-mode warning
 if [[ "$ACTION" == "paying" ]]; then
     log "⚠ PAY-AS-YOU-GO: spending balance at \$${COST} (limit \$${SPENDING_LIMIT})"

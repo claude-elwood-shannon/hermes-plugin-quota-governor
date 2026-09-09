@@ -77,6 +77,7 @@ def main():
             ok += 1
     # OBJ-26: nanogpt balance budget (exact /api/check-balance probe via
     # nanogpt-balance-ledger.py, 60s cache) + level + weekly budget state.
+    ng_mod = None
     try:
         sys.path.insert(0, "REPO/scripts")
         import importlib.util as _ilu
@@ -87,6 +88,7 @@ def main():
             raise ImportError("cannot load nanogpt-balance-ledger spec")
         _mod = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
+        ng_mod = _mod
         ctx, _warn = _mod.budget_context()
         if ctx:
             row["nanogpt_balance_usd"] = ctx.get("usd_balance")
@@ -94,6 +96,22 @@ def main():
             row["nanogpt_window_spent_usd"] = ctx.get("window_spent_usd")
     except Exception:
         pass  # F1 must never fail for the balance column
+    # OBJ-26a follow-up (t_92d7f0d6): per-request ledger accumulators from
+    # nanogpt-requests.jsonl (cross-profile merge — rows land under the
+    # CAPTURING process's HERMES_HOME). Independientes de window_spent_usd
+    # (probe): acumuladores distintos, se reportan por separado.
+    try:
+        if ng_mod is not None:
+            req = ng_mod.request_window_totals_all_homes()
+            # homes_read == 0: no capture data anywhere -> omitir campos
+            # (None) en vez de reportar un 0.0 que pareceria "gasto cero".
+            if req and req.get("homes_read"):
+                row["nanogpt_request_balance_usd"] = req.get(
+                    "request_balance_usd")
+                row["nanogpt_request_covered_usd"] = req.get(
+                    "request_covered_usd")
+    except Exception:
+        pass  # F1 must never fail for the request columns
     og2 = from_last_good("opencode_go")
     if og2:
         row["opencode_rolling_pct"] = og2.get("rolling_pct")

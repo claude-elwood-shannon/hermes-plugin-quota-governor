@@ -133,7 +133,31 @@ layer never spends tokens):
 **F1 — time-series collector** (`quota-metrics.py`, cron every 15m): samples
 board counts + all providers' last-good pct and appends to
 `~/.hermes/profiles/pr-ollama/quota-governor/metrics-history.jsonl`. Zero
-extra API calls (the tick's last-good IS the sample). Tests: `test_quota_metrics.py`.
+extra API calls (the tick's last-good IS the sample). Since the OBJ-26a
+follow-up it also carries `nanogpt_request_balance_usd` /
+`nanogpt_request_covered_usd` (see below). Tests: `test_quota_metrics.py`.
+
+## Per-request billing visibility (OBJ-26a follow-up, t_92d7f0d6)
+
+The in-process capture (hermes-agent `nanogpt_pricing_capture`) appends one
+row per NanoGPT request to `nanogpt-requests.jsonl` under the CAPTURING
+process's HERMES_HOME. Three read paths expose the window accumulators —
+always as SEPARATE fields, never merged with probe-derived spend meters
+(`window_spent_usd`, `activity_cost`, burn-watchdog `spent_usd`):
+
+- `nanogpt-balance-ledger.request_window_totals_all_homes()`: merges the
+  per-request rows across every HERMES root (`~/.hermes` + all profiles;
+  `QUOTA_GOVERNOR_PROFILE_HOMES` os.pathsep override). `homes_read == 0`
+  means "no capture data anywhere" — consumers report None, not 0.0.
+- `quota-governor-tick.sh` → `tick-observation.py`: the tick now PERSISTS a
+  `quota_tick` row in `observations.jsonl` (it decided but never wrote one;
+  in-process hooks don't fire in no_agent cron) with
+  `quota.request_balance_usd` / `quota.request_covered_usd`.
+- Core `record_observation()`: every hook row (`task_claimed`,
+  `session_end`, `periodic_sample`, …) carries the same two fields.
+
+Privacy:low — only USD aggregates at NanoGPT scale (1e-06); no per-request
+rows, prompts, or model names reach observations.jsonl.
 
 **F2 — EMA predictor** (`quota-forecast.py`, cron every 15m after metrics):
 for each provider, exponential moving average of the weekly burn rate

@@ -23,6 +23,44 @@ from .quota_planner import GovernorDecision, decide
 logger = logging.getLogger(__name__)
 
 
+def _request_window_fields() -> Dict[str, Any]:
+    """OBJ-26a follow-up (t_92d7f0d6): per-request ledger accumulators.
+
+    Reads the cross-profile window totals (request rows land under the
+    CAPTURING process's HERMES_HOME, which differs from this observer's) and
+    returns quota.request_balance_usd / quota.request_covered_usd. These are
+    independent accumulators from the probe-derived window_spent_usd and the
+    Ollama activity_cost — reported separately, never merged. Values are
+    None when the ledger module or its data is unavailable (schema-stable
+    None, fail-open, never raises).
+    """
+    fields: Dict[str, Any] = {
+        "request_balance_usd": None,
+        "request_covered_usd": None,
+    }
+    try:
+        import importlib.util
+
+        # quota_governor.py lives at the plugin ROOT: dirname() is the
+        # plugin dir, and the ledger copy is next to it under scripts/.
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "scripts", "nanogpt-balance-ledger.py")
+        spec = importlib.util.spec_from_file_location(
+            "nanogpt_balance_ledger_obs", script)
+        if spec is None or spec.loader is None:
+            return fields
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        totals = mod.request_window_totals_all_homes()
+        if totals and totals.get("homes_read"):
+            fields["request_balance_usd"] = totals.get("request_balance_usd")
+            fields["request_covered_usd"] = totals.get("request_covered_usd")
+    except Exception as exc:  # fail-open: observability never breaks hooks
+        logger.debug("request-window fields unavailable: %s", exc)
+    return fields
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -109,6 +147,11 @@ def record_observation(
         if cost is not None:
             quota_entry["activity_cost"] = round(cost, 5)
             quota_entry["ollama_activity_cost"] = round(cost, 5)
+        # OBJ-26a follow-up: per-request ledger accumulators from
+        # nanogpt-requests.jsonl (cross-profile merge). Independent of
+        # activity_cost (Ollama probe) and of any spent_usd probe meter —
+        # reported separately, values None when the ledger is unavailable.
+        quota_entry.update(_request_window_fields())
         entry["quota"] = quota_entry
 
     try:

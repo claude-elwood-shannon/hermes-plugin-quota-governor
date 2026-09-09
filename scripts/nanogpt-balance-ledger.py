@@ -506,6 +506,88 @@ def request_window_totals(since=None, hermes_home=None):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Cross-profile request-window totals (OBJ-26a follow-up, t_92d7f0d6)
+# ---------------------------------------------------------------------------
+
+# Capture is in-process: each worker's HERMES_NANOGPT_LEDGER_PATH resolves to
+# a deployed copy, and append_request_row() lands rows under THAT process's
+# HERMES_HOME (QUOTA_GOVERNOR_DIR is never set in production cron/worker envs).
+# Observers (the tick's request-window fields) must therefore merge every
+# profile home, not just their own. ~/.hermes itself is included: processes
+# with no HERMES_HOME (bare crons, subprocesses without profile env) write
+# there. Entries are HERMES_HOME-style roots — state_dir() resolves
+# <entry>/quota-governor under the hood, same convention as the rest of the
+# module. New profiles require a deploy of any ledger copy anyway, which
+# updates this list.
+# QUOTA_GOVERNOR_PROFILE_HOMES (os.pathsep-separated HERMES roots) overrides
+# the list — used by tests and hosts with non-standard profile names.
+_DEFAULT_PROFILE_HOMES = (
+    HERMES_HOME_DEFAULT,
+) + tuple(
+    os.path.join(HERMES_HOME_DEFAULT, "profiles", name)
+    for name in ("pr-ollama", "pr-nanogpt", "pr-opencode", "pr-openrouter",
+                 "pr-vllm")
+)
+
+
+def _profile_homes():
+    raw = os.environ.get("QUOTA_GOVERNOR_PROFILE_HOMES", "")
+    homes = tuple(p for p in (s.strip() for s in raw.split(os.pathsep))
+                  if p)
+    return homes or _DEFAULT_PROFILE_HOMES
+
+
+def request_window_totals_all_homes(since=None, hermes_home=None):
+    """Merge request_window_totals() across every profile home.
+
+    Rows are written under the CAPTURING process's HERMES_HOME (pr-nanogpt
+    workers for now), while observers like quota-governor-tick run under
+    pr-ollama — a single-home read would undercount to zero. Duplicates are
+    impossible (capture dedupes by requestId within one process and each
+    home is read exactly once). Merged accumulators are sums in NanoGPT
+    scale (1e-06 USD/request), rounded to 12 decimals like the single-home
+    version. homes_read counts only homes whose requests file exists.
+    Never raises.
+    """
+    homes = [hermes_home] if hermes_home else list(_profile_homes())
+    merged = {
+        "request_covered_usd": 0.0,
+        "request_balance_usd": 0.0,
+        "requests": 0,
+        "balance_requests": 0,
+        "covered_requests": 0,
+        "homes_read": 0,
+    }
+    window_start = None
+    try:
+        for home in homes:
+            # A missing requests file means the home has no capture data —
+            # not an error, but not a "read" either (homes_read stays honest
+            # for observability).
+            if not os.path.isfile(requests_path(hermes_home=home)):
+                continue
+            totals = request_window_totals(since=since, hermes_home=home)
+            if totals is None:
+                continue  # unreadable home — fail-open per home
+            merged["homes_read"] += 1
+            for key in ("request_covered_usd", "request_balance_usd",
+                        "requests", "balance_requests", "covered_requests"):
+                merged[key] += totals.get(key) or 0.0
+            start = totals.get("window_start")
+            if start is not None:
+                window_start = start if window_start is None else min(
+                    window_start, start)
+        for key in ("request_covered_usd", "request_balance_usd"):
+            merged[key] = round(merged[key], 12)
+        for key in ("requests", "balance_requests", "covered_requests"):
+            merged[key] = int(merged[key])
+        merged["window_start"] = window_start
+        return merged
+    except Exception:
+        return None
+
+
 def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
     """One call for quota-gate.py. Never raises; degrades gracefully.
 

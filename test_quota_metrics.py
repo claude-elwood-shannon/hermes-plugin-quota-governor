@@ -7,9 +7,12 @@ falta un provider. TODO con fixtures tmp: nunca toca board ni last-good reales.
 """
 import importlib.util
 import json
+import os
+import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -83,6 +86,54 @@ class TestCollect(Base):
         self.assertEqual(rc, 0)
         row = json.loads(qm.OUT.read_text().splitlines()[-1])
         self.assertEqual(row["providers_ok"], 1)
+
+    def test_request_ledger_fields_en_fila(self):
+        # OBJ-26a follow-up: los acumuladores per-request llegan a la fila
+        # cuando el merge all-homes tiene datos (override de homes fixture).
+        home = tempfile.mkdtemp(prefix="qm-ledger-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        requests = Path(home, "quota-governor", "nanogpt-requests.jsonl")
+        requests.parent.mkdir(parents=True)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(requests, "w") as fh:
+            fh.write(json.dumps({"ts": ts, "costUsd": 4.87e-06,
+                                 "paymentSource": "USD",
+                                 "requestId": "req_x"}) + "\n")
+        self.write_lg("ollama", {"session_pct": 1.0, "weekly_pct": 2.0})
+        self.write_lg("nanogpt", {"weekly_tokens_pct": 3.0})
+        prev = os.environ.get("QUOTA_GOVERNOR_PROFILE_HOMES")
+        os.environ["QUOTA_GOVERNOR_PROFILE_HOMES"] = home
+        try:
+            qm.main()
+        finally:
+            if prev is None:
+                os.environ.pop("QUOTA_GOVERNOR_PROFILE_HOMES", None)
+            else:
+                os.environ["QUOTA_GOVERNOR_PROFILE_HOMES"] = prev
+        row = json.loads(qm.OUT.read_text().splitlines()[-1])
+        self.assertAlmostEqual(row["nanogpt_request_balance_usd"], 4.87e-06,
+                               places=9)
+        self.assertAlmostEqual(row["nanogpt_request_covered_usd"], 0.0,
+                               places=9)
+
+    def test_request_ledger_sin_datos_omite_campos(self):
+        # Sin filas de capture en ningun home: campos ausentes (None), nunca
+        # 0.0 disfrazado de "gasto cero". Override -> home vacio inexistente
+        # ("" volveria a los defaults reales, que SI tienen datos en vivo).
+        self.write_lg("ollama", {"session_pct": 1.0, "weekly_pct": 2.0})
+        prev = os.environ.get("QUOTA_GOVERNOR_PROFILE_HOMES")
+        os.environ["QUOTA_GOVERNOR_PROFILE_HOMES"] = os.path.join(
+            self.tmp, "nothing-here")
+        try:
+            qm.main()
+        finally:
+            if prev is None:
+                os.environ.pop("QUOTA_GOVERNOR_PROFILE_HOMES", None)
+            else:
+                os.environ["QUOTA_GOVERNOR_PROFILE_HOMES"] = prev
+        row = json.loads(qm.OUT.read_text().splitlines()[-1])
+        self.assertNotIn("nanogpt_request_balance_usd", row)
+        self.assertNotIn("nanogpt_request_covered_usd", row)
 
     def test_board_ilegible_mensaja_y_exit0(self):
         qm.KANBAN_DB = Path("/nonexistent/kanban.db")
