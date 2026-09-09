@@ -28,6 +28,8 @@ import sys
 import tempfile
 import time
 import unittest
+import contextlib
+import io
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone
 
@@ -42,6 +44,8 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["diagnose_crash"] = _mod
 _spec.loader.exec_module(_mod)
 
+import diagnose_crash  # bind module object (same instance as _mod)
+
 from diagnose_crash import (
     get_crash_blocked_tasks,
     get_crash_runs,
@@ -54,6 +58,10 @@ from diagnose_crash import (
     CRASH_LOG_MAX_CHARS,
     DIAGNOSER_VERSION,
     DIAGNOSIS_WINDOW_HOURS,
+    SYSTEMIC_ERROR_PATTERNS,
+    SYSTEMIC_SIGNATURE_GROUPS,
+    is_systemic_crash,
+    systemic_error_summary,
 )
 
 
@@ -603,6 +611,146 @@ class TestConstants(unittest.TestCase):
 
     def test_diagnosis_window_hours(self):
         self.assertEqual(DIAGNOSIS_WINDOW_HOURS, 168)  # 7 days
+
+
+# ── Tests: systemic crash detection (v1.2 signature groups) ─────────────────
+
+class TestSystemicCrashDetectionV12(unittest.TestCase):
+    """v1.2: systemic detection matches ANY signature group.
+
+    Regression t_128382ac (2026-09-09): a worker whose startup died with
+    AuthError ``Unknown provider 'nanogpt'`` (rc=0, no HTTP status in the
+    log) was NOT classified as systemic by v1.1 (which required both
+    "Non-retryable" and "HTTP 4"), so an LLM diagnostic task (t_091bf828)
+    burned on a pure config crash. Same provider error already seen
+    2026-09-06 (t_176228c5/t_7da69d59).
+    """
+
+    # Exact shape of the t_128382ac worker log (3 spawn attempts, \r line
+    # endings, generic breaker tail). No "Non-retryable"/"HTTP 4" anywhere.
+    UNKNOWN_PROVIDER_LOG = (
+        "Unknown provider 'nanogpt'. Check 'hermes model' for available "
+        "providers, or run\r\n"
+    ) * 3 + "worker exited cleanly (rc=0) without calling kanban_complete\n"
+
+    def _task(self, **kw):
+        return {"id": kw.get("id", "t_sys"), "title": "test task"}
+
+    def test_unknown_provider_is_systemic(self):
+        self.assertTrue(is_systemic_crash(self.UNKNOWN_PROVIDER_LOG, self._task()))
+
+    def test_unknown_provider_log_matches_full_text_not_tail(self):
+        # The signature sits at the START of the log; the 2000-char tail
+        # would only carry the generic rc=0 line. Full-text matching (v1.1
+        # invariant) must be preserved for the new group too.
+        big = (self.UNKNOWN_PROVIDER_LOG + "x" * (CRASH_LOG_MAX_CHARS * 3))
+        self.assertTrue(is_systemic_crash(big, self._task()))
+
+    def test_legacy_nonretryable_pair_still_systemic(self):
+        log = "Non-retryable error (HTTP 400): upstream rejected the request\n"
+        self.assertTrue(is_systemic_crash(log, self._task()))
+
+    def test_no_module_named_is_systemic(self):
+        log = "ModuleNotFoundError: No module named 'yaml'\n"
+        self.assertTrue(is_systemic_crash(log, self._task()))
+
+    def test_task_specific_log_not_systemic(self):
+        # Crash but task-specific: rc=0 protocol violation, no terminal
+        # call, no systemic signature → must NOT be suppressed.
+        log = (
+            "worker exited cleanly (rc=0) without calling kanban_complete "
+            "or kanban_block — protocol violation\n"
+            "worker pid 12345 not alive; consecutive failure recorded\n"
+        )
+        self.assertFalse(is_systemic_crash(log, self._task()))
+
+    def test_half_of_legacy_pair_not_systemic(self):
+        # Group semantics: BOTH tokens of a group are required. A log that
+        # merely mentions "Non-retryable" (retry chatter) stays task-specific.
+        log = "retry planner chatter: previous attempt was Non-retryable\n"
+        self.assertFalse(is_systemic_crash(log, self._task()))
+
+    def test_empty_or_missing_log_not_systemic(self):
+        self.assertFalse(is_systemic_crash(None, self._task()))
+        self.assertFalse(is_systemic_crash("", self._task()))
+
+    def test_flat_patterns_contain_new_tokens(self):
+        self.assertIn("Unknown provider '", SYSTEMIC_ERROR_PATTERNS)
+        self.assertIn("No module named", SYSTEMIC_ERROR_PATTERNS)
+        self.assertIn(("Unknown provider '",), SYSTEMIC_SIGNATURE_GROUPS)
+
+    def test_summary_quotes_unknown_provider_line(self):
+        line = systemic_error_summary(self.UNKNOWN_PROVIDER_LOG)
+        self.assertIn("Unknown provider 'nanogpt'", line)
+        self.assertLessEqual(len(line), 200)
+
+    def _crash_db(self, task_id):
+        return _make_kanban_db(
+            tasks=[{"id": task_id, "consecutive_failures": 2,
+                    "last_failure_error": "crash", "status": "blocked"}],
+            runs=[{"task_id": task_id}],
+            events=[{"task_id": task_id, "kind": "gave_up"}],
+        )
+
+    def _worker_log_for(self, task_id, text):
+        tmpdir = tempfile.mkdtemp()
+        with open(os.path.join(tmpdir, f"{task_id}.log"), "w") as f:
+            f.write(text)
+        return tmpdir
+
+    def test_main_execute_systemic_creates_no_diagnostic_task(self):
+        """t_128382ac acceptance: systemic crash → NO diagnostic task."""
+        task_id = "t_sys_nanogpt"
+        db_path = self._crash_db(task_id)
+        logdir = self._worker_log_for(task_id, self.UNKNOWN_PROVIDER_LOG)
+        diag_fd, diag_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(diag_fd)
+        os.unlink(diag_file)
+        captured = io.StringIO()
+        with patch.dict(os.environ, {"HERMES_KANBAN_DB": db_path,
+                                     "DIAGNOSE_CRASH_EXECUTE": "1"}):
+            with patch("diagnose_crash.WORKER_LOGS_DIR", logdir):
+                with patch("diagnose_crash.DIAGNOSES_FILE", diag_file):
+                    with patch("diagnose_crash.create_diagnostic_task") as m:
+                        with contextlib.redirect_stdout(captured):
+                            diagnose_crash.main()
+        self.assertEqual(m.call_count, 0)  # NO diagnostic task created
+        self.assertFalse(os.path.exists(diag_file))  # nothing recorded
+        out = captured.getvalue()
+        self.assertIn("SYSTEMIC-ALERT", out)
+        self.assertIn(task_id, out)
+        self.assertIn("Unknown provider 'nanogpt'", out)
+
+    def test_main_execute_task_specific_still_diagnoses(self):
+        """Negative case intact: task-specific crash still gets diagnosed."""
+        task_id = "t_task_specific"
+        db_path = self._crash_db(task_id)
+        logdir = self._worker_log_for(
+            task_id,
+            "worker exited cleanly (rc=0) without calling kanban_complete\n"
+            "worker pid 999 not alive\n",
+        )
+        diag_fd, diag_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(diag_fd)
+        os.unlink(diag_file)
+        captured = io.StringIO()
+        with patch.dict(os.environ, {"HERMES_KANBAN_DB": db_path,
+                                     "DIAGNOSE_CRASH_EXECUTE": "1"}):
+            with patch("diagnose_crash.WORKER_LOGS_DIR", logdir):
+                with patch("diagnose_crash.DIAGNOSES_FILE", diag_file):
+                    with patch(
+                        "diagnose_crash.create_diagnostic_task",
+                        return_value="t_diag_new",
+                    ) as m:
+                        with contextlib.redirect_stdout(captured):
+                            diagnose_crash.main()
+        self.assertEqual(m.call_count, 1)
+        out = captured.getvalue()
+        self.assertIn(f"DIAGNOSED: task {task_id}", out)
+        with open(diag_file) as f:
+            entry = json.loads(f.readline())
+        self.assertEqual(entry["task_id"], task_id)
+        self.assertEqual(entry["version"], DIAGNOSER_VERSION)
 
 
 if __name__ == "__main__":
