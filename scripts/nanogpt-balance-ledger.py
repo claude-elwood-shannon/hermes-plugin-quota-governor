@@ -41,6 +41,8 @@ Gate integration (see quota-gate.py ``nanogpt_budget_context``):
         "usd_balance": 15.49, "weekly_tokens_pct": 79.8,
         "window_spent_usd": 0.12, "window_max_spend_usd": 5.0,
         "window_fraction": 0.024,
+        "request_covered_usd": 0.0,   # OBJ-26a: per-request capture sums
+        "request_balance_usd": 0.03,  # (separate from probe-derived spend)
         "level": "ok" | "warn" | "stop",
         "covered_models": ["z-ai/glm-5.3-flash", ...],
         "coverage_unknown": false,
@@ -59,6 +61,7 @@ fallback values on any error.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
@@ -410,6 +413,99 @@ def _parse_dt(s):
 # Gate entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-request billing fold (OBJ-26a): rows written by the agent's in-process
+# capture (agent/nanogpt_pricing_capture.py) — one line per API request.
+# ---------------------------------------------------------------------------
+
+def requests_path(hermes_home=None):
+    return os.path.join(state_dir(hermes_home), "nanogpt-requests.jsonl")
+
+
+def append_request_row(row, hermes_home=None):
+    """Append one per-request billing row (costUsd>0 drains balance; =0 covered)."""
+    try:
+        os.makedirs(os.path.dirname(requests_path(hermes_home)), exist_ok=True)
+        with open(requests_path(hermes_home), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _load_requests(hermes_home=None):
+    rows = []
+    try:
+        with open(requests_path(hermes_home), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return rows
+
+
+def _budget_window_start(hermes_home=None):
+    """Current budget window anchor (subscription period, else ISO week)."""
+    cached = read_cache(hermes_home) or {}
+    return window_start_from_period(cached.get("period_end"))
+
+
+def request_window_totals(since=None, hermes_home=None):
+    """Window accumulators from per-request rows: covered_usd, balance_usd,
+    plus request counts. Rows outside the window (ts < since or before the
+    budget window anchor) are excluded. Never raises.
+
+    NOTE: costs are NanoGPT-scale (1e-06 USD/request) — accumulators are
+    rounded to 12 decimals, never 6 (6 dp would collapse real micro-spend).
+    """
+    try:
+        start = since or _budget_window_start(hermes_home)
+        covered = 0.0
+        balance = 0.0
+        n = 0
+        n_covered = 0
+        for row in _load_requests(hermes_home):
+            ts = row.get("ts")
+            try:
+                when = dt.datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ")\
+                    .replace(tzinfo=dt.timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if start and when < start:
+                continue
+            raw_cost = row.get("costUsd")
+            try:
+                cost = float(raw_cost)
+            except (TypeError, ValueError):
+                # Unparseable cost: can't tell covered from balance — skip the
+                # row entirely instead of miscounting it as covered.
+                continue
+            if cost <= 0:
+                # covered-first signal: costUsd=0 + paymentSource=USD means the
+                # subscription paid; only count it when the source is USD.
+                if str(row.get("paymentSource") or "").upper() == "USD":
+                    n_covered += 1
+                continue
+            source = str(row.get("paymentSource") or "").upper()
+            if source == "USD":
+                balance += cost
+                n += 1
+            # Non-USD payment sources are neither covered nor balance spend.
+        return {"window_start": start.isoformat() if start else None,
+                "request_covered_usd": round(covered, 12),
+                "request_balance_usd": round(balance, 12),
+                "requests": n + n_covered,
+                "balance_requests": n,
+                "covered_requests": n_covered}
+    except Exception:
+        return None
+
+
 def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
     """One call for quota-gate.py. Never raises; degrades gracefully.
 
@@ -448,6 +544,9 @@ def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
             level = "ok"
 
         covered, cov_err = fetch_covered_models()
+        req_totals = None
+        with contextlib.suppress(Exception):
+            req_totals = request_window_totals(hermes_home=hermes_home)
         ctx = {
             "usd_balance": snap.get("usd_balance"),
             "weekly_tokens_pct": snap.get("weekly_tokens_pct"),
@@ -457,6 +556,8 @@ def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
             "window_spent_usd": round(spent, 4),
             "window_max_spend_usd": max_spend,
             "window_fraction": round(frac, 4),
+            "request_covered_usd": (req_totals or {}).get("request_covered_usd"),
+            "request_balance_usd": (req_totals or {}).get("request_balance_usd"),
             "level": level,
             "covered_models": sorted(covered) if covered is not None else [],
             "coverage_unknown": covered is None,
@@ -511,6 +612,16 @@ def main(argv=None):
         print(f"{len(rows)} ledger rows; last 20:")
         for line in rows[-20:]:
             print(" ", line.rstrip())
+        totals = request_window_totals(hermes_home=args.hermes_home
+                                       if hasattr(args, "hermes_home") else None)
+        if totals:
+            print("request-window totals:",
+                  json.dumps(totals, ensure_ascii=False))
+        req_rows = _load_requests(hermes_home=args.hermes_home
+                                  if hasattr(args, "hermes_home") else None)
+        print(f"{len(req_rows)} per-request rows; last 10:")
+        for row in req_rows[-10:]:
+            print(" ", json.dumps(row, ensure_ascii=False))
         return 0
 
     snap = fetch_snapshot(force=True)
