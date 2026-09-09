@@ -302,12 +302,104 @@ if alert_no_file:
 else:
     fail("No alert for missing observations file (expected one)")
 
+# Test: idle profile suppression (no active tasks)
+print("\n  --- Idle profile: no active tasks should suppress silent_plugin ---")
+# Setup stale observations but give the profile zero active tasks
+old_ts = (now - timedelta(hours=2)).isoformat()
+setup_observation_file([
+    {
+        "timestamp": old_ts,
+        "event": "periodic_sample",
+        "quota": {"ollama_session_pct": 10.0, "ollama_weekly_pct": 5.0},
+    },
+])
+# Profile name = "pr-idle-dummy", no tasks in DB for it
+if alert_log.exists():
+    alert_log.unlink()
+alert_idle = check_silent_plugin(profile_name="pr-idle-dummy")
+if alert_idle is None:
+    ok("Silent_plugin suppressed for idle profile (no active tasks)")
+else:
+    fail(f"Alert fired for idle profile: {alert_idle}")
+
+# Test: active task should NOT suppress
+print("\n  --- Active profile: running task should NOT suppress silent_plugin ---")
+# Give pr-active-dummy a running task in the kanban DB
+setup_kanban_db([
+    ("t_active_01", "Active task", "pr-active-dummy", "running", int(now.timestamp()), int(now.timestamp())),
+])
+if alert_log.exists():
+    alert_log.unlink()
+alert_active = check_silent_plugin(profile_name="pr-active-dummy")
+if alert_active is not None:
+    ok("Silent_plugin fires for profile with running tasks + stale obs")
+else:
+    fail("Silent_plugin suppressed but profile has running tasks")
+
+# Clean up the active task kanban DB so run_all_health_checks doesn't see it
+if alert_log.exists():
+    alert_log.unlink()
+
 # ---------------------------------------------------------------------------
-# Test 4: run_all_health_checks integration
+# Test: Dedup/backoff — same alert type consecutively should suppress
+# ---------------------------------------------------------------------------
+print("\n--- Test: Dedup/backoff for repeated alerts ---")
+
+# Clear log
+if alert_log.exists():
+    alert_log.unlink()
+
+# Write first alert
+first = write_alert("test_dedup", "First occurrence", extra={"code": "A"})
+if first is not None:
+    ok("First alert written")
+else:
+    fail("First alert was deduplicated (should not be)")
+
+# Write same alert again (same type + same extra)
+second = write_alert("test_dedup", "Second occurrence (same state)", extra={"code": "A"})
+if second is None:
+    ok("Second alert suppressed (dedup: same type + same extra)")
+else:
+    fail("Second alert was written (should be deduplicated)")
+
+# Write different alert type — should NOT be suppressed
+third = write_alert("test_dedup_other", "Different type", extra={"code": "B"})
+if third is not None:
+    ok("Different type alert written (not deduplicated)")
+else:
+    fail("Different type alert was suppressed (should not be)")
+
+# Write same type but different extra — should NOT be suppressed
+fourth = write_alert("test_dedup", "Changed state", extra={"code": "B"})
+if fourth is not None:
+    ok("Same type with changed extra written (not deduplicated)")
+else:
+    fail("Same type with changed extra suppressed (should not be)")
+
+# Verify only 3 entries in the log
+log_entries = read_alert_log()
+if len(log_entries) == 3:
+    ok(f"Log has exactly {len(log_entries)} entries (3 written, 1 deduplicated)")
+else:
+    fail(f"Log has {len(log_entries)} entries (expected 3)")
+
+# Clear log for next test
+if alert_log.exists():
+    alert_log.unlink()
+
 # ---------------------------------------------------------------------------
 print("\n--- Test 4: run_all_health_checks integration ---")
 
 # Setup: fresh observations with fast-burn + zombie + silent
+# NOTE: re-setup the zombie kanban DB because the previous test overwrote it
+zombie_time = int((now - timedelta(hours=3)).timestamp())  # 3h ago
+healthy_time = int(now.timestamp())  # just now
+
+setup_kanban_db([
+    ("t_zombie_01", "Zombie task", "pr-nanogpt", "running", zombie_time, zombie_time),
+    ("t_healthy_01", "Healthy task", "pr-ollama", "running", healthy_time, healthy_time),
+])
 setup_observation_file([
     {
         "timestamp": (now - timedelta(minutes=3)).isoformat(),

@@ -139,10 +139,15 @@ def get_kanban_db_path() -> Path:
 # Alert writer
 # ---------------------------------------------------------------------------
 
-def write_alert(alert_type: str, message: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Append a JSON alert to the alert log file.
+def write_alert(alert_type: str, message: str, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Append a JSON alert to the alert log file, with dedup/backoff.
 
-    Returns the alert dict so callers can collect it for stdout.
+    Dedup: if the last alert in the log has the same ``type`` AND the same
+    non-timestamp fields (extra dict), this alert is suppressed — no write
+    occurs — and None is returned.  This prevents repeated entries of the
+    same alert type when the underlying state has not changed.
+
+    Returns the alert dict if written, or None if deduplicated.
     """
     alert: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -151,6 +156,21 @@ def write_alert(alert_type: str, message: str, extra: Optional[Dict[str, Any]] =
     }
     if extra:
         alert.update(extra)
+
+    # Dedup: compare (type, non-timestamp fields) against the last entry
+    last = _last_alert_key()
+    if last is not None and last.get("type") == alert_type:
+        # Compare all fields except 'timestamp' and 'hours_silent' (which
+        # always changes as the silence grows)
+        _skip_keys = {"timestamp", "hours_silent", "message"}
+        last_fields = {k: v for k, v in last.items() if k not in _skip_keys}
+        new_fields = {k: v for k, v in alert.items()   if k not in _skip_keys}
+        if last_fields == new_fields:
+            logger.debug(
+                "dedup: suppressing %s alert (unchanged state)",
+                alert_type,
+            )
+            return None
 
     log_path = get_alert_log_path()
     try:
@@ -369,7 +389,8 @@ def check_zombie_workers() -> List[Dict[str, Any]]:
                     "title": row["title"],
                 },
             )
-            alerts.append(alert)
+            if alert:
+                alerts.append(alert)
 
     return alerts
 
@@ -378,12 +399,13 @@ def check_zombie_workers() -> List[Dict[str, Any]]:
 # 3. Silent plugin detection
 # ---------------------------------------------------------------------------
 
-def _profile_has_running_tasks(profile_name: str) -> bool:
-    """Check if a profile has any running tasks in the kanban DB.
 
-    Used to distinguish an idle profile (no work → no observations is
-    expected) from a genuinely silent plugin (has work but producing no
-    observations).
+def _profile_has_any_active_tasks(profile_name: str) -> bool:
+    """Check if a profile has any non-terminal task (ready, running, blocked, todo).
+
+    Used to suppress silent_plugin when the board has zero work for this
+    profile — if there are no ready/running/todo tasks, silence is expected
+    regardless of whether the plugin hooks are firing.
     """
     db_path = get_kanban_db_path()
     if not db_path.exists():
@@ -392,16 +414,42 @@ def _profile_has_running_tasks(profile_name: str) -> bool:
     try:
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE assignee = ? AND status = 'running'",
+            "SELECT COUNT(*) FROM tasks WHERE assignee = ? AND status IN ('ready', 'running', 'blocked', 'todo')",
             (profile_name,),
         ).fetchone()
         return row[0] > 0
     except Exception as exc:
-        logger.debug("running-tasks check failed: %s", exc)
+        logger.debug("active-tasks check failed: %s", exc)
         return False
     finally:
         if conn is not None:
             conn.close()
+
+
+def _last_alert_key() -> Optional[Dict[str, Any]]:
+    """Return the ``(type, dedup_key)`` of the last alert in the log, or None.
+
+    The dedup_key is a frozenset of the non-timestamp, non-message fields
+    that define whether an alert has "changed state" — same type + same
+    extra fields → deduplicate.
+    """
+    log_path = get_alert_log_path()
+    if not log_path.exists():
+        return None
+    try:
+        text = log_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    last_line = text.split("\n")[-1].strip()
+    if not last_line:
+        return None
+    try:
+        entry = json.loads(last_line)
+    except json.JSONDecodeError:
+        return None
+    return entry
 
 
 def _find_profile_observations() -> List[tuple]:
@@ -448,14 +496,15 @@ def check_silent_plugin(
     obs_path = observations_path if observations_path is not None else get_observations_file()
 
     # Idle-profile suppression: if we know the profile name and it has no
-    # running tasks, silence is expected — don't alert.  This prevents the
-    # false positive where an on-demand profile (e.g. pr-nanogpt) that
-    # only runs when tasks are assigned is flagged as "silent" during idle
-    # periods.
+    # active tasks (none in ready/running/blocked/todo), silence is expected
+    # — don't alert.  This covers both:
+    #   - On-demand profiles (e.g. pr-nanogpt) that only run when assigned
+    #   - The tick profile when the quota gate has max_workers=0 and the
+    #     board has no work queued (legitimate idle, not a plugin failure)
     if profile_name is not None:
-        if not _profile_has_running_tasks(profile_name):
+        if not _profile_has_any_active_tasks(profile_name):
             logger.debug(
-                "silent_plugin: profile %s is idle (no running tasks) — suppressing alert",
+                "silent_plugin: profile %s has zero active tasks — suppressing alert",
                 profile_name,
             )
             return None
@@ -559,8 +608,20 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
     default_obs = get_observations_file()
     checked_paths: set = set()
 
-    # 3a. Tick profile — no idle suppression (must always be alive)
-    sp = check_silent_plugin(observations_path=default_obs)
+    # 3a. Tick profile — must always be alive, UNLESS the board is
+    # legitimately idle (no active tasks for this profile).  When the
+    # quota gate outputs max_workers=0 and there are zero ready/running/
+    # blocked/todo tasks, silence is expected and not an alert condition.
+    # Resolve the profile name from HERMES_HOME so we can check it.
+    tick_profile: Optional[str] = None
+    hermes_home = _get_hermes_home()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    try:
+        rel = hermes_home.relative_to(profiles_root)
+        tick_profile = rel.parts[0]
+    except (ValueError, IndexError):
+        pass
+    sp = check_silent_plugin(observations_path=default_obs, profile_name=tick_profile)
     if sp:
         alerts.append(sp)
     checked_paths.add(str(default_obs.resolve()))
