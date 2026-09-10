@@ -409,7 +409,7 @@ class TestEdgeCases(Base):
 class TestPortability(unittest.TestCase):
     def test_no_absolute_host_paths_in_module(self):
         src = Path(TRACE_SCRIPT).read_text(encoding="utf-8")
-        for needle in ("/home/", "/data", "host"):
+        for needle in ("/home/", "/data", Path.home().name):
             self.assertNotIn(needle, src,
                              f"host path leaked into trace.py: {needle}")
 

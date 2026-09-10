@@ -388,7 +388,7 @@ class PrivacyTest(Base):
         src = Path(SCRIPT).read_text()
         self.assertNotIn("/home/", src)
         self.assertNotIn("/data/", src)
-        self.assertNotIn("host", src)
+        self.assertNotIn(Path.home().name, src)
 
 
 if __name__ == "__main__":

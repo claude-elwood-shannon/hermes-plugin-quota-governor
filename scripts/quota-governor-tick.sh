@@ -330,7 +330,7 @@ if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
     HERMES_BIN="${HERMES_BIN:-$(command -v hermes)}"
     if [[ -z "$HERMES_BIN" ]]; then
         # Try common locations
-        for p in "$HOME/.local/bin/hermes" "~/.local/bin/hermes"; do
+        for p in "$HOME/.local/bin/hermes"; do
             if [[ -x "$p" ]]; then HERMES_BIN="$p"; break; fi
         done
     fi
