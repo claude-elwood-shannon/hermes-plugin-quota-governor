@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run test suite
+        # Tests that exercise DEPLOYED copies (~/.hermes/scripts/*) skip
+        # themselves on CI: a fresh checkout has no deployed copies to test.
+        run: |
+          set -o pipefail
+          failed=0
+          passed=0
+          for t in $(find . -name 'test_*.py' -not -path './.git/*' | sort); do
+            if out=$(timeout 280 python3 "$t" 2>&1); then
+              passed=$((passed + 1))
+              n=$(printf '%s\n' "$out" | grep -oE 'Ran [0-9]+ tests?' | grep -oE '[0-9]+' || echo 0)
+              echo "OK    $t ($n tests)"
+            else
+              failed=$((failed + 1))
+              echo "FAIL  $t"
+              printf '%s\n' "$out" | tail -30
+            fi
+          done
+          echo "-----"
+          echo "files: passed=$passed failed=$failed"
+          [ "$failed" -eq 0 ]

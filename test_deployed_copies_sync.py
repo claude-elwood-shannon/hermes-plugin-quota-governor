@@ -12,10 +12,13 @@ This test:
   1. hashes the repo copy;
   2. for each candidate deployed path that EXISTS, asserts the md5 matches
      the repo copy and bash -n passes;
-  3. if NO deployed copy exists yet (fresh clone / new host), asserts that
-     is reported loudly instead of passing silently.
+  3. if NO deployed copy exists (fresh clone / CI), SKIPS — a machine that
+     never deployed the tick has nothing to drift. Set
+     QUOTA_GOVERNOR_EXPECT_DEPLOYED=1 (host verify runs) to make a missing
+     copy a loud failure instead.
 """
 import hashlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -80,11 +83,15 @@ def main():
             bad(f"bash -n {cand}: {r.stderr.strip()}")
 
     if not found:
-        bad(
+        msg = (
             "no deployed copy found (checked: "
             + ", ".join(str(c) for c in CANDIDATE_DEPLOYED)
             + ") — cron has nothing to run; deploy the repo copy"
         )
+        if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1":
+            bad(msg)
+        else:
+            print(f"  SKIP: {msg}")
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

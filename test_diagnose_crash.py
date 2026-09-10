@@ -33,8 +33,16 @@ import io
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone
 
-# The script lives at ~/.hermes/scripts/diagnose-crash.py
+# The script lives at ~/.hermes/scripts/diagnose-crash.py (a DEPLOYED copy,
+# not part of the repo). On a fresh clone / CI it does not exist — skip the
+# module instead of failing; the host verify runs always have it.
 SCRIPT_PATH = os.path.expanduser("~/.hermes/scripts/diagnose-crash.py")
+
+if not os.path.exists(SCRIPT_PATH):
+    raise SystemExit(
+        "SKIP: deployed diagnose-crash.py not found (fresh clone / CI) — "
+        "nothing to test on this machine"
+    )
 
 # Import with filename-based module
 import importlib.util
