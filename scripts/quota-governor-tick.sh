@@ -211,6 +211,7 @@ CONCURRENCY_OUTPUT=$(HERMES_HOME="$HERMES_HOME" \
     HERMES_KANBAN_DB="${HERMES_KANBAN_DB:-}" \
     PLUGIN_DIR="$PLUGIN_DIR" \
     QUOTA_GOVERNOR_HARD_LIMIT="${QUOTA_GOVERNOR_HARD_LIMIT:-}" \
+    CONCURRENCY_DESIRED_MAX="$DESIRED_MAX" \
     python3 -c "
 import json, os, sys
 sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'REPO'))
@@ -234,7 +235,7 @@ try:
 except Exception as e:
     # Concurrency guard should never break the tick
     print(json.dumps({'error': str(e), 'live_count': 0, 'should_spawn': True}))
-" CONCURRENCY_DESIRED_MAX="$DESIRED_MAX" 2>/dev/null) || true
+" 2>/dev/null) || true
 
 # Parse the JSON output
 LIVE_COUNT=$(echo "$CONCURRENCY_OUTPUT" | python3 -c "
