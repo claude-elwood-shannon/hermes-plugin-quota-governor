@@ -1,11 +1,40 @@
 # hermes-plugin-quota-governor
 
+[![tests](https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor/actions/workflows/tests.yml/badge.svg)](https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org)
+
 > Hermes Agent plugin: self-governance by quota
 
 A Hermes Agent plugin that observes the kanban lifecycle, queries provider
 quota in real time, and coordinates the kanban daemon accordingly — so the
 agent can self-organise work based on available quota without human
 intervention.
+
+## Why this exists
+
+This plugin came out of a real failure: a single model silently consumed
+82% of a $12 rolling spend window while the agent kept dispatching work —
+nothing was watching the money. Providers expose quota *numbers*; nothing
+tied those numbers to the *decision* of whether an autonomous agent should
+keep spawning workers.
+
+The governor closes that loop: observe (kanban lifecycle + provider quota)
+→ decide (a deterministic heuristic, no LLM in the loop) → act
+(start/stop/scale the worker daemon). It has governed a multi-agent
+workspace continuously since then, and grew the pieces nobody publishes
+and we needed most:
+
+- a **per-model cost ledger** calibrated against real provider billing —
+  Hermes does not persist the API cost field, so the ledger estimates from
+  token counts × published prices as a conservative upper bound;
+- a **quota time-series** sampled with zero extra API calls, driving
+  threshold forecasts;
+- **per-task cost prediction** (median/p90 by objective) trained on its own
+  observation data.
+
+`docs/` carries the calibration notes, the per-model matrix and the design
+records — the measurements are the point, not an afterthought.
 
 ## What it does
 
@@ -243,11 +272,25 @@ Weekly override (most restrictive wins):
 - Weekly > 75% → tiny tasks only
 - Weekly > 90% → stop entirely
 
-## Install
+## Quickstart
 
 ```bash
+# run the suite (1,000+ tests, no network needed; each file runs directly —
+# some module basenames repeat across dirs, so `unittest discover` is not usable)
+git clone https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor
+cd hermes-plugin-quota-governor
+failed=0
+for t in $(find . -name 'test_*.py' -not -path './.git/*'); do
+  python3 "$t" >/dev/null 2>&1 || { echo "FAIL: $t"; failed=1; }
+done
+[ "$failed" -eq 0 ] && echo "suite green"
+
+# install as a Hermes plugin
 hermes plugins install claude-elwood-shannon/hermes-plugin-quota-governor --enable
 ```
+
+Two tests exercise *deployed* scripts that live outside the repo
+(`~/.hermes/scripts/*`); they skip automatically on a fresh clone.
 
 ## Slash command
 
