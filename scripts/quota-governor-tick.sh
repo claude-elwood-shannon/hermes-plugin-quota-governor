@@ -172,13 +172,19 @@ fi
 log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY_REQS} cost=\$${COST} -> ${ACTION} max=${DESIRED_MAX} -- ${REASON}"
 
 # ── Observation row (OBJ-26a follow-up, t_92d7f0d6) ──────────────────────────
+# ── Portable default: resolve the plugin repo from THIS script's location ──
+# (works on any clone path; overrides via env still win)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="${PLUGIN_DIR:-$(dirname "$SCRIPT_DIR")}"
+export PLUGIN_DIR
+
 # The tick decides but never persisted a snapshot; the in-process hooks do
 # not fire in no_agent cron. tick-observation.py appends a quota_tick row
 # (event=quota_tick) carrying the decision plus the OBJ-26a per-request
 # ledger accumulators (request_balance_usd / request_covered_usd,
 # cross-profile merge inside the script). Best-effort: never breaks the tick;
 # placed BEFORE any early exit so every decision path records.
-PLUGIN_DIR="${PLUGIN_DIR:-REPO}"
+# (PLUGIN_DIR already exported above)
 HERMES_HOME="$HERMES_HOME" PLUGIN_DIR="$PLUGIN_DIR" \
     python3 "$PLUGIN_DIR/scripts/tick-observation.py" \
     --action "$ACTION" \
@@ -211,7 +217,6 @@ fi
 #      daemon already prevents new spawns — workers drain naturally)
 #   3. Hard cap: if live > hard_limit (default desired_max+2), SIGTERM
 #      the oldest workers to prevent unbounded accumulation
-PLUGIN_DIR="${PLUGIN_DIR:-REPO}"
 CONCURRENCY_OUTPUT=$(HERMES_HOME="$HERMES_HOME" \
     HERMES_KANBAN_DB="${HERMES_KANBAN_DB:-}" \
     PLUGIN_DIR="$PLUGIN_DIR" \
@@ -219,7 +224,7 @@ CONCURRENCY_OUTPUT=$(HERMES_HOME="$HERMES_HOME" \
     CONCURRENCY_DESIRED_MAX="$DESIRED_MAX" \
     python3 -c "
 import json, os, sys
-sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'REPO'))
+sys.path.insert(0, os.environ.get('PLUGIN_DIR', '.'))
 try:
     from concurrency_guard import check_concurrency, kill_worker, format_decision_for_log, format_kill_notice
     desired_max = int(os.environ.get('CONCURRENCY_DESIRED_MAX', '1'))
@@ -355,7 +360,7 @@ fi
 # PLUGIN_DIR already set by the concurrency guard section above.
 HEALTH_OUTPUT=$(HERMES_HOME="$HERMES_HOME" python3 -c "
 import json, os, sys
-sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'REPO'))
+sys.path.insert(0, os.environ.get('PLUGIN_DIR', '.'))
 try:
     from health_checks import run_all_health_checks, format_alerts_for_stdout
     alerts = run_all_health_checks()
