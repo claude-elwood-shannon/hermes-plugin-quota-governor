@@ -257,7 +257,7 @@ exceed 5 workers simultaneously.
 ### Test
 
 ```bash
-cd REPO
+cd <plugin-repo-checkout>
 python3 test_concurrency_guard.py
 ```
 

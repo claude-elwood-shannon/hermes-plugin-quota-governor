@@ -1,74 +1,70 @@
 # Obs Dashboard — OBJ-32 v0
 
-Una página HTML consultable en el navegador: la casa entera en una
-pantalla. Es la recomendación técnica de OBJ-32 tras evaluar Grafana:
-NO el stack (server + datasource + provisioning para un host de un solo
-inquilino es una granja que contradice la portabilidad), SÍ su espíritu
-— un panel consultable. v0 = generador estático, familia de
-morning-screen.
+A consultable HTML page in the browser: the whole house on one screen.
+This is OBJ-32's technical recommendation after evaluating Grafana: NOT the
+stack (server + datasource + provisioning for a single-tenant host is a
+farm that contradicts portability), YES its spirit — a consultable panel.
+v0 = static generator, morning-screen family.
 
-## Uso
+## Usage
 
 ```bash
-# página estática (por defecto junto al trace: obs/dashboard.html)
+# static page (by default next to the trace: obs/dashboard.html)
 HERMES_HOME=~/.hermes/profiles/pr-ollama python3 scripts/obs/obs-dashboard.py
 
-# página en vivo: regenera en cada request, Ctrl-C y fuera
+# live page: regenerates on every request, Ctrl-C and done
 HERMES_HOME=~/.hermes/profiles/pr-ollama python3 scripts/obs/obs-dashboard.py --serve
-# → http://127.0.0.1:8734   (otro puerto: --serve 9000)
+# → http://127.0.0.1:8734   (another port: --serve 9000)
 ```
 
-Sin installs, sin JS, sin CDN, sin dependencias: stdlib de Python. El
-HTML también funciona abierto como fichero (`file://`). `--serve` hace
-bind SOLO en 127.0.0.1 (privacidad: nada sale del host).
+No installs, no JS, no CDN, no dependencies: Python stdlib. The HTML also
+works opened as a file (`file://`). `--serve` binds to 127.0.0.1 ONLY
+(privacy: nothing leaves the host).
 
-## Qué muestra
+## What it shows
 
-1. **KPIs** — gasto real acumulado (trace), hueco sin etiqueta %,
-   done 24h, supply_ratio 24h + saldo NanoGPT con su nivel de
-   presupuesto (metrics-history, OBJ-29).
-2. **Gasto por clase de consumo** — tabla con líneas/gasto/%/barra y
-   sparkline de gasto $/día (14 días, inline SVG).
-3. **Gasto por objetivo** — top 8; `unattributed` siempre visible en
-   rojo con su marca `← sin etiqueta (hueco)`: el hueco se muestra, no
-   se esconde.
-4. **Forecast + veredicto (gate)** — % de cuota por provider con barra
-   y badge del veredicto: `OK` / `REDUCIR` (max_workers=1) /
-   `BOARD OFF` / `SIN PROYECCIÓN`; reset semanal con horas restantes.
-5. **Board** — recuento por estado, done 24h (con hora) y tareas
-   activas.
-6. **Alertas** — las mismas alarmas F2 de morning-screen; solo cuando
-   hay anomalías (`sin incidencias` si todo va bien, silencio si no hay
-   fuentes: patrón watchdog).
+1. **KPIs** — real accumulated spend (trace), unlabeled-gap %,
+   done 24h, supply_ratio 24h + NanoGPT balance with its budget level
+   (metrics-history, OBJ-29).
+2. **Spend by consumption class** — table with lines/spend/%/bar and a
+   $/day spend sparkline (14 days, inline SVG).
+3. **Spend by objective** — top 8; `unattributed` always visible in
+   red with its `← unlabeled (gap)` marker: the gap is shown, not hidden.
+4. **Forecast + verdict (gate)** — quota % per provider with bar and
+   verdict badge: `OK` / `REDUCE` (max_workers=1) / `BOARD OFF` /
+   `NO PROJECTION`; weekly reset with hours remaining.
+5. **Board** — count by state, done 24h (with hour) and active tasks.
+6. **Alarms** — the same F2 alarms as morning-screen; only when there
+   are anomalies (`no incidents` when all is well, silence when there
+   are no sources: watchdog pattern).
 
-## Contrato de fuentes (idéntico a morning-screen)
+## Source contract (identical to morning-screen)
 
-- `quota-governor/obs/trace.jsonl` — OBJ-27 F0 (consumo canónico)
-- `quota-governor/forecast.json` — OBJ-24 F2 (forecast EMA burn)
-- `quota-governor/metrics-history.jsonl` — OBJ-29 (supply_ratio, saldo)
-- `kanban.db` (root o profile home) — estado del board
+- `quota-governor/obs/trace.jsonl` — OBJ-27 F0 (canonical consumption)
+- `quota-governor/forecast.json` — OBJ-24 F2 (EMA burn forecast)
+- `quota-governor/metrics-history.jsonl` — OBJ-29 (supply_ratio, balance)
+- `kanban.db` (root or profile home) — board state
 
-Rutas resueltas por `get_hermes_home()` (`HERMES_HOME` o `~/.hermes`).
-Solo lectura: el dashboard nunca escribe en las fuentes. El trace vive
-bajo el profile home que lo colecta: fija `HERMES_HOME` igual que hace
-el cron de morning-screen.
+Paths resolve through `get_hermes_home()` (`HERMES_HOME` or `~/.hermes`).
+Read-only: the dashboard never writes to its sources. The trace lives
+under the profile home that collects it: set `HERMES_HOME` the same way
+the morning-screen cron does.
 
-## Fuente única de verdad
+## Single source of truth
 
-El módulo IMPORTA morning-screen (lectores, umbrales F2, regla del
-veredicto del gate) en vez de duplicarlos: si mañana cambia un umbral,
-cambia en los dos sitios a la vez.
+The module IMPORTS morning-screen (readers, F2 thresholds, gate-verdict
+rule) instead of duplicating them: if a threshold changes tomorrow, it
+changes in both places at once.
 
-## Archivos
+## Files
 
-- `scripts/obs/obs-dashboard.py` — generador + `--serve`
-- `scripts/obs/test_obs_dashboard.py` — 16 tests, fixtures, sin red,
+- `scripts/obs/obs-dashboard.py` — generator + `--serve`
+- `scripts/obs/test_obs_dashboard.py` — 16 tests, fixtures, no network,
   `/usr/bin/python3.12`
 
-## Roadmap (decidido en OBJ-32)
+## Roadmap (decided in OBJ-32)
 
-- **v1** (solo si se quiere refresco real sin `--serve`): endpoint OTLP
-  opcional + página que consulta el JSONL por fetch local. Sin
-  Prometheus.
-- **v2** (solo casa multi-host): AHI sí, Grafana/SigNoz — la herramienta
-  aparece cuando el problema la justifica.
+- **v1** (only if real refresh without `--serve` is wanted): optional OTLP
+  endpoint + a page querying the JSONL via local fetch. No Prometheus.
+- **v2** (only multi-host houses): AHI yes, Grafana/SigNoz — the tool
+  appears when the problem justifies it.

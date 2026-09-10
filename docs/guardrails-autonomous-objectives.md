@@ -1,148 +1,148 @@
-# Guardarrailes para Objetivos Autónomos (OBJ-17)
+# Guardrails for Autonomous Objectives (OBJ-17)
 
-> **Documento:** Diseño e implementación de guardarrailes que limitan al governor
-> antes de que pueda proponer nuevos objetivos por sí mismo (OBJ-16).
-> **Estado:** Implementado (Sep 2026)
-> **Prioridad:** P4 — debe completarse ANTES que OBJ-16
-> **Creado:** 2026-09-01
-
----
-
-## 1. Visión General
-
-OBJ-16 habilita al governor para proponer nuevos objetivos basados en patrones
-que detecta (bugs recurrentes, oportunidades de mejora). Antes de darle esa
-capacidad, necesitamos guardarrailes que limiten qué puede hacer y qué no.
-
-Este documento define los 11 guardarrailes, su implementación técnica
-(script `validate-guardrails.py`), y cómo se integran con el task creator.
+> **Document:** Design and implementation of the guardrails that constrain the
+> governor before it can propose new objectives by itself (OBJ-16).
+> **Status:** Implemented (Sep 2026)
+> **Priority:** P4 — must be completed BEFORE OBJ-16
+> **Created:** 2026-09-01
 
 ---
 
-## 2. Los 11 Guardarrailes
+## 1. Overview
 
-Cada guardabroil tiene un ID (GRn), una descripción, su implementación técnica,
-y el tipo de validación (estática o dinámica).
+OBJ-16 enables the governor to propose new objectives based on patterns it
+detects (recurring bugs, improvement opportunities). Before giving it that
+capability, we need guardrails that bound what it may and may not do.
 
-### GR1: No más de 5 objetivos activos simultáneamente
-
-**Descripción:** El sistema nunca debe tener más de 5 objetivos con tareas
-no terminadas (ready/running/blocked) al mismo tiempo.
-
-**Implementación:** Dinámica. El validador consulta `kanban.db`, agrupa
-tareas por tag `objective:OBJ-N`, cuenta objetivos con al menos una tarea
-no terminal. Si >= 5, rechaza la propuesta.
-
-**Validación:** `check_max_active_objectives(kanban_db_path) -> GuardrailResult`
-
-### GR2: No tocar NADA fuera del repo del plugin
-
-**Descripción:** Los objetivos propuestos no pueden sugerir modificar archivos
-fuera de `REPO/`.
-
-**Implementación:** Estática. El validador analiza el texto del objetivo
-propuesto buscando paths de archivo. Cualquier path que no esté dentro del
-repo del plugin se rechaza. Excepción: `~/.hermes/` está permitido por GR3.
-
-**Validación:** `check_file_scope(text) -> GuardrailResult`
-
-### GR3: No tocar NADA fuera de ~/.hermes/
-
-**Descripción:** Los objetivos pueden modificar archivos dentro de `~/.hermes/`
-(config, scripts, skills, etc.) pero no fuera de él ni fuera del repo del plugin.
-
-**Implementación:** Estática. Complementa GR2. Si el texto menciona paths
-absolutos que no están bajo `~/.hermes/` ni bajo el repo del plugin, se rechaza.
-
-**Validación:** `check_file_scope(text) -> GuardrailResult` (combinado con GR2)
-
-### GR4: No proponer objetivos que toquen archivos del sistema
-
-**Descripción:** Archivos críticos del sistema como `.env`, `.ssh/config`,
-`/etc/`, `/var/`, `/proc/`, `/sys/` no pueden ser tocados por objetivos
-propuestos.
-
-**Implementación:** Estática. Lista negra de paths y patrones. El validador
-detecta menciones a estos archivos en el texto del objetivo.
-
-**Validación:** `check_system_files(text) -> GuardrailResult`
-
-### GR5: No proponer objetivos que requieran credenciales nuevas sin aprobación
-
-**Descripción:** Si un objetivo requiere nuevas API keys, tokens, o
-credenciales, debe marcarse como "requires_human_approval" y no auto-promocionarse.
-
-**Implementación:** Estática. Detección de palabras clave: "API key",
-"credential", "token", "secret", "password", "auth key", "login".
-
-**Validación:** `check_credentials(text) -> GuardrailResult`
-
-### GR6: Máximo 1 objetivo nuevo propuesto por día
-
-**Descripción:** El sistema no puede proponer más de un objetivo nuevo por
-día natural. Si ya propuso uno hoy, los demás se rechazan hasta mañana.
-
-**Implementación:** Dinámica. El validador consulta `objective-proposals.jsonl`
-un registro append-only de propuestas. Si ya hay una entrada con la fecha de
-hoy, rechaza.
-
-**Validación:** `check_daily_proposal_limit(state_file) -> GuardrailResult`
-
-### GR7: No proponer objetivos que modifiquen config.yaml sin aprobación humana
-
-**Descripción:** Cualquier objetivo que sugiera modificar `config.yaml` debe
-marcarse como "requires_human_approval".
-
-**Implementación:** Estática. Detección de "config.yaml" o "config.yml"
-en el texto del objetivo.
-
-**Validación:** `check_config_yaml(text) -> GuardrailResult`
-
-### GR8: Todo objetivo propuesto entra en triage
-
-**Descripción:** Los objetivos propuestos por el governor NUNCA se promueven
-automáticamente a "ready". Siempre entran en "triage" para que el usuario
-decida.
-
-**Implementación:** Dinámica. El script que crea la tarea usa el flag
-`--triage` o `initial_status: "triage"`. El validador verifica que el
-status de la tarea creada sea "triage".
-
-**Validación:** `check_triage_only(task_creation_args) -> GuardrailResult`
-
-### GR9: No proponer objetivos que requieran instalar paquetes sin aprobación
-
-**Descripción:** Si un objetivo requiere `pip install`, `apt install`,
-`npm install`, etc., debe marcarse como "requires_human_approval".
-
-**Implementación:** Estática. Detección de comandos de instalación.
-
-**Validación:** `check_package_install(text) -> GuardrailResult`
-
-### GR10: No crear, modificar ni eliminar archivos en ningún otro repo de ~/git/
-
-**Descripción:** El governor solo puede tocar el repo del plugin. Otros repos
-en `~/git/` están prohibidos.
-
-**Implementación:** Estática. Detectar paths bajo `~/git/` que no sean
-el repo del plugin.
-
-**Validación:** `check_other_repos(text) -> GuardrailResult`
-
-### GR11: No modificar archivos del sistema operativo fuera de ~/.hermes/
-
-**Descripción:** El governor no puede modificar archivos del SO fuera de
-`~/.hermes/`. Esto incluye `/etc/`, `/usr/`, `/var/`, `/tmp/` (para
-persistencia), etc.
-
-**Implementación:** Estática. Similar a GR4 pero más amplio: cualquier path
-absoluto que no esté bajo `~/.hermes/` o el repo del plugin se marca.
-
-**Validación:** `check_os_files(text) -> GuardrailResult` (combinado con GR2/GR3)
+This document defines the 11 guardrails, their technical implementation
+(script `validate-guardrails.py`), and how they integrate with the task
+creator.
 
 ---
 
-## 3. Arquitectura de Implementación
+## 2. The 11 Guardrails
+
+Each guardrail has an ID (GRn), a description, its technical implementation,
+and its validation type (static or dynamic).
+
+### GR1: No more than 5 active objectives at once
+
+**Description:** The system must never have more than 5 objectives with
+non-finished tasks (ready/running/blocked) at the same time.
+
+**Implementation:** Dynamic. The validator queries `kanban.db`, groups
+tasks by `objective:OBJ-N` tag, and counts objectives with at least one
+non-terminal task. If >= 5, the proposal is rejected.
+
+**Validation:** `check_max_active_objectives(kanban_db_path) -> GuardrailResult`
+
+### GR2: Touch NOTHING outside the plugin repo
+
+**Description:** Proposed objectives may not suggest modifying files outside
+the plugin repo.
+
+**Implementation:** Static. The validator scans the proposed objective text
+for file paths. Any path not inside the plugin repo is rejected.
+Exception: `~/.hermes/` is allowed by GR3.
+
+**Validation:** `check_file_scope(text) -> GuardrailResult`
+
+### GR3: Touch NOTHING outside ~/.hermes/
+
+**Description:** Objectives may modify files inside `~/.hermes/`
+(config, scripts, skills, etc.) but not outside it nor outside the plugin repo.
+
+**Implementation:** Static. Complements GR2. If the text mentions absolute
+paths not under `~/.hermes/` or the plugin repo, it is rejected.
+
+**Validation:** `check_file_scope(text) -> GuardrailResult` (combined with GR2)
+
+### GR4: Do not propose objectives that touch system files
+
+**Description:** Critical system files such as `.env`, `.ssh/config`,
+`/etc/`, `/var/`, `/proc/`, `/sys/` must not be touched by proposed objectives.
+
+**Implementation:** Static. Path and pattern blacklist. The validator detects
+mentions of these files in the objective text.
+
+**Validation:** `check_system_files(text) -> GuardrailResult`
+
+### GR5: Do not propose objectives that require new credentials without approval
+
+**Description:** If an objective requires new API keys, tokens, or
+credentials, it must be marked as "requires_human_approval" and never
+auto-promoted.
+
+**Implementation:** Static. Keyword detection: "API key", "credential",
+"token", "secret", "password", "auth key", "login".
+
+**Validation:** `check_credentials(text) -> GuardrailResult`
+
+### GR6: At most 1 new objective proposed per day
+
+**Description:** The system may not propose more than one new objective per
+calendar day. If it already proposed one today, all others are rejected
+until tomorrow.
+
+**Implementation:** Dynamic. The validator consults `objective-proposals.jsonl`,
+an append-only log of proposals. If an entry with today's date already
+exists, it rejects.
+
+**Validation:** `check_daily_proposal_limit(state_file) -> GuardrailResult`
+
+### GR7: Do not propose objectives that modify config.yaml without human approval
+
+**Description:** Any objective suggesting a modification of `config.yaml` must
+be marked as "requires_human_approval".
+
+**Implementation:** Static. Detection of "config.yaml" or "config.yml"
+in the objective text.
+
+**Validation:** `check_config_yaml(text) -> GuardrailResult`
+
+### GR8: Every proposed objective enters triage
+
+**Description:** Objectives proposed by the governor are NEVER automatically
+promoted to "ready". They always enter "triage" so the user decides.
+
+**Implementation:** Dynamic. The script that creates the task uses the flag
+`--triage` or `initial_status: "triage"`. The validator checks that the
+created task's status is "triage".
+
+**Validation:** `check_triage_only(task_creation_args) -> GuardrailResult`
+
+### GR9: Do not propose objectives that install packages without approval
+
+**Description:** If an objective requires `pip install`, `apt install`,
+`npm install`, etc., it must be marked as "requires_human_approval".
+
+**Implementation:** Static. Detection of install commands.
+
+**Validation:** `check_package_install(text) -> GuardrailResult`
+
+### GR10: Do not create, modify, or delete files in any other repo
+
+**Description:** The governor may only touch the plugin repo. Other repos
+are forbidden.
+
+**Implementation:** Static. Detects paths under the workspace root that are
+not the plugin repo.
+
+**Validation:** `check_other_repos(text) -> GuardrailResult`
+
+### GR11: Do not modify OS files outside ~/.hermes/
+
+**Description:** The governor may not modify OS files outside `~/.hermes/`.
+This includes `/etc/`, `/usr/`, `/var/`, `/tmp/` (for persistence), etc.
+
+**Implementation:** Static. Similar to GR4 but broader: any absolute path
+not under `~/.hermes/` or the plugin repo is flagged.
+
+**Validation:** `check_os_files(text) -> GuardrailResult` (combined with GR2/GR3)
+
+---
+
+## 3. Implementation Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -160,118 +160,113 @@ absoluto que no esté bajo `~/.hermes/` o el repo del plugin se marca.
 │      ├─ GR7: config.yaml detection          │
 │      ├─ GR8: triage-only enforcement        │
 │      ├─ GR9: package install detection      │
-│      └─ GR10: other repos in ~/git/     │
+│      └─ GR10: other repos                   │
 │   5. If all pass → create task in triage    │
 │   5b. If any fail → log rejection, skip    │
 │   6. Record proposal in proposals.jsonl     │
 └─────────────────────────────────────────────┘
 ```
 
-### Flujo de validación
+### Validation flow
 
-1. El task creator (o el script que propone objetivos) llama a
-   `validate-guardrails.py` con el texto del objetivo propuesto.
-2. El script ejecuta los 11 checks.
-3. Devuelve JSON con:
+1. The task creator (or the script proposing objectives) calls
+   `validate-guardrails.py` with the proposed objective text.
+2. The script runs the 11 checks.
+3. It returns JSON with:
    - `allowed: true/false`
-   - `violations: [{id, message}]` (vacío si allowed)
-   - `warnings: [{id, message}]` (no bloquean pero requieren atención)
+   - `violations: [{id, message}]` (empty when allowed)
+   - `warnings: [{id, message}]` (non-blocking but worth attention)
    - `requires_human_approval: true/false`
-4. Si `allowed: false`, el objetivo no se crea.
-5. Si `allowed: true` pero `requires_human_approval: true`, el objetivo
-   se crea en triage con un body que marca "REQUIRES HUMAN APPROVAL" y
-   la lista de warnings.
-6. Si `allowed: true` y `requires_human_approval: false`, el objetivo
-   se crea en triage sin warnings.
+4. If `allowed: false`, the objective is not created.
+5. If `allowed: true` but `requires_human_approval: true`, the objective
+   is created in triage with a body that marks "REQUIRES HUMAN APPROVAL" and
+   the list of warnings.
+6. If `allowed: true` and `requires_human_approval: false`, the objective
+   is created in triage without warnings.
 
-### Registro de propuestas
+### Proposal log
 
-Cada propuesta (aprobada o rechazada) se registra en
+Every proposal (approved or rejected) is recorded in
 `~/.hermes/quota-governor/objective-proposals.jsonl`:
 
 ```json
 {
   "timestamp": "2026-09-01T12:00:00Z",
-  "date": "2026-09-01",
-  "title": "OBJ-20: Optimizar health checks",
-  "allowed": true,
-  "violations": [],
-  "warnings": [],
-  "requires_human_approval": false,
-  "task_id": "t_xxx"  // si se creó
+  "title": "OBJ-20: ...",
+  "verdict": "allowed|rejected",
+  "violations": []
 }
 ```
 
 ---
 
-## 4. Integración con el task creator
+## 4. Integration with the task creator
 
-El cron prompt del autonomous-task-creator se actualiza para incluir:
+The autonomous-task-creator cron prompt is updated to include:
 
-1. Antes de proponer un objetivo nuevo (OBJ-16): ejecutar
-   `validate-guardrails.py --title "..." --body "..."` y respetar el veredicto.
-2. Si el validador devuelve `allowed: false`, NO crear la tarea.
-3. Si devuelve `allowed: true`, crear la tarea en `triage`.
-4. Registrar la propuesta en `objective-proposals.jsonl`.
+1. Before proposing a new objective (OBJ-16): run
+   `validate-guardrails.py --title "..." --body "..."` and respect the verdict.
+2. If the validator returns `allowed: false`, DO NOT create the task.
+3. If it returns `allowed: true`, create the task in `triage`.
+4. Record the proposal in `objective-proposals.jsonl`.
 
-Las guardrails existentes (G1-G6) del task creator siguen activas y se
-aplican ANTES de las nuevas (GR1-GR11). Las nuevas son específicas para
-la propuesta de objetivos (OBJ-16), no para la creación de tareas
-para objetivos existentes.
+The existing guardrails (G1-G6) of the task creator remain active and apply
+BEFORE the new ones (GR1-GR11). The new ones are specific to objective
+proposals (OBJ-16), not to task creation for existing objectives.
 
 ---
 
-## 5. Paths permitidos y prohibidos
+## 5. Allowed and forbidden paths
 
-### Paths permitidos (el governor puede proponer touching)
+### Allowed paths (the governor may propose touching)
 
-| Path | Guardabroil | Notas |
-|------|------------|-------|
-| `REPO/**` | GR2 | Repo del plugin |
+| Path | Guardrail | Notes |
+|------|-----------|-------|
+| `<plugin-repo>/**` | GR2 | Plugin repo (resolved from the checkout) |
 | `~/.hermes/**` | GR3 | Config, scripts, skills, etc. |
-| `~/.hermes/profiles/pr-ollama/**` | GR3 | Perfil activo |
-| `~/.hermes/profiles/pr-ollama/scripts/**` | GR3 | Scripts del cron |
-| `~/.hermes/profiles/pr-ollama/docs/**` | GR3 | Documentación |
+| `~/.hermes/profiles/<active-profile>/**` | GR3 | Active profile |
+| `~/.hermes/profiles/<active-profile>/scripts/**` | GR3 | Cron scripts |
+| `~/.hermes/profiles/<active-profile>/docs/**` | GR3 | Documentation |
 
-### Paths prohibidos (el governor NUNCA puede proponer touching)
+### Forbidden paths (the governor must NEVER propose touching)
 
-| Path | Guardabroil | Notas |
-|------|------------|-------|
-| `~/.env` | GR4 | Credenciales del sistema |
-| `~/.ssh/config` | GR4 | Config SSH |
-| `~/.hermes/profiles/*/config.yaml` | GR7 | Requiere aprobación humana |
-| `~/git/<other-repo>/**` | GR10 | Otros repos |
-| `/etc/**` | GR4, GR11 | Sistema |
-| `/var/**` | GR4, GR11 | Sistema |
-| `/proc/**` | GR4, GR11 | Sistema |
-| `/sys/**` | GR4, GR11 | Sistema |
-| `/usr/**` | GR11 | Sistema |
-| `/tmp/**` | GR11 | Temporal (no persistencia) |
+| Path | Guardrail | Notes |
+|------|-----------|-------|
+| `~/.env` | GR4 | System credentials |
+| `~/.ssh/config` | GR4 | SSH config |
+| `~/.hermes/profiles/*/config.yaml` | GR7 | Requires human approval |
+| `<other-repos>/**` | GR10 | Other repos |
+| `/etc/**` | GR4, GR11 | System |
+| `/var/**` | GR4, GR11 | System |
+| `/proc/**` | GR4, GR11 | System |
+| `/sys/**` | GR4, GR11 | System |
+| `/usr/**` | GR11 | System |
+| `/tmp/**` | GR11 | Temporal (not persistence) |
 
-### Paths que requieren aprobación humana
+### Paths requiring human approval
 
-| Path/patrón | Guardabroil | Razón |
-|-------------|------------|-------|
-| `config.yaml` / `config.yml` | GR7 | Config central de Hermes |
-| Cualquier mención de "API key", "credential", etc. | GR5 | Credenciales |
-| Cualquier `pip install`, `apt install`, etc. | GR9 | Instalación de paquetes |
+| Path/pattern | Guardrail | Reason |
+|-------------|-----------|--------|
+| `config.yaml` / `config.yml` | GR7 | Hermes central config |
+| Any mention of "API key", "credential", etc. | GR5 | Credentials |
+| Any `pip install`, `apt install`, etc. | GR9 | Package installs |
 
 ---
 
 ## 6. Script: validate-guardrails.py
 
-**Ubicación:** `~/.hermes/scripts/validate-guardrails.py`
-**Sintaxis:**
+**Location:** `scripts/validate-guardrails.py` in the plugin repo.
+**Syntax:**
 
 ```bash
-# Validar una propuesta de objetivo
+# Validate an objective proposal
 python3 validate-guardrails.py \
-  --title "OBJ-20: Optimizar health checks" \
-  --body "Refactorizar health_checks.py para reducir falsos positivos..." \
+  --title "OBJ-20: Optimize health checks" \
+  --body "Refactor health_checks.py to reduce false positives..." \
   --kanban-db ~/.hermes/kanban.db \
   --state-file ~/.hermes/quota-governor/objective-proposals.jsonl
 
-# Output (JSON en stdout):
+# Output (JSON on stdout):
 # {
 #   "allowed": true,
 #   "violations": [],
@@ -280,20 +275,19 @@ python3 validate-guardrails.py \
 # }
 ```
 
-**Opciones:**
-- `--title`: Título del objetivo propuesto (requerido)
-- `--body`: Body/descripción del objetivo (requerido)
-- `--kanban-db`: Path a kanban.db (default: `~/.hermes/kanban.db`)
-- `--state-file`: Path al registro de propuestas (default: `~/.hermes/quota-governor/objective-proposals.jsonl`)
-- `--json`: Output JSON (default)
-- `--quiet`: Solo exit code (0=allowed, 1=rejected)
+**Options:**
+- `--title`: Title of the proposed objective (required)
+- `--body`: Body/description of the objective (required)
+- `--kanban-db`: Path to kanban.db (default: `~/.hermes/kanban.db`)
+- `--state-file`: Path to the proposal log (default: `~/.hermes/quota-governor/objective-proposals.jsonl`)
+- `--json`: JSON output (default)
+- `--quiet`: Exit code only (0=allowed, 1=rejected)
 
 ---
 
-## 7. Criterio de Completitud
+## 7. Completion criteria
 
-- [x] Documento de guardarrailes diseñado (este documento)
-- [x] `validate-guardrails.py` implementado con los 11 checks
-- [x] Tests unitarios para cada check
-- [x] Prompt del task creator actualizado con instrucciones de validación
-- [x] Verificación de que los guardarrailes se respetan (tests pasando)
+- [x] Guardrail design document (this document)
+- [x] `validate-guardrails.py` implemented with the 11 checks
+- [x] Unit tests for every check
+- [x] Task-creator prompt updated with validation instructions

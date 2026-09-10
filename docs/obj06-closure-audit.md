@@ -9,12 +9,12 @@ limitations, not missing work (documented in §5).
 Per `docs/autonomous-objectives.md` OBJ-06: with several slow workers and `--max 2`,
 the system must never exceed the hard cap, and every kill must be logged.
 
-## 2. Code evidence (repo `REPO`)
+## 2. Code evidence (plugin repo)
 
 - Commit `7495a05` ("feat: OBJ-06 concurrency guard — live worker count, soft/hard
   caps for tick script", 2026-09-02) adds:
-  - `concurrency_guard.py` (286 lines): live-worker count = kanban DB tasks in
-    `running` with alive PIDs; soft cap (`live >= desired_max` → skip spawn);
+  - `concurrency_guard.py` (new module): live worker count from kanban.db claim
+    locks; `soft_limit` (`--max`, skip spawn) and
     hard cap (`live > hard_limit`, default `desired_max+2` → SIGTERM oldest-first).
   - `scripts/quota-governor-tick.sh` (+100 lines): guard wired before daemon
     management; kill notice logged via `log "$KILL_NOTICE"` (tick.sh L255–257).
@@ -24,9 +24,9 @@ the system must never exceed the hard cap, and every kill must be logged.
     `kill_worker` SIGTERM returns True. Re-run at audit time:
     `python3 -m unittest test_concurrency_guard` → **23 passed, 0 failed**.
 - Deployed copy matches repo: `md5sum` of `scripts/quota-governor-tick.sh` and
-  `~/.hermes/scripts/quota-governor-tick.sh` both `e8858c2656ccd46795ae05664e354344`
-  at audit time (deploy done by t_ae7106cd on 2026-09-08; guard resolves
-  `concurrency_guard.py` from `PLUGIN_DIR=REPO`,
+  the deployed `~/.hermes/scripts/quota-governor-tick.sh` both
+  `e8858c2656ccd46795ae05664e354344` at audit time (deploy done by t_ae7106cd on
+  2026-09-08; the guard resolves `concurrency_guard.py` from the plugin dir,
   tick.sh L197).
 
 ## 3. Production evidence (`~/.hermes/logs/quota-governor-tick.log`)
@@ -65,8 +65,8 @@ artifacts of the 2026-08-31 manual cleanup.
 
 1. **No real kill observed in production.** Hard-cap SIGTERM firing is proven by
    unit tests (kill_worker=True) and an isolated e2e with real PIDs where kills
-   were reaped-verified (t_9f687fc3: "hard cap SIGTERM oldest-first mata de
-   verdad (verificado con wait/reap)"), and the kill-to-log path exists at
+   were reaped-verified (t_9f687fc3: "hard cap SIGTERM oldest-first really kills
+   (verified with wait/reap)"), and the kill-to-log path exists at
    tick.sh L255–257 — but production load has never exceeded the hard limit, so
    no `Concurrency: ... kill` log line exists in the real tick log yet.
 2. **`objective-progress.json` will keep OBJ-06 at `needs_attention`.**
