@@ -24,7 +24,9 @@ import unittest
 
 GOV_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(GOV_DIR, "scripts", "nanogpt-balance-ledger.py")
-CAPTURE = "~/.hermes/hermes-agent/agent/nanogpt_pricing_capture.py"
+CAPTURE = os.environ.get(
+    "NANO_GPT_PRICING_CAPTURE",
+    os.path.expanduser("~/.hermes/hermes-agent/agent/nanogpt_pricing_capture.py"))
 
 _spec = importlib.util.spec_from_file_location("nanogpt_balance_ledger", SCRIPT)
 ledger = importlib.util.module_from_spec(_spec)

@@ -139,7 +139,7 @@ def test_verify_single_task_verified():
     # override the paths. Let's import it directly with path overrides.
 
     # Save and override env
-    verify_script = "~/.hermes/scripts/verify-task.py"
+    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
     script_dir = os.path.dirname(verify_script)
 
     # We'll use importlib to load verify-task.py with overridden paths
@@ -198,7 +198,7 @@ def test_verify_single_task_phantom():
     if os.path.exists(verifications_file):
         os.unlink(verifications_file)
 
-    verify_script = "~/.hermes/scripts/verify-task.py"
+    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
     import importlib.util
     spec = importlib.util.spec_from_file_location("verify_task_phantom", verify_script)
     vt = importlib.util.module_from_spec(spec)
@@ -250,7 +250,7 @@ def test_verify_single_task_not_found():
         conn.commit()
         conn.close()
 
-    verify_script = "~/.hermes/scripts/verify-task.py"
+    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
     import importlib.util
     spec = importlib.util.spec_from_file_location("verify_task_nf", verify_script)
     vt = importlib.util.module_from_spec(spec)
@@ -290,7 +290,7 @@ def test_spawn_verify_task():
 
         # We need to define _spawn_verify_task inline since importing __init__.py
         # has complex dependencies. Let's test the logic directly.
-        _VERIFY_TASK_SCRIPT = "~/.hermes/scripts/verify-task.py"
+        _VERIFY_TASK_SCRIPT = os.path.expanduser("~/.hermes/scripts/verify-task.py")
 
         def _spawn_verify_task(task_id):
             if not os.path.exists(_VERIFY_TASK_SCRIPT):
@@ -374,7 +374,7 @@ def test_task_id_bypasses_idempotency():
             "verifier_version": "1.0"
         }) + "\n")
 
-    verify_script = "~/.hermes/scripts/verify-task.py"
+    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
     import importlib.util
     spec = importlib.util.spec_from_file_location("verify_task_idemp", verify_script)
     vt = importlib.util.module_from_spec(spec)

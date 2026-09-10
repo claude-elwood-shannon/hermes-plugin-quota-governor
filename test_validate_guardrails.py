@@ -41,6 +41,8 @@ from validate_guardrails import (
     GuardrailResult,
     Violation,
     Warning_,
+    REPOS_ROOT,
+    PLUGIN_REPO,
     check_max_active_objectives,
     check_file_scope,
     check_system_files,
@@ -179,7 +181,7 @@ class TestGR2GR3FileScope(unittest.TestCase):
 
     def test_plugin_repo_path_allowed(self):
         """Paths inside the plugin repo should be allowed."""
-        text = f"Refactor {os.environ.get('PLUGIN_REPO', 'REPO')}/health_checks.py"
+        text = f"Refactor {PLUGIN_REPO}/health_checks.py"
         result = check_file_scope(text)
         self.assertTrue(result.allowed)
 
@@ -386,13 +388,13 @@ class TestGR9PackageInstall(unittest.TestCase):
 class TestGR10OtherRepos(unittest.TestCase):
 
     def test_other_repo_blocked(self):
-        text = "Modify ~/git/other-project/main.py"
+        text = f"Modify {REPOS_ROOT}/other-project/main.py"
         result = check_other_repos(text)
         self.assertFalse(result.allowed)
         self.assertEqual(result.violations[0].id, "GR10")
 
     def test_plugin_repo_allowed(self):
-        text = "Modify REPO/health_checks.py"
+        text = f"Modify {REPOS_ROOT}/hermes-plugin-quota-governor/health_checks.py"
         result = check_other_repos(text)
         self.assertTrue(result.allowed)
 
@@ -471,7 +473,7 @@ class TestValidateObjective(unittest.TestCase):
     def test_multiple_violations(self):
         result = validate_objective(
             title="OBJ-23: Bad proposal",
-            body="Modify /etc/hosts, ~/git/other/file.py, and install packages with pip install requests",
+            body=f"Modify /etc/hosts, {REPOS_ROOT}/other/file.py, and install packages with pip install requests",
             kanban_db="/nonexistent.db",
             state_file="/nonexistent.jsonl",
         )

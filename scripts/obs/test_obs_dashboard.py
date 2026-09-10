@@ -236,7 +236,7 @@ class TestServer(Base):
 class TestPortability(unittest.TestCase):
     def test_no_absolute_host_paths_in_module(self):
         src = Path(DASH_SCRIPT).read_text(encoding="utf-8")
-        for needle in ("/home/", "/data/git", "host"):
+        for needle in ("/home/", "/data", "host"):
             self.assertNotIn(needle, src,
                              f"host path leaked into obs-dashboard.py: "
                              f"{needle}")

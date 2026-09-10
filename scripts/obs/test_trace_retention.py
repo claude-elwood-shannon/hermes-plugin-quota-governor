@@ -31,7 +31,8 @@ import time
 import unittest
 from pathlib import Path
 
-GOV_DIR = os.environ.get("GOV_DIR", "REPO")
+GOV_DIR = os.environ.get("GOV_DIR", os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 TRACE_SCRIPT = os.path.join(GOV_DIR, "scripts", "obs", "trace.py")
 
 _spec = importlib.util.spec_from_file_location("obs_trace_f3", TRACE_SCRIPT)
@@ -408,7 +409,7 @@ class TestEdgeCases(Base):
 class TestPortability(unittest.TestCase):
     def test_no_absolute_host_paths_in_module(self):
         src = Path(TRACE_SCRIPT).read_text(encoding="utf-8")
-        for needle in ("/home/", "/data/git", "host"):
+        for needle in ("/home/", "/data", "host"):
             self.assertNotIn(needle, src,
                              f"host path leaked into trace.py: {needle}")
 

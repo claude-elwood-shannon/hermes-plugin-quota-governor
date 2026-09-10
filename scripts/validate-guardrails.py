@@ -46,7 +46,7 @@ from typing import List, Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-PLUGIN_REPO = "REPO"
+PLUGIN_REPO = str(Path(__file__).resolve().parent.parent)
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 
 MAX_ACTIVE_OBJECTIVES = 5
@@ -82,9 +82,10 @@ SYSTEM_FILE_BLACKLIST = [
     "/bin/",
 ]
 
-# Other repos in ~/git/ (not the plugin repo)
+# Other repos in the repos root (parent of the plugin repo)
+REPOS_ROOT = str(Path(PLUGIN_REPO).parent)
 OTHER_REPOS_PATTERN = re.compile(
-    r"~/git/(?!hermes-plugin-quota-governor)[\w\-./]+",
+    re.escape(REPOS_ROOT) + r"/(?!hermes-plugin-quota-governor)[\w\-./]+",
     re.IGNORECASE,
 )
 
@@ -389,18 +390,18 @@ def check_package_install(text: str) -> GuardrailResult:
 
 
 def check_other_repos(text: str) -> GuardrailResult:
-    """GR10: No touching other repos in ~/git/."""
+    """GR10: No touching other repos in the repos root."""
     result = GuardrailResult()
 
     for match in OTHER_REPOS_PATTERN.finditer(text):
         path = match.group(0)
-        # Ensure it's not just "REPO"
+        # Ensure it's not just the plugin repo itself
         # (the regex already excludes it, but double-check)
         if "hermes-plugin-quota-governor" not in path:
             result.allowed = False
             result.violations.append(Violation(
                 id="GR10",
-                message=f"Objective touches other repo in ~/git/: {path}",
+                message=f"Objective touches other repo in the repos root: {path}",
             ))
 
     return result

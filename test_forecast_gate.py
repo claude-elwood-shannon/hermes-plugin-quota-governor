@@ -7,11 +7,14 @@ corrupto, y no-regresión (sin --suggest el gate no inyecta nada). El
 monkeypatching es sobre fixtures tmp — nunca toca forecast.json real.
 """
 import importlib.util
+import os
 import sys
 import unittest
 
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 SPEC = importlib.util.spec_from_file_location(
-    "quota_gate", "REPO/scripts/quota-gate.py")
+    "quota_gate", os.path.join(REPO_ROOT, "scripts", "quota-gate.py"))
 qg = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(qg)
 

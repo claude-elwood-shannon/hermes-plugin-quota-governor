@@ -494,7 +494,7 @@ class TestComputePrivacySummary(unittest.TestCase):
             "considera privacidad: el snapshot emite privacy_level: none y "
             "el creator asigna solo por cuota.\n\n"
             "**Trabajo**:\n1. Localizar el script del gate (sistema "
-            "quota-governor en ~/git/) y leer como parsea los bodies de "
+            "quota-governor) y leer como parsea los bodies de "
             "tareas kanban.\n2. Anadir deteccion del tag privacy:high|medium|low "
             "en bodies de tareas activas (kanban.db) y exponer un campo "
             "privacy_summary en el JSON del snapshot\n"

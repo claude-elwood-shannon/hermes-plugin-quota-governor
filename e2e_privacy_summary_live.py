@@ -16,7 +16,8 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-REAL_DB = "~/.hermes/kanban.db"
+REAL_DB = os.environ.get(
+    "REAL_KANBAN_DB", os.path.expanduser("~/.hermes/kanban.db"))
 GATE = os.path.join(REPO, "scripts", "quota-gate.py")
 
 tmpdir = tempfile.mkdtemp(prefix="privacy-e2e-")

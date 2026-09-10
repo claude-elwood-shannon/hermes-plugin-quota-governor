@@ -10,7 +10,7 @@ external config file:
 
 a JSON array of objects:
     {
-      "repo":     "REPO",  # absolute path
+      "repo":     "<absolute path to the plugin repo>",  # absolute path
       "remote":   "origin",            # remote ref (default "origin")
       "assignee": "pr-nanogpt",        # profile (default "auto" -> DEFAULT_ASSIGNEE)
       "enabled":  true                 # skip when false

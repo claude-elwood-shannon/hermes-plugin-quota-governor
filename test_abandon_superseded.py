@@ -395,7 +395,7 @@ class TestDetectorIntegration(Sandbox):
 
     def _load_wp(self):
         import importlib.util
-        repo = "REPO"
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         spec = importlib.util.spec_from_file_location(
             "weekly_progress_wp", os.path.join(repo, "scripts", "weekly-progress.py"))
         mod = importlib.util.module_from_spec(spec)

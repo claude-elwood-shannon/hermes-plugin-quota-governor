@@ -30,7 +30,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-GOV_DIR = "REPO"
+GOV_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPT = os.path.join(GOV_DIR, "scripts", "obs", "otlp_exporter.py")
 
 _spec = importlib.util.spec_from_file_location("otlp_exporter", SCRIPT)

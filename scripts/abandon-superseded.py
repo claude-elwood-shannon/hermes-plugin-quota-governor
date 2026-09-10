@@ -52,7 +52,7 @@ Exit codes:
 References:
   - scripts/weekly-progress.py  ABANDONED_TAG_RE (the read side)
   - scripts/cost-tag-fix.py     (sibling header-stamp pattern)
-  - REPO/docs/obj06-closure-audit.md §5
+  - docs/obj06-closure-audit.md §5
 """
 from __future__ import annotations
 
