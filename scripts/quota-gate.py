@@ -126,7 +126,10 @@ PRIVACY_CAPABILITIES = {
     # data_collection:deny. Revisit if a ZDR policy is verified.
     "public": {"ollama-cloud", "nanogpt", "openrouter", "opencode-go", "custom"},
     "sensitive": {"ollama-cloud", "nanogpt", "custom"},
-    "confidential": {"custom"},
+    # OBJ-40 (Sep 10 2026, user-approved): vllm-local added to confidential —
+    # the only provider whose inference NEVER leaves the user's LAN
+    # (ml-host 192.168.1.32, self-hosted vLLM, no third-party TOS).
+    "confidential": {"custom", "vllm-local"},
 }
 
 # Reverse: provider name → set of privacy levels it can handle
@@ -831,6 +834,11 @@ def query_opencode_go():
 # Profile → default model mapping (from config.yaml of each profile)
 PROFILE_MODELS = {
     "pr-ollama": "glm-5.2",
+    # OBJ-40 (Sep 10 2026, duel won vs Llama-3.1-8B-AWQ: multi-turn tool loop
+    # 3/3 correct vs Llama's schema hallucination; user approved integration):
+    # Qwen2.5-7B-Instruct-FP8 self-hosted on ml-host — the $0 confidential
+    # worker. FP8 natively supported by vLLM on the 4060 Ti (8.7GB weights).
+    "pr-vllm": "liodon-ai/Qwen2.5-7B-Instruct-FP8",
     # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.2 approved by the user in
     # t_bef3cbf0): zai-org/glm-5.2 -> z-ai/glm-5.3-flash for interactive.
     # Data: z-ai/glm-5.3-flash $0.075/$0.25 USD/M in/out, subscription-covered
@@ -897,6 +905,10 @@ PROFILE_WORKER_MODELS = {
                                             # archived as historical coverage evidence).
     "pr-openrouter": "z-ai/glm-5.2:free",   # free tier already — keep as is
     "pr-opencode": "qwen3.8-flash",         # $0.15/$0.47/M, no peak pricing
+    # OBJ-40 (Sep 10 2026): local worker — $0, LAN-only, FP8 on the 4060 Ti.
+    # Same model as interactive: the 8B-class is single-purpose here (strict
+    # JSON one-shot tasks), no interactive use intended.
+    "pr-vllm": "liodon-ai/Qwen2.5-7B-Instruct-FP8",
 }
 
 # Cost tiers whose auto-created tasks must use the worker (cheap) model.
