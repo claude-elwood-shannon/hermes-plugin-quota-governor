@@ -12,9 +12,21 @@ import sys
 import unittest
 from unittest import mock
 
-# importar el plugin como package real: sys.path incluye el PADRE del plugin
+# importar el plugin como package real. The clone dir is named
+# hermes-plugin-quota-governor (dashes), which is not importable, so register
+# the package by PATH under the canonical name — works on any clone dir name.
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(PLUGIN_DIR))
+if "hermes_plugin_quota_governor" not in sys.modules:
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "hermes_plugin_quota_governor",
+        os.path.join(PLUGIN_DIR, "__init__.py"),
+        submodule_search_locations=[PLUGIN_DIR],
+    )
+    assert _spec is not None and _spec.loader is not None
+    _plug = importlib.util.module_from_spec(_spec)
+    sys.modules["hermes_plugin_quota_governor"] = _plug
+    _spec.loader.exec_module(_plug)
 import hermes_plugin_quota_governor as plug  # noqa: E402
 
 

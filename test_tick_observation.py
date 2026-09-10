@@ -304,8 +304,19 @@ class TestCoreRecordObservation(Base):
     """record_observation (core): mismos campos en filas de hooks."""
 
     def _gov(self):
-        # import the package the way the plugin loader does
-        sys.path.insert(0, os.path.dirname(GOV_DIR))
+        # register the package by PATH under the canonical name — the clone
+        # dir name (dashes) is not importable, so sys.path tricks are not enough
+        if "hermes_plugin_quota_governor" not in sys.modules:
+            import importlib.util
+            _spec = importlib.util.spec_from_file_location(
+                "hermes_plugin_quota_governor",
+                os.path.join(GOV_DIR, "__init__.py"),
+                submodule_search_locations=[GOV_DIR],
+            )
+            assert _spec is not None and _spec.loader is not None
+            _plug = importlib.util.module_from_spec(_spec)
+            sys.modules["hermes_plugin_quota_governor"] = _plug
+            _spec.loader.exec_module(_plug)
         import hermes_plugin_quota_governor.quota_governor as gov_mod
         return gov_mod
 
