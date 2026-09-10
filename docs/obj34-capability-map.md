@@ -1,256 +1,256 @@
-# OBJ-34 — Mapa de capacidades y fronteras de la casa
+# OBJ-34 — Capability and frontier map of the house
 
-> **Qué es:** mapa priorizado de lo que la casa puede hacer hoy, dónde está
-> la frontera exacta de cada área, y qué pieza de crecimiento comprar primero
-> con presupuesto declarado. **Estado: mapa, no builds** — nada instalado,
-> nada pedido, nada activado. La decisión final es de Andrew.
+> **What it is:** a prioritized map of what the house can do today, where the
+> exact frontier of each area lies, and which growth piece to buy first with a
+> declared budget. **Status: map, not builds** — nothing installed, nothing
+> requested, nothing activated. The final decision is Andrew's.
 >
-> **Fecha:** 10-sep-2026 · **Fuente de cada dato:** probes reales de hoy
-> (método en §7). **Modelo del mapa:** todo lo que entra, entra con contrato:
-> coste declarado, criterio verificable, revocable — el mismo formato que el
-> resto del fondo.
+> **Date:** 2026-09-10 · **Source of every number:** live probes from today
+> (method in §7). **Map model:** everything that enters, enters with a
+> contract: declared cost, verifiable criterion, revocable — the same format
+> as the rest of the fund.
 
 ---
 
-## Resumen ejecutivo (30 segundos)
+## Executive summary (30 seconds)
 
-| # | Pieza candidata | Área | Coste | Riesgo | Clase | Veredicto |
+| # | Candidate piece | Area | Cost | Risk | Class | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | **Visión para QA visual del dashboard (OBJ-32)** | Físicas | **$0** | Bajo | C | ✅ **RECOMENDADA** |
-| 2 | QA visual E2E con screenshots (browser+visión) | Físicas | $0 | Bajo | C | Misma pieza, vista pipeline |
-| 3 | Visión por HTTP (payload directo a proveedor de visión) | Físicas | ~$0.01/req | Bajo | A | Alternativa si el nativo queda corto |
-| 4 | Cierre de OBJ-27 F4b | Observ. | ~$0.10 | Bajo | C | Ya en marcha (tarea hermana) |
-| 5 | Rama de memoria por-dominio | Memoria | $0 | Bajo | C | Espera formato de OBJ-31 |
-| 6 | Higiene del hueco (etiquetado en el trace) | Observ. | ~$0.05 | Bajo | C | Barato, alto valor |
-| 7 | MCP server propio del trace | Nuevos | $0 | Bajo | C | Buen segundo |
-| 8 | Proxy OpenAI-compat local | Nuevos | $0 | Medio | A | Espera cliente |
-| 9 | ACP a IDEs | Nuevos | $0 | Medio | A | Espera cliente |
-| 10 | Bot multi-plataforma vía gateway | Nuevos | $0 | Medio | A | Espera elección |
-| 11 | Computer-use (Xorg :10 real) | Físicas | $0 | **Medio-alto** | A | **No recomendar aún** |
-| 12 | Voice-in (STT) / TTS en gateway | Físicas | $0 | Medio | A | Tras visión |
-| 14 | Salud de memoria en el dashboard | Memoria | ~$0.02 | Bajo | C | Tras OBJ-31 |
+| 1 | **Vision for visual QA of the dashboard (OBJ-32)** | Physical | **$0** | Low | C | ✅ **RECOMMENDED** |
+| 2 | E2E visual QA with screenshots (browser+vision) | Physical | $0 | Low | C | Same piece, pipeline view |
+| 3 | Vision over HTTP (direct payload to a vision provider) | Physical | ~$0.01/req | Low | A | Alternative if the native tool falls short |
+| 4 | Close-out of OBJ-27 F4b | Observ. | ~$0.10 | Low | C | Already in motion (sister task) |
+| 5 | Per-domain memory branch | Memory | $0 | Low | C | Waits for OBJ-31's format |
+| 6 | Gap hygiene (tagging in the trace) | Observ. | ~$0.05 | Low | C | Cheap, high value |
+| 7 | Own MCP server for the trace | New | $0 | Low | C | Good second |
+| 8 | Local OpenAI-compat proxy | New | $0 | Medium | A | Waits for a client |
+| 9 | ACP to IDEs | New | $0 | Medium | A | Waits for a client |
+| 10 | Multi-platform bot via gateway | New | $0 | Medium | A | Waits for a choice |
+| 11 | Computer-use (real Xorg :10) | Physical | $0 | **Medium-high** | A | **Not recommended yet** |
+| 12 | Voice-in (STT) / TTS in gateway | Physical | $0 | Medium | A | After vision |
+| 14 | Memory health on the dashboard | Memory | ~$0.02 | Low | C | After OBJ-31 |
 
-**Recomendación:** pieza 1 — activar visión (tool nativo, $0) y su primer
-caso de uso: QA visual del dashboard OBJ-32, con contrato cerrado en §6.
-
----
-
-## 0. Cómo leer este mapa
-
-- **Clase C** = ejecutable hoy con tools nativos del perfil, sin installs ni
-  creds nuevas → no requiere aprobación por pieza (aplica el marco OBJ-30).
-- **Clase A-adyacente** = requiere install, credencial nueva o tocar config →
-  **aprobación por pieza** (GR5/GR7/GR9 ya lo exigen formalmente).
-- **Coste** = USD de saldo NanoGPT estimado por ciclo de uso; las piezas $0
-  consumen cuota de ventana (tokens %), no saldo. La cuota es el recurso
-  escaso real (100.05% semanal usada, reset lun 14-sep 00:00Z).
-- **Revocable** = cómo se apaga en una línea, sin dejar estado huérfano.
-- Los números del fondo actual, medidos hoy: saldo NanoGPT **$27.50**,
-  ventana OBJ-30b: gastado **$3.44 de $5.00** (warn 50% cruzado → estado
-  `warn`, la casa funciona pero sin holgura de ventana), forecast gate
-  `OK` (53.1% de cuota, ETA_90 en ~70h), 23 cron activos (de 24), board:
-  4 running / 1 ready / 11 triage / 1 blocked / 10 done / 364 archived.
+**Recommendation:** piece 1 — activate vision (native tool, $0) and its first
+use case: visual QA of the OBJ-32 dashboard, with the contract closed in §6.
 
 ---
 
-## 1. Razonamiento largo (lo que ya funciona)
+## 0. How to read this map
 
-**Estado actual — verificado hoy:**
-- **Delegación a subagentes** (delegate_task): aislamiento de contexto real,
-  en uso (p.ej. OBJ-33 corriendo como tarea hermana).
-- **Kanban como memoria de trabajo**: 385 tareas en el board, 364 archived;
-  los OBJ funcionan como contenedores de objetivo con handoff estructurado
-  (summary/metadata), dependencias parent→child y memoria entre runs.
-- **Skills**: 16 en el perfil, 14 MB — memoria procedimental que carga solo
-  cuando aplica.
-- **Herramienta base**: 52 subcomandos (`hermes --help`), incluidos
-  `mcp`, `acp`, `proxy`, `serve` — senderos ya expuestos, sin estrenar.
+- **Class C** = executable today with the profile's native tools, no installs
+  or new credentials → no per-piece approval needed (OBJ-30 framework
+  applies).
+- **Class A-adjacent** = requires an install, a new credential, or touching
+  config → **per-piece approval** (GR5/GR7/GR9 already demand it formally).
+- **Cost** = USD of NanoGPT balance estimated per usage cycle; $0 pieces
+  consume window quota (tokens %), not balance. Quota is the real scarce
+  resource (100.05% of the weekly window used, reset Mon 2026-09-14 00:00Z).
+- **Revocable** = how it is switched off in one line, leaving no orphan state.
+- Numbers of the fund today, measured today: NanoGPT balance **$27.50**,
+  OBJ-30b window: spent **$3.44 of $5.00** (50% warn crossed → state `warn`,
+  the house works but with no window slack), forecast gate `OK` (53.1% of
+  quota, ETA_90 in ~70h), 23 active crons (of 24), board: 4 running / 1 ready
+  / 11 triage / 1 blocked / 10 done / 364 archived.
 
-**Frontera concreta:** el contexto de un solo turno. Todo lo que cabe en un
-turno + skills + board funciona; lo que se necesita *entre* turnos y no vive
-en skills/board/memoria, se evapora. La memoria persistente de perfil es hoy
-**2.0 KB MEMORY + 1.3 KB USER** (~3.3 KB en total) — la menor de toda la
-casa; OBJ-31 es la tarea madre de esta frontera.
+---
 
-**Piezas candidatas:**
-- **(5) Rama de memoria por-dominio** (C): una skill `references/` por
-  dominio (quota, obs, privacy) cargable on-demand. Habilita: contexto entre
-  sesiones sin hinchar el turno. Coste: $0 (tokens de escritura).
-  Verificación: la skill carga y responde a una pregunta de dominio.
-  Revocable: borrar el dir. **Dependencia: OBJ-31 fija el formato** —
-  no empezarla antes.
-- **(6) Higiene del hueco** (C): el trace dice que el **100% del gasto
-  con coste ($17.69) es `unattributed`** — 1,040 de 1,419 líneas sin tag
-  `objective:`. El dashboard lo muestra en rojo (correcto: el hueco se
-  muestra, no se esconde), pero sin etiquetas no hay presupuesto por
-  objetivo posible (OBJ-28 necesita esto). Coste ~$0.05. Verificación:
-  % del hueco < 20% en el dashboard (su propio umbral). Revocable: quitar
-  el tag del creator. **Dependencia: OBJ-27 F0/F4b estabilizadas.**
+## 1. Long reasoning (what already works)
 
-## 2. Capacidades físicas
+**Current state — verified today:**
+- **Delegation to subagents** (delegate_task): real context isolation,
+  in use (e.g. OBJ-33 running as a sister task).
+- **Kanban as working memory**: 385 tasks on the board, 364 archived; OBJs
+  work as objective containers with structured handoff (summary/metadata),
+  parent→child dependencies, and memory across runs.
+- **Skills**: 16 in the profile, 14 MB — procedural memory that loads only
+  when it applies.
+- **Base tool**: 52 subcommands (`hermes --help`), including `mcp`, `acp`,
+  `proxy`, `serve` — paths already exposed, never used.
 
-**Estado actual — verificado hoy:**
-- **Browser** (browser_exec, Chromium headless via CDP): funcional —
-  navega file:// y http, DOM legible, screenshots.
-- **Visión** (vision_analyze): **funcional**. Probe E2E real: un PNG
-  sintético (114 bytes) generado en workspace → respuesta correcta (bloque
-  rojo, área estimada 30-35%, real 31%). Sin install ni cred nueva.
-- **TTS** (text_to_speech, provider edge): **funcional**, gratis, sin
-  cred — mp3 en cache de audio del perfil.
-- **Computer-use** (cua-driver): tool **presente** en el catálogo;
-  **Xorg real en :10** (xrdp) — hardware presente, tool no estrenada.
-- **STT/voz-in**: sin canal hoy (gateway sin wiring de audio-in).
+**Concrete frontier:** the single-turn context. Everything that fits in one
+turn + skills + board works; what is needed *between* turns and does not live
+in skills/board/memory evaporates. The profile's persistent memory is today
+**2.0 KB MEMORY + 1.3 KB USER** (~3.3 KB total) — the smallest of the whole
+house; OBJ-31 is the mother task of this frontier.
 
-**Frontera concreta:** la casa ve y habla (probes verificados), pero
-ninguna de las dos capacidades tiene *primer caso de uso real* integrado a
-un flujo de la casa. Computer-use existe pero sin contrato de riesgo.
+**Candidate pieces:**
+- **(5) Per-domain memory branch** (C): one `references/` skill per domain
+  (quota, obs, privacy), loadable on demand. Enables: cross-session context
+  without bloating the turn. Cost: $0 (writing tokens). Verification: the
+  skill loads and answers a domain question. Revocable: delete the dir.
+  **Dependency: OBJ-31 fixes the format** — do not start it before.
+- **(6) Gap hygiene** (C): the trace says **100% of the spend with cost
+  ($17.69) is `unattributed`** — 1,040 of 1,419 lines without an
+  `objective:` tag. The dashboard shows it in red (correct: the gap is
+  shown, not hidden), but without tags, per-objective budgeting is
+  impossible (OBJ-28 needs this). Cost ~$0.05. Verification: gap % < 20% on
+  the dashboard (its own threshold). Revocable: remove the tag from the
+  creator. **Dependency: OBJ-27 F0/F4b stabilized.**
 
-**Piezas candidatas:**
-- **(1) Visión para QA visual del dashboard (OBJ-32)** — evaluada en
-  detalle en §6. Recomendada.
-- **(2) QA visual E2E con screenshots** (C): pipeline completo
-  browser→screenshot→vision_analyze, probado hoy en sesión aislada
-  (`obj34-iso`): render file:// del dashboard (1265×1103 px) → captura →
-  análisis correcto (título, secciones, defectos). Coste $0. Habilita:
-  que OBJ-32 v1 (HTML consultable) tenga QA visual periódico y barato sin
-  tocar la base. Verificación: un defecto sembrado en un fixture HTML se
-  detecta en el análisis. Revocable: borrar la skill.
-- **(3) Visión por HTTP** (A-adyacente: toca config → GR7): payload
-  imagen→proveedor de visión, ~$0.01/req, ~$0.10-0.30/ventana. Solo si el
-  tool nativo queda corto. Revocable: revertir la línea de config.
-- **(11) Computer-use** (A): tool presente + Xorg :10 real. Habilita QA de
-  apps nativas, automatización de GUI. Riesgo medio-alto (es la pieza con
-  más poder de acción física sobre el host; y `xrdp` = superficie de
-  acceso remoto). Contrato mínimo: sesión `--print` y dry-run primero,
-  never-login, sandboxed session, revocable = no invocar. **No
-  recomendar aún**: es la única pieza del mapa que merece su propia
-  evaluación de riesgo antes de un primer caso de uso. Post-visión.
-- **(12) Voice-in/TTS en gateway** (A): STT a gateway (WhatsApp/Telegram
-  de la casa) → respuestas habladas. Coste $0-0.05. Riesgo: medio (superficie
-  de mensajería). Verificación: un audio de prueba → transcripción en el log
-  del gateway. Revocable: desactivar el cron/gateway wiring. Tras visión.
+## 2. Physical capabilities
 
-## 3. Memoria (con OBJ-31)
+**Current state — verified today:**
+- **Browser** (browser_exec, headless Chromium via CDP): functional —
+  navigates file:// and http, readable DOM, screenshots.
+- **Vision** (vision_analyze): **functional**. Real E2E probe: a synthetic
+  PNG (114 bytes) generated in the workspace → correct answer (red block,
+  estimated area 30-35%, actual 31%). No install, no new credential.
+- **TTS** (text_to_speech, edge provider): **functional**, free, no
+  credential — mp3 in the profile's audio cache.
+- **Computer-use** (cua-driver): tool **present** in the catalog; **real
+  Xorg on :10** (xrdp) — hardware present, tool never used.
+- **STT/voice-in**: no channel today (gateway has no audio-in wiring).
 
-**Estado actual — verificado hoy:** memories/ = 2 archivos planos,
-3.3 KB total, sin locking real (locks `.lock` presentes), sin rotación,
-sin per-dominio. El dashboard mide casa (gasto/board/forecast) pero nada
-mide la salud de la memoria.
+**Concrete frontier:** the house sees and speaks (verified probes), but
+neither capability has a *real first use case* integrated into a house flow.
+Computer-use exists but with no risk contract.
 
-**Frontera concreta:** sin curación, la memoria crece hasta golpear su
-límite duro de chars (el prompt del sistema ya avisa "94% / 95% full" en
-cada turno). Sin per-dominio, cada sesión paga contexto irrelevante.
+**Candidate pieces:**
+- **(1) Vision for visual QA of the dashboard (OBJ-32)** — evaluated in
+  detail in §6. Recommended.
+- **(2) E2E visual QA with screenshots** (C): full pipeline
+  browser→screenshot→vision_analyze, probed today in an isolated session
+  (`obj34-iso`): file:// render of the dashboard (1265×1103 px) → capture →
+  correct analysis (title, sections, defects). Cost $0. Enables: OBJ-32 v1
+  (queryable HTML) getting periodic, cheap visual QA without touching the
+  base. Verification: a seeded defect in an HTML fixture is detected in the
+  analysis. Revocable: delete the skill.
+- **(3) Vision over HTTP** (A-adjacent: touches config → GR7): image→vision
+  provider payload, ~$0.01/req, ~$0.10-0.30/window. Only if the native tool
+  falls short. Revocable: revert the config line.
+- **(11) Computer-use** (A): tool present + real Xorg :10. Enables QA of
+  native apps, GUI automation. Medium-high risk (it is the piece with the
+  most physical action power over the host; and `xrdp` = a remote-access
+  surface). Minimal contract: `--print` session and dry-run first,
+  never-login, sandboxed session, revocable = do not invoke. **Not
+  recommended yet**: it is the only piece of the map that deserves its own
+  risk evaluation before a first use case. Post-vision.
+- **(12) Voice-in/TTS in gateway** (A): STT into the gateway (the house's
+  WhatsApp/Telegram) → spoken replies. Cost $0-0.05. Risk: medium
+  (messaging surface). Verification: a test audio → transcription in the
+  gateway log. Revocable: disable the cron/gateway wiring. After vision.
 
-**Piezas candidatas:**
-- **(14) Salud de memoria en el dashboard** (C, tras OBJ-31): cuando
-  OBJ-31 aterrice, un mapa de salud de memoria en el dashboard OBJ-32
-  (bytes, % lleno, última rotación) es una pieza natural y barata:
-  1 sección en el generador + 1 test. Coste ~$0.02. Verificación: sección
-  visible con datos reales. Revocable: quitar la sección del generador.
-- La **curación y rotación en sí** es OBJ-31 — no se duplica aquí, solo se
-  referencia (out of scope de esta tarea).
+## 3. Memory (with OBJ-31)
 
-## 4. Senderos no explorados
+**Current state — verified today:** memories/ = 2 flat files, 3.3 KB total,
+no real locking (`.lock` files present), no rotation, no per-domain. The
+dashboard measures the house (spend/board/forecast) but nothing measures
+memory health.
 
-**Estado actual — verificado hoy:** `hermes --help` lista 52 subcomandos.
-Del catálogo de tools diferidas del sistema, estos senderos existen y están
-sin estrenar en la casa:
+**Concrete frontier:** without curation, memory grows until it hits its hard
+char limit (the system prompt already warns "94% / 95% full" every turn).
+Without per-domain, every session pays for irrelevant context.
 
-| Sendero | Qué habilita | Clase | Coste |
+**Candidate pieces:**
+- **(14) Memory health on the dashboard** (C, after OBJ-31): once OBJ-31
+  lands, a memory-health map on the OBJ-32 dashboard (bytes, % full, last
+  rotation) is a natural, cheap piece: 1 section in the generator + 1 test.
+  Cost ~$0.02. Verification: visible section with real data. Revocable:
+  remove the section from the generator.
+- **Curation and rotation themselves are OBJ-31** — not duplicated here,
+  only referenced (out of scope of this task).
+
+## 4. Unexplored paths
+
+**Current state — verified today:** `hermes --help` lists 52 subcommands.
+From the system's deferred tool catalog, these paths exist and are unused in
+the house:
+
+| Path | What it enables | Class | Cost |
 |---|---|---|---|
-| **(7) MCP server propio** | El trace/board/skills de la casa consultables desde cualquier cliente MCP externo | C | $0 |
-| **(8) Proxy OpenAI-compat** | Cualquier cliente OpenAI-SDK habla con los proveedores de la casa | A | $0 |
-| **(9) ACP a IDEs** | Hermes como ACP server dentro de un IDE (Zed, etc.) | A | $0 |
-| **(10) Bot multi-plataforma vía gateway** | WhatsApp/Slack/etc. de la casa con la misma casa detrás | A | $0 |
+| **(7) Own MCP server** | The house's trace/board/skills queryable from any external MCP client | C | $0 |
+| **(8) OpenAI-compat proxy** | Any OpenAI-SDK client talks to the house's providers | A | $0 |
+| **(9) ACP to IDEs** | Hermes as an ACP server inside an IDE (Zed, etc.) | A | $0 |
+| **(10) Multi-platform bot via gateway** | The house's WhatsApp/Slack/etc. with the same house behind it | A | $0 |
 
-**Frontera concreta:** cuatro senderos expuestos, cero estrenados. Ninguno
-tiene un cliente concreto hoy — son capacidad sin demanda, y la regla de la
-casa es no acumular tools sin caso de uso. Se listan para que Andrew vea
-el sendero completo; la recomendación es **no abrirlos** hasta que exista
-el primer cliente real.
+**Concrete frontier:** four paths exposed, zero used. None has a concrete
+client today — they are capacity without demand, and the house rule is not
+to accumulate tools without a use case. They are listed so Andrew sees the
+full path; the recommendation is **not to open them** until the first real
+client exists.
 
-**Criterio de apertura:** existe un cliente concreto (IDE usado, bot que
-se quiere, cliente MCP que se quiere) → se abre su pieza con contrato;
-sin cliente, no se abre.
+**Opening criterion:** a concrete client exists (an IDE in use, a bot that
+is wanted, an MCP client that is wanted) → open its piece with a contract;
+without a client, it does not open.
 
-## 5. Cuidado — el contrato de cada pieza nueva
+## 5. Care — the contract of every new piece
 
-Toda pieza que entre al fondo hereda el formato de OBJ-30 (y GR5/GR7/GR9
-ya lo exigen formalmente para A-adyacentes):
+Every piece that enters the fund inherits the OBJ-30 format (and GR5/GR7/GR9
+already demand it formally for A-adjacent pieces):
 
-1. **Coste declarado** — USD de saldo estimado por ciclo + moneda
-   (saldo vs cuota %).
-2. **Criterio verificable** — una frase que un tercero puede comprobar
-   (como los probes de hoy: un PNG sintético, un fixture HTML con defecto
-   sembrado).
-3. **Revocable** — una línea que lo apaga sin estado huérfano.
+1. **Declared cost** — estimated USD of balance per cycle + currency
+   (balance vs quota %).
+2. **Verifiable criterion** — one sentence a third party can check (like
+   today's probes: a synthetic PNG, an HTML fixture with a seeded defect).
+3. **Revocable** — one line that switches it off with no orphan state.
 
-**Mecanismo:** las piezas se proponen en triage con estos tres campos en el
-body; el creator las rechaza si faltan (misma mecánica GR5/GR9). El forecast
-gate y burn watchdog siguen siendo los límites duros; una pieza $0 igual
-paga cuota, así que *toda* pieza entra con presupuesto de cuota declarado.
-
----
-
-## 6. Evaluación detallada: visión para QA visual del dashboard (OBJ-32)
-
-**Candidata señalada por la tarea** como primer caso de prueba del marco.
-**Evaluación con probes reales de hoy:**
-
-- **Tool nativo funcional** — `vision_analyze` (perfil pr-ollama) responde
-  correcto a un PNG sintético (bloque rojo: estimó 30-35% del área, real
-  31%). Sin installs, sin creds nuevas.
-- **Pipeline E2E probado** — browser aislado (sesión `obj34-iso`) →
-  file://dashboard.html (1265×1103 px) → screenshot → análisis correcto:
-  título, secciones (KPIs, gasto por clase, gasto por objetivo, forecast,
-  board), defectos detectados. **El probe ya produjo 2 hallazgos reales de
-  v0**: el título del panel "GASTO — POR CLASE DE CONSUMO" rompe feo en 3
-  líneas; y "presupuesto:" sin valor visible junto al badge warn en la
-  tarjeta de saldo. QA visual clásico — el pipeline funcionó a la primera.
-- **Criterio verificable:** un defecto sembrado en un fixture HTML se
-  detecta en el análisis.
-- **Coste: $0** de saldo (cuota de tokens; sin calls pagados).
-- **Privacidad: baja** — las capturas viven en tmp local
-  (~/.config/browser-harness/tmp/) y van al proveedor de visión solo para
-  analizar; el dashboard es localhost-only por diseño (bind 127.0.0.1) y
-  el HTML no contiene credenciales (verificado en el probe: solo métricas).
-- **Revocable:** la skill QA es un dir — `rm -r`; el tool nativo no se
-  desinstala porque no se instaló nada.
-
-**Veredicto:** primera pieza. $0, riesgo bajo, caso de uso concreto
-(dashboard OBJ-32), pipeline ya verificado E2E y con 2 hallazgos reales el
-primer día. La decisión final es de Andrew.
-
-### 6b. Presupuesto propuesto
-
-**Pieza 1 (visión QA dashboard):** $0 de saldo, ~1-2% de cuota semanal
-(los probes de hoy costaron $0 y un ciclo QA completo ≈ 3-5 requests).
-**Presupuesto propuesto para la ventana:** $0.50 de saldo como margen para
-imprevistos + cap de cuota: si el ciclo QA supera 5 requests o $0.20,
-STOP duro y reportar. Revocable: no re-agendar el ciclo QA (cron opcional),
-sin estado huérfano.
+**Mechanism:** pieces are proposed in triage with these three fields in the
+body; the creator rejects them if missing (same GR5/GR9 mechanics). The
+forecast gate and burn watchdog remain the hard limits; a $0 piece still
+pays quota, so *every* piece enters with a declared quota budget.
 
 ---
 
-## 7. Método (los probes de hoy, replicables)
+## 6. Detailed evaluation: vision for visual QA of the dashboard (OBJ-32)
 
-Todos los datos de este doc salen de probes de hoy (10-sep), reproducibles:
+**Candidate flagged by the task** as the framework's first test case.
+**Evaluated with live probes today:**
 
-- **Board/estado**: sqlite RO sobre `~/.hermes/kanban.db` (385 tareas:
+- **Native tool functional** — `vision_analyze` (pr-ollama profile) answers
+  correctly to a synthetic PNG (red block: estimated 30-35% of the area,
+  actual 31%). No installs, no new credentials.
+- **E2E pipeline probed** — isolated browser (session `obj34-iso`) →
+  file://dashboard.html (1265×1103 px) → screenshot → correct analysis:
+  title, sections (KPIs, spend by class, spend by objective, forecast,
+  board), defects detected. **The probe already produced 2 real v0
+  findings**: the "GASTO — POR CLASE DE CONSUMO" panel title wraps badly
+  into 3 lines; and "presupuesto:" with no visible value next to the warn
+  badge on the balance card. Classic visual QA — the pipeline worked on the
+  first try.
+- **Verifiable criterion:** a seeded defect in an HTML fixture is detected
+  in the analysis.
+- **Cost: $0** of balance (token quota; no paid calls).
+- **Privacy: low** — captures live in local tmp
+  (~/.config/browser-harness/tmp/) and go to the vision provider only for
+  analysis; the dashboard is localhost-only by design (binds 127.0.0.1) and
+  the HTML contains no credentials (verified in the probe: metrics only).
+- **Revocable:** the QA skill is a dir — `rm -r`; the native tool is not
+  uninstalled because nothing was installed.
+
+**Verdict:** first piece. $0, low risk, concrete use case (OBJ-32
+dashboard), pipeline already verified E2E with 2 real findings on day one.
+The final decision is Andrew's.
+
+### 6b. Proposed budget
+
+**Piece 1 (dashboard vision QA):** $0 of balance, ~1-2% of weekly quota
+(today's probes cost $0 and a full QA cycle ≈ 3-5 requests).
+**Proposed window budget:** $0.50 of balance as a margin for the unexpected
++ quota cap: if the QA cycle exceeds 5 requests or $0.20, hard STOP and
+report. Revocable: do not re-schedule the QA cycle (optional cron), no
+orphan state.
+
+---
+
+## 7. Method (today's probes, replicable)
+
+Every number in this doc comes from today's (2026-09-10) probes, reproducible:
+
+- **Board/state**: read-only sqlite over `~/.hermes/kanban.db` (385 tasks:
   4 running / 1 ready / 11 triage / 1 blocked / 10 done / 364 archived).
-- **Fondo**: `quota-governor/*.json` (budget-state, forecast, spending-limit)
-  + `nanogpt-balance-ledger.jsonl` (saldo $27.50, ventana $3.44/$5.00).
-- **Trace**: 1,419 líneas OBJ-27 F0 — 100% del gasto con coste es
-  unattributed; clase cron-llm = $17.69 (100%); día más caro 09-sep $2.67.
-- **Visión**: PNG sintético (114 B, stdlib) → análisis correcto (30-35%
-  estimado vs 31% real).
-- **Browser E2E**: dashboard file:// en sesión aislada → screenshot →
-  análisis (2 defectos reales de v0 encontrados).
-- **TTS**: provider edge, gratis, mp3 en audio-cache del perfil.
-- **Xorg**: `pgrep Xorg` → :0 (lightdm) y :10 (xrdp) activos.
-- **Herramienta base**: `hermes --help` (52 subcomandos); `mcp`, `acp`,
-  `proxy`, `serve` expuestos sin estrenar.
-- **Cron**: 24 jobs (23 activos + 1 disabled), en `cron/jobs.json`.
+- **Fund**: `quota-governor/*.json` (budget-state, forecast, spending-limit)
+  + `nanogpt-balance-ledger.jsonl` (balance $27.50, window $3.44/$5.00).
+- **Trace**: 1,419 lines OBJ-27 F0 — 100% of spend with cost is
+  unattributed; cron-llm class = $17.69 (100%); priciest day 2026-09-09
+  $2.67.
+- **Vision**: synthetic PNG (114 B, stdlib) → correct analysis (30-35%
+  estimated vs 31% actual).
+- **Browser E2E**: dashboard file:// in an isolated session → screenshot →
+  analysis (2 real v0 defects found).
+- **TTS**: edge provider, free, mp3 in the profile's audio cache.
+- **Xorg**: `pgrep Xorg` → :0 (lightdm) and :10 (xrdp) active.
+- **Base tool**: `hermes --help` (52 subcommands); `mcp`, `acp`, `proxy`,
+  `serve` exposed, never used.
+- **Cron**: 24 jobs (23 active + 1 disabled), in `cron/jobs.json`.
 
-*Un doc de la casa: cada número de §7 se puede verificar con los mismos
-probes.*
+*A house doc: every number in §7 can be verified with the same probes.*
