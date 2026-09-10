@@ -98,7 +98,12 @@ FORECAST_COLCHON_H = 2.0
 # Guardrail G1: only these profiles may receive auto-created tasks.
 # The autonomous task creator must NEVER assign to any other profile.
 # pr-opencode added in MULTI-PROV-06 (OpenCode Go provider).
-ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-opencode"}
+# OBJ-40 (Sep 10 2026, user-approved): pr-vllm joins ALLOWED_PROFILES — the
+# $0 confidential worker (Qwen2.5-7B-FP8 self-hosted on ml-host). Its quota
+# is GPU capacity, not API: the probe reports availability from
+# /data/ml/data/hermes/logs/gpu-health.log (temp/throttle) instead of a
+# provider API.
+ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-opencode", "pr-vllm"}
 
 # ---------------------------------------------------------------------------
 # Privacy capability mapping (Phase 2 — privacy-by-provider-design.md §4, §7)
