@@ -8,6 +8,7 @@ el board real — DB fixture en tmp).
 """
 import importlib.util
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -135,6 +136,9 @@ class TestDryRunRealBoard(unittest.TestCase):
     def test_board_real_solo_lectura(self):
         # el board real existe: evaluate en modo observe no debe fallar
         # ni mutar (usa el forecast real, que puede estar vacío)
+        if not os.path.exists(bc.KANBAN_DB):
+            # live host board is the subject under test; absent on CI
+            self.skipTest("no live kanban.db (fresh clone / CI)")
         decisions = bc.evaluate(forecast=bc.load_forecast(), enforce=False)
         self.assertIsInstance(decisions, list)
 

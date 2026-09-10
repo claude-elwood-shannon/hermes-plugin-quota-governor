@@ -395,9 +395,16 @@ def check_other_repos(text: str) -> GuardrailResult:
 
     for match in OTHER_REPOS_PATTERN.finditer(text):
         path = match.group(0)
-        # Ensure it's not just the plugin repo itself
-        # (the regex already excludes it, but double-check)
-        if "hermes-plugin-quota-governor" not in path:
+        # Exclude the plugin repo itself, layout-independently: compare the
+        # FIRST path component under REPOS_ROOT (a substring check breaks
+        # when the checkout parent dir is named like the repo — e.g. GitHub
+        # Actions' .../work/<repo>/<repo> layout).
+        try:
+            rel = os.path.relpath(path, REPOS_ROOT)
+            top = Path(rel).parts[0] if rel != "." else ""
+        except ValueError:
+            top = ""
+        if top != "hermes-plugin-quota-governor":
             result.allowed = False
             result.violations.append(Violation(
                 id="GR10",

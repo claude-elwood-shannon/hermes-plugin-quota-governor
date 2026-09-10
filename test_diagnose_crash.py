@@ -39,10 +39,13 @@ from datetime import datetime, timezone
 SCRIPT_PATH = os.path.expanduser("~/.hermes/scripts/diagnose-crash.py")
 
 if not os.path.exists(SCRIPT_PATH):
-    raise SystemExit(
+    skip = (
         "SKIP: deployed diagnose-crash.py not found (fresh clone / CI) — "
         "nothing to test on this machine"
     )
+    print(skip)
+    # host verify runs want this loud; CI wants green
+    raise SystemExit(1 if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1" else 0)
 
 # Import with filename-based module
 import importlib.util

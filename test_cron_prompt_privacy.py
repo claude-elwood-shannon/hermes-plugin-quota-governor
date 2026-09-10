@@ -54,8 +54,11 @@ print("--- Test: active cron prompt wires OBJ-18 Phase 4 (privacy routing) ---")
 jobs_path = next((p for p in CANDIDATE_JOBS if os.path.isfile(p)), None)
 check("jobs.json found", jobs_path is not None, f"tried {CANDIDATE_JOBS}")
 if jobs_path is None:
-    print(f"\nResults: {passed} passed, {failed} failed")
-    sys.exit(1)
+    # the LIVE cron config of this host is the subject under test; on a
+    # fresh clone / CI it does not exist — skip instead of failing
+    loud = os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1"
+    print("SKIP: no live cron jobs.json (fresh clone / CI)" + ("" if loud else " — host-only test"))
+    sys.exit(1 if loud else 0)
 
 try:
     data = json.load(open(jobs_path))

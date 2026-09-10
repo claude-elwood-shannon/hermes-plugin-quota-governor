@@ -28,6 +28,11 @@ CAPTURE = os.environ.get(
     "NANO_GPT_PRICING_CAPTURE",
     os.path.expanduser("~/.hermes/hermes-agent/agent/nanogpt_pricing_capture.py"))
 
+if not os.path.exists(CAPTURE):
+    # deployed hermes-agent checkout (not part of this repo); skip on CI
+    print("SKIP: deployed nanogpt_pricing_capture.py not found (fresh clone / CI)")
+    raise SystemExit(1 if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1" else 0)
+
 _spec = importlib.util.spec_from_file_location("nanogpt_balance_ledger", SCRIPT)
 ledger = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ledger)

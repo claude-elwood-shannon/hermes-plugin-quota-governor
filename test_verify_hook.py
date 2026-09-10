@@ -38,6 +38,11 @@ VERIFY_TASK_SCRIPT = os.environ.get(
     "VERIFY_TASK_SCRIPT",
     os.path.join(os.path.expanduser("~"), ".hermes", "scripts", "verify-task.py"))
 
+if not os.path.exists(VERIFY_TASK_SCRIPT):
+    # deployed script (not part of this repo); skip on CI / fresh clones
+    print("SKIP: deployed verify-task.py not found (fresh clone / CI)")
+    raise SystemExit(1 if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1" else 0)
+
 # Also set the verifications file to the test home
 # verify-task.py uses ~/.hermes/quota-governor/verifications.jsonl
 # We need to override HOME to isolate
