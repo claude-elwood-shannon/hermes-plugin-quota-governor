@@ -831,7 +831,15 @@ def query_opencode_go():
 # Profile → default model mapping (from config.yaml of each profile)
 PROFILE_MODELS = {
     "pr-ollama": "glm-5.2",
-    "pr-nanogpt": "zai-org/glm-5.2",
+    # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.2 approved by the user in
+    # t_bef3cbf0): zai-org/glm-5.2 -> z-ai/glm-5.3-flash for interactive.
+    # Data: z-ai/glm-5.3-flash $0.075/$0.25 USD/M in/out, subscription-covered
+    # STABLE (x_nanogpt_pricing.costUsd == 0 on every measured call — probes
+    # 10.2 §4.3 + cost study 10.3 §5.1), while zai-org/glm-5.2 has DYNAMIC
+    # coverage (costUsd flipped 0 -> >0 within 20 minutes on Sep 7 2026 —
+    # "on the subscription list" != "covered").  4-5x cheaper than glm-5.2
+    # ($0.42/$1.32).
+    "pr-nanogpt": "z-ai/glm-5.3-flash",
     "pr-openrouter": "z-ai/glm-5.2:free",
     "pr-opencode": "glm-5.3-flash",  # opencode-go provider, MULTI-PROV-06
 }
@@ -844,25 +852,41 @@ PROFILE_MODELS = {
 # for interactive sessions and tasks tagged cost:medium or above.
 #
 # Measured per-million prices (USD):
-#   pr-opencode:  glm-5.2 $1.40/$4.40  vs  qwen3.8-flash $0.15/$0.47 (~9x cheaper)
-#   pr-ollama:    glm-5.2 $1.40/$4.40  vs  deepseek-v4-flash $0.22/M
-#   pr-nanogpt:   zai-org/glm-5.2 $0.42/$1.32 interactive vs z-ai/glm-5.3-flash
-#                 $0.075/$0.25 worker (subscription-covered, proven Sep 8 2026
-#                 by worker t_154b29f2 — 5.6x/5.3x cheaper)
+#   pr-opencode:  glm-5.3-flash $0.15/$0.50 interactive  vs  qwen3.8-flash
+#                 $0.15/$0.47 worker (~9x cheaper than glm-5.2 was)
+#   pr-ollama:    glm-5.2 $1.40/$4.40  vs  gpt-oss:20b $0.07/$0.30 worker
+#                 (MULTI-PROV-10.5 Sep 10 2026; deepseek-v4-flash $0.22/$0.66
+#                 demoted — peak x2 in EU working hours)
+#   pr-nanogpt:   z-ai/glm-5.3-flash $0.075/$0.25 interactive AND worker
+#                 (subscription-covered, proven Sep 8 2026 by worker
+#                 t_154b29f2; interactive pin switched Sep 10 2026, §6.2)
 #
 # INTERACTIVE MODEL WARNING (Sep 7 2026, verified live — OpenCode Go console):
 # glm-5.2 via opencode-go burned 82% of the 5h window alone ($9.84 of $12)
 # while the worker (qwen3.8-flash) used 7.5% and glm-5.3-flash 3.6%.  The
 # pr-opencode interactive model is therefore glm-5.3-flash, NOT glm-5.2.
 # glm-5.2 stays interactive for pr-ollama (Ollama Cloud Pro window is wider).
+# MULTI-PROV-10.5 (Sep 10 2026, matrix §6.2): pr-nanogpt interactive is now
+# z-ai/glm-5.3-flash (stable coverage), replacing zai-org/glm-5.2 whose
+# subscription coverage is dynamic (billed balance intermittently).
 #
 # PITFALL (verified live, MULTI-PROV-07 diagnostic): deepseek-v4-flash via
 # OpenCode Go returns RegionError 403 (China-hosted, requires explicit
-# account opt-in).  It is therefore ONLY usable as pr-ollama's worker model,
-# NEVER as pr-opencode's.  minimax-m2.7 on OpenCode Go fails with Internal
-# server error — also not usable.
+# account opt-in).  It is therefore usable ONLY via ollama-cloud (pr-ollama),
+# NEVER as pr-opencode's.  Since MULTI-PROV-10.5 (Sep 10 2026) it is no
+# longer pr-ollama's worker pin either (gpt-oss:20b is) but stays callable
+# on ollama-cloud as a fallback.  minimax-m2.7 on OpenCode Go fails with
+# Internal server error — also not usable.
 PROFILE_WORKER_MODELS = {
-    "pr-ollama": "deepseek-v4-flash",       # $0.22/M
+    # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.1 approved by the user in
+    # t_bef3cbf0): deepseek-v4-flash -> gpt-oss:20b for cheap workers.
+    # Data: gpt-oss:20b $0.07/$0.30 USD/M in/out, NO peak pricing, probe
+    # 200 OK (10.2 §4.2), $0.000028/micro-call measured (10.3 §5.2) — 3x
+    # cheaper than deepseek off-peak and 6x during DeepSeek peak windows
+    # (price x2 Mon-Fri 12:00-18:00 UTC = EU working hours, MULTI-PROV-07).
+    # deepseek-v4-flash ($0.22/$0.66, peak x2) remains callable on
+    # ollama-cloud (19/19 models OK) as fallback.
+    "pr-ollama": "gpt-oss:20b",             # $0.07/$0.30/M, no peak pricing
     "pr-nanogpt": "z-ai/glm-5.3-flash",     # Sep 8 2026: subscription-COVERED (proven by
                                             # worker t_154b29f2, run 407 — no HTTP 402, real
                                             # artifacts in workspace).  Probe 8-sep 00:55 CEST:
@@ -918,8 +942,8 @@ def peak_pricing_context(now=None):
         "affected_models": PEAK_AFFECTED_MODELS if active else {},
         "note": (
             "DeepSeek models double in price during peak hours. Current "
-            "worker models (qwen3.8-flash, glm-5.2, glm-5.3-flash) have no "
-            "peak pricing."
+            "worker models (gpt-oss:20b, qwen3.8-flash, z-ai/glm-5.3-flash) "
+            "have no peak pricing."
         ),
     }
 
