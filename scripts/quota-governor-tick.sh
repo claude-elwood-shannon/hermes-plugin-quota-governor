@@ -294,6 +294,30 @@ if [[ -n "$KILL_NOTICE" ]]; then
     log "$KILL_NOTICE"
 fi
 
+# ── Cola viva (OBJ-30b-IMPL, t_31b9c1d2): constitution of flight, clause 3 ──
+# When the board is idle (live_workers==0) and quota is free (session AND
+# weekly < 80%) and no STOP, refill the queue with LEGITIMATE work (assign a
+# ready-without-assignee, or create ONE structural class-C successor of a
+# recent done task). Never filler. Zero tokens. One line per decision.
+# Only executes when the tick decided 'run' (not stop/paying) — the script's
+# own quota gates are the backstop.
+COLA_VIVA_EXEC=""
+if [[ "$ACTION" == "run" ]]; then
+    COLA_VIVA_EXEC="--execute"
+fi
+COLA_VIVA_OUTPUT=$(HERMES_HOME="$HERMES_HOME" \
+    HERMES_KANBAN_DB="${HERMES_KANBAN_DB:-}" \
+    python3 "$PLUGIN_DIR/scripts/tick-cola-viva.py" \
+    --session-pct "$SESSION_PCT" \
+    --weekly-pct "$WEEKLY_PCT" \
+    --live-workers "$LIVE_COUNT" \
+    --action "$ACTION" \
+    $COLA_VIVA_EXEC 2>/dev/null) || true
+if [[ -n "$COLA_VIVA_OUTPUT" ]]; then
+    echo "$COLA_VIVA_OUTPUT"
+    log "Cola viva: $COLA_VIVA_OUTPUT"
+fi
+
 # Daemon management
 DAEMON_NEEDS_ACTION=false
 
