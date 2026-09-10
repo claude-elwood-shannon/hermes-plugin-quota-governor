@@ -44,12 +44,34 @@ OBSERVER-ONLY: collectors only READ existing files/DBs and APPEND to the
 trace. They never modify the sources, never touch Hermes core, and never
 raise into a caller (every public helper fails open).
 
+F3 RETENTION / ROTATION (the trace must not grow without limit)
+---------------------------------------------------------------
+The active file holds a bounded window; history is never destroyed, only
+compacted. ``enforce_retention()`` (CLI: ``retention``, ``--dry-run`` to
+preview) moves rows older than keep_days — plus the oldest overflow
+beyond max_lines — into a gzip archive (obs/archive/trace-<stamp>.jsonl.gz,
+write-ahead, then atomic os.replace of the active file) and GCs archives
+beyond keep_archives. Defaults: 14 days / 100k lines / 12 archives,
+overridable via QUOTA_GOVERNOR_TRACE_{KEEP_DAYS,MAX_LINES,KEEP_ARCHIVES}.
+
+THE CURSOR IS SACRED: rotation never reads, writes or removes
+trace-cursor.json. The collector cursor is a per-source timestamp
+watermark, independent of the active file's contents, so idempotency
+survives rotation (test: collect -> rotate -> collect appends nothing
+twice). Corrupt lines and rows without a parseable ts are preserved in
+the active file — never silently dropped.
+
+doctor() reports the trace's size and age (trace_bytes, oldest/newest
+epoch, age_days), the effective policy, the archives, and
+needs_rotation=True when the bounds are already exceeded.
+
 Portability: paths resolve through get_hermes_home() (HERMES_HOME env or
 ~/.hermes). No absolute host paths in the repo. Times are epoch UTC.
 """
 from __future__ import annotations
 
 import datetime as dt
+import gzip
 import json
 import os
 import sqlite3
@@ -455,11 +477,209 @@ def run_collectors(hermes_home=None, kanban_db=None) -> dict:
     return counts
 
 
+# ---------------------------------------------------------------------------
+# F3: retention / rotation (the trace must not grow without limit)
+# ---------------------------------------------------------------------------
+
+DEFAULT_KEEP_DAYS = 14.0     # time window: rows older than this are archived
+DEFAULT_MAX_LINES = 100_000  # hard cap on active-file rows (overflow archived)
+DEFAULT_KEEP_ARCHIVES = 12   # archive GC: keep at most N .jsonl.gz files
+
+_ENV_KEEP_DAYS = "QUOTA_GOVERNOR_TRACE_KEEP_DAYS"
+_ENV_MAX_LINES = "QUOTA_GOVERNOR_TRACE_MAX_LINES"
+_ENV_KEEP_ARCHIVES = "QUOTA_GOVERNOR_TRACE_KEEP_ARCHIVES"
+
+
+def archive_dir(hermes_home=None) -> Path:
+    """Rotated archives live here: obs/archive/trace-<stamp>.jsonl.gz."""
+    return obs_dir(hermes_home) / "archive"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = float(os.environ.get(name, "").strip())
+        return v if v >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(os.environ.get(name, "").strip())
+        return v if v >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def retention_policy(hermes_home=None) -> dict:
+    """Effective policy: env overrides over the built-in defaults."""
+    return {
+        "keep_days": _env_float(_ENV_KEEP_DAYS, DEFAULT_KEEP_DAYS),
+        "max_lines": _env_int(_ENV_MAX_LINES, DEFAULT_MAX_LINES),
+        "keep_archives": _env_int(_ENV_KEEP_ARCHIVES,
+                                  DEFAULT_KEEP_ARCHIVES),
+    }
+
+
+def _read_trace_lines(path: Path) -> tuple:
+    """(good_rows, bad_lines) in file order. Never raises."""
+    rows, bad = [], []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    bad.append(line)
+    except OSError:
+        pass
+    return rows, bad
+
+
+def _plan_eviction(rows: list, keep_days: float, max_lines: int,
+                   now: float) -> tuple:
+    """Split rows into (keep, evict) under window + cap policy.
+
+    Window rule: ts < now - keep_days*86400 is evicted — EXCEPT rows
+    without a parseable ts (None), which are never window-evicted (the
+    trace never silently drops what it cannot date). Cap rule: when the
+    survivor count still exceeds max_lines, the OLDEST survivors are
+    evicted until the file holds exactly the newest max_lines rows.
+    """
+    cutoff = now - keep_days * 86400.0
+    keep, evict = [], []
+    for r in rows:
+        ts = r.get("ts_epoch_utc")
+        if ts is not None and ts < cutoff:
+            evict.append(r)
+        else:
+            keep.append(r)
+    if len(keep) > max_lines:
+        # newest stay; the oldest overflow -> archive
+        keep_sorted = sorted(
+            keep, key=lambda r: (r.get("ts_epoch_utc") is not None,
+                                 r.get("ts_epoch_utc") or 0.0))
+        overflow = keep_sorted[: len(keep) - max_lines]
+        evict.extend(overflow)
+        keep = keep_sorted[len(keep) - max_lines:]
+    return keep, evict
+
+
+def _gc_archives(adir: Path, keep_n: int, errors: list) -> int:
+    """Delete the oldest archive files beyond keep_n. Returns deleted count."""
+    try:
+        archives = sorted(adir.glob("trace-*.jsonl.gz"))
+    except OSError:
+        return 0
+    excess = archives[:-keep_n] if keep_n > 0 else archives
+    dropped = 0
+    for old in excess:
+        try:
+            old.unlink()
+            dropped += 1
+        except OSError as exc:
+            errors.append(f"gc: {exc}")
+    return dropped
+
+
+def enforce_retention(hermes_home=None, keep_days=None, max_lines=None,
+                      keep_archives=None, dry_run=False,
+                      now=None) -> dict:
+    """Rotate the trace under the retention policy; never raise.
+
+    Contract (the cursor is sacred):
+      - Reads the active trace once; splits rows into keep/evict.
+      - Evicted rows are APPENDED to a gzip archive FIRST (write-ahead),
+        then the active file is replaced atomically (os.replace). A crash
+        between the two leaves a superset on disk — nothing is lost.
+      - The incremental cursor file (trace-cursor.json) is NEVER read,
+        written or removed here: collectors stay idempotent regardless of
+        what this rotation removes from the active file.
+      - Corrupt (non-JSON) lines and ts-less rows stay in the active file.
+      - Expired archive files beyond keep_archives are deleted.
+    Returns a report dict {ok, rotated, reason, archived, kept, ...}.
+    """
+    report = {
+        "ok": True, "rotated": False, "reason": "none", "archived": 0,
+        "kept": 0, "dropped_archives": 0, "archive_path": None,
+        "dry_run": bool(dry_run), "cutoff_epoch": None, "errors": [],
+    }
+    try:
+        policy = retention_policy(hermes_home)
+        kd = policy["keep_days"] if keep_days is None else float(keep_days)
+        ml = policy["max_lines"] if max_lines is None else int(max_lines)
+        ka = (policy["keep_archives"] if keep_archives is None
+              else int(keep_archives))
+        report["policy"] = {"keep_days": kd, "max_lines": ml,
+                            "keep_archives": ka}
+        now = time.time() if now is None else float(now)
+        path = trace_path(hermes_home)
+        if not path.exists():
+            return report
+        rows, bad_lines = _read_trace_lines(path)
+        if not rows and not bad_lines:
+            return report
+
+        keep, evict = _plan_eviction(rows, kd, ml, now)
+        report["cutoff_epoch"] = now - kd * 86400.0
+        report["kept"] = len(keep)
+        report["archived"] = len(evict)
+        if not evict and len(keep) == len(rows):
+            report["reason"] = "none"
+            # still GC expired archive files even when nothing rotated
+            report["dropped_archives"] = _gc_archives(
+                archive_dir(hermes_home), ka, report["errors"])
+            return report
+        report["reason"] = "window" if evict and any(
+            (r.get("ts_epoch_utc") is not None
+             and r.get("ts_epoch_utc") < report["cutoff_epoch"])
+            for r in evict) else "lines"
+        if dry_run:
+            return report
+
+        if evict:
+            adir = archive_dir(hermes_home)
+            adir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+            apath = adir / f"trace-{stamp}.jsonl.gz"
+            # write-ahead: archive FIRST, only then touch the active file
+            with gzip.open(apath, "at", encoding="utf-8") as fh:
+                for r in evict:
+                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            report["archive_path"] = str(apath)
+
+        # atomic replace of the active file: recent rows + preserved
+        # corrupt lines (they are never silently dropped)
+        tmp = path.with_name(path.name + ".tmp-rotate")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for r in keep:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            for line in bad_lines:
+                fh.write(line + "\n")
+        os.replace(tmp, path)
+        report["rotated"] = True
+
+        # archive GC: keep only the newest ka archive files
+        report["dropped_archives"] = _gc_archives(
+            archive_dir(hermes_home), ka, report["errors"])
+    except Exception as exc:  # fail open, like every public helper here
+        report["ok"] = False
+        report["errors"].append(repr(exc))
+    return report
+
+
 def doctor(hermes_home=None) -> dict:
     """obs-doctor: writable paths + JSONL parseable + count by class.
 
+    F3 extension: reports the trace's size and age (bytes, oldest/newest
+    epoch, age_days), the effective retention policy, the archive files,
+    and needs_rotation=True when policy bounds are already exceeded.
     Returns a dict with 'ok' (bool), 'path', 'writable', 'parseable',
-    'lines', and 'by_class' (consumer_class -> count). Never raises.
+    'lines', 'by_class' (consumer_class -> count) plus the F3 keys.
+    Never raises.
     """
     path = trace_path(hermes_home)
     result = {
@@ -469,6 +689,14 @@ def doctor(hermes_home=None) -> dict:
         "parseable": True,
         "lines": 0,
         "by_class": {},
+        # F3:
+        "trace_bytes": 0,
+        "oldest_epoch": None,
+        "newest_epoch": None,
+        "age_days": None,
+        "retention": retention_policy(hermes_home),
+        "archives": {"count": 0, "bytes": 0},
+        "needs_rotation": False,
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,8 +707,15 @@ def doctor(hermes_home=None) -> dict:
         result["writable"] = False
         return result
 
+    if path.exists():
+        try:
+            result["trace_bytes"] = path.stat().st_size
+        except OSError:
+            result["trace_bytes"] = 0
+
     by_class = {}
     n = 0
+    oldest = newest = None
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
@@ -496,11 +731,36 @@ def doctor(hermes_home=None) -> dict:
                 n += 1
                 cls = row.get("consumer_class", "unattributed")
                 by_class[cls] = by_class.get(cls, 0) + 1
+                ts = row.get("ts_epoch_utc")
+                if isinstance(ts, (int, float)):
+                    ts = float(ts)
+                    oldest = ts if oldest is None else min(oldest, ts)
+                    newest = ts if newest is None else max(newest, ts)
     except OSError:
         result["ok"] = False
         return result
     result["lines"] = n
     result["by_class"] = by_class
+    result["oldest_epoch"] = oldest
+    result["newest_epoch"] = newest
+    if oldest is not None:
+        result["age_days"] = (time.time() - oldest) / 86400.0
+
+    try:
+        files = sorted(archive_dir(hermes_home).glob("trace-*.jsonl.gz"))
+        result["archives"] = {
+            "count": len(files),
+            "bytes": sum((f.stat().st_size for f in files), 0),
+        }
+    except OSError:
+        pass
+
+    # needs_rotation: policy bounds already exceeded (window or cap).
+    pol = result["retention"]
+    if oldest is not None and n > 0:
+        cutoff = time.time() - pol["keep_days"] * 86400.0
+        if oldest < cutoff or n > pol["max_lines"]:
+            result["needs_rotation"] = True
     return result
 
 
@@ -556,7 +816,13 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("collect", help="run all collectors, append to trace")
-    sub.add_parser("doctor", help="check writable paths + parseable + by class")
+    sub.add_parser("doctor", help=("check writable paths + parseable + "
+                                   "by class + size/age/archives (F3)"))
+    p_ret = sub.add_parser(
+        "retention", help=("rotate the trace under the retention policy "
+                           "(archive+rotate; never touches the cursor)"))
+    p_ret.add_argument("--dry-run", action="store_true",
+                       help="report the plan without writing anything")
     args = p.parse_args(argv)
 
     if args.cmd == "collect":
@@ -566,6 +832,10 @@ def main(argv=None) -> int:
     if args.cmd == "doctor":
         print(json.dumps(doctor(), ensure_ascii=False, indent=1))
         return 0
+    if args.cmd == "retention":
+        rep = enforce_retention(dry_run=args.dry_run)
+        print(json.dumps(rep, ensure_ascii=False, indent=1))
+        return 0 if rep.get("ok") else 1
     return 1
 
 
