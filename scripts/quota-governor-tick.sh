@@ -30,6 +30,11 @@ source "$ENV_FILE"
 # variables but they don't reach child processes via os.environ)
 export OLLAMA_API_KEY 2>/dev/null || true
 
+# Operational override: QUOTA_GOVERNOR_HARD_LIMIT may be pinned in .env to
+# clamp the concurrency guard's hard cap (concurrency_guard.py reads it from
+# the environment; without an explicit export it would never leave the shell).
+export QUOTA_GOVERNOR_HARD_LIMIT 2>/dev/null || true
+
 if [[ -z "${OLLAMA_API_KEY:-}" ]]; then
     log "ERROR: OLLAMA_API_KEY not set in $ENV_FILE"
     exit 0
