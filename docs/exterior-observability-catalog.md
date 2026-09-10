@@ -67,6 +67,10 @@ Jaeger.
 - **Deployment:** single binary, but pairs with Grafana for visualization —
   the stack is the point.
 - **Community:** Grafana ecosystem, strong.
+- **Verified (10-sep-2026):** E2E PASS against the house's OTLP bridge —
+  exporter's exact payload accepted (200, no auth), `house.*` legible via
+  `/api/traces/<id>`, `gen_ai.*` verbatim, JSONL invariant. See
+  `obs-otlp-verification.md` Stack 2.
 - **Why YES:** if the house already runs Grafana for metrics, Tempo slots in.
 - **Why NO:** Tempo alone is a backend without a face; the value is the whole
   Grafana stack, which OBJ-32 already evaluated and rejected as a farm for a

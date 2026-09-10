@@ -82,11 +82,87 @@ as a supported backend, so the exporter should tolerate a tracing-only
 backend (e.g. treat a 404 on `/v1/metrics` as "no metrics backend" and
 advance the cursor on traces success). Tracked as a follow-up.
 
-## Stack 2 — SigNoz / lightweight OTLP receiver
+## Stack 2 — Grafana Tempo (PASS for traces; metrics gap -> same F4b contract)
 
-Not run. Jaeger already proves OTLP/OTel semconv conformance (the protocol
-conformance is what matters); SigNoz is a large ClickHouse stack that does
-not fit the verification budget. Recorded as **not-tested, not a blocker**.
+The catalog's top-1 non-Jaeger tracing candidate (OBJ-36 §1). Single binary,
+OTLP-native, no auth on the receiver — the exporter's exact payload is
+accepted as-is.
+
+```bash
+# pull + run ephemeral (OTLP receiver on 4318, query API on 3200)
+podman pull docker.io/grafana/tempo:latest
+podman run -d --rm --name tempo-otlp-test \
+  -p 3200:3200 -p 4318:4318 \
+  -v /tmp/tempo-config.yaml:/etc/tempo.yaml:ro \
+  --tmpfs /tmp/tempo \
+  docker.io/grafana/tempo:latest -config.file=/etc/tempo.yaml
+# tempo-config.yaml: server.http_listen_port 3200; distributor.receivers.otlp
+#   .protocols.http.endpoint 0.0.0.0:4318; storage.trace.backend local
+```
+
+### Traces path — PASS
+
+```
+POST /v1/traces -> HTTP 200 (no auth, exporter's exact payload)
+Tempo /api/traces/<traceId> returned the span with house.* attributes:
+  house.consumer_class, house.consumer_id, house.objective, house.cost_usd,
+  house.provider, house.source, house.cause
+gen_ai.* attributes present verbatim: gen_ai.request.model,
+  gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, gen_ai.request.id
+run_export() -> ok:true, "metrics": "skipped-404 (tracing-only backend)"
+RESULT: PASS
+```
+
+Tempo is a tracing-only backend like Jaeger: `/v1/metrics` returns 404, and
+the F4b contract (skip-404, cursor advances on traces success) applies
+unchanged. The exporter's `doubleValue` attributes are accepted by Tempo
+(no type restriction).
+
+## Stack 3 — OpenObserve (GAPS: auth + doubleValue on traces receiver)
+
+The catalog's "all-in-one light" candidate (OBJ-36 §1). Single binary,
+OTLP-native, but the OTLP HTTP receiver sits behind basic auth and its
+traces receiver rejects `doubleValue` attributes.
+
+```bash
+podman pull public.ecr.aws/zinclabs/openobserve:latest
+podman run -d --rm --name openobserve-otlp-test \
+  -p 5080:5080 -p 5081:5081 \
+  -e ZO_ROOT_USER_EMAIL=root@example.com -e ZO_ROOT_USER_PASSWORD=Root@123 \
+  -e ZO_DATA_DIR=/data --tmpfs /data \
+  public.ecr.aws/zinclabs/openobserve:latest
+# OTLP HTTP receiver is on 5080 (not 5081, which is gRPC), path /api/default/v1/*
+```
+
+### Findings
+
+- **Auth required (401 without it).** The exporter sends no credentials, so
+  `run_export()` fails (`ok:false`, traces:false, metrics:false) against
+  OpenObserve out of the box. The exporter has no auth support today.
+- **`doubleValue` rejected on the traces receiver (400).** With basic auth
+  supplied, `POST /api/default/v1/traces` returns
+  `400 "invalid type: map, expected f64"` for any attribute whose value is
+  `{"doubleValue": ...}` — the house's `house.cost_usd` is exactly that.
+  `intValue`, `boolValue`, `stringValue` are accepted; the metrics receiver
+  accepts the same `doubleValue` payload (200). This is an OpenObserve
+  traces-receiver strictness, not a house bug — Tempo and Jaeger both accept
+  `doubleValue`.
+- **JSONL invariant.** Every failure path left the trace and cursor
+  untouched (`sha256sum` unchanged, `7cd90717…`).
+
+**Verdict for OpenObserve:** not a drop-in receiver for the current exporter
+— it needs (a) basic-auth support in the exporter and (b) either a
+`doubleValue`-tolerant traces receiver upstream or a house-side workaround
+(emit `house.cost_usd` as a string). Recorded as **not-verified E2E, not a
+blocker** — the protocol conformance is already proven by Jaeger and Tempo.
+Tracked as a follow-up if the house ever wants OpenObserve.
+
+## Stack 4 — SigNoz / lightweight OTLP receiver
+
+Not run. Jaeger and Tempo already prove OTLP/OTel semconv conformance (the
+protocol conformance is what matters); SigNoz is a large ClickHouse stack
+that does not fit the verification budget. Recorded as **not-tested, not a
+blocker**.
 
 ## Exporter checks (checklist item 3)
 
@@ -104,20 +180,27 @@ left the trace and cursor untouched.
 ## How to reproduce the traces verification
 
 ```bash
-# 1. run Jaeger (above)
-# 2. export the traces payload to Jaeger and assert house.* via the API
+# 1. run Jaeger (above) or Tempo (Stack 2)
+# 2. export the traces payload and assert house.* via the API
 /usr/bin/python3.12 scripts/obs/otlp_exporter.py --endpoint http://localhost:4318 --export-once
 #    -> ok:true, "metrics": "skipped-404 (...)" — F4b tolerates the
 #       tracing-only backend; the cursor advances (traces are ingested)
-# 3. query Jaeger for the house service
-curl -s "http://localhost:16686/api/traces?service=quota-governor&limit=5"
+# 3. query the backend for the house service
+curl -s "http://localhost:16686/api/traces?service=quota-governor&limit=5"   # Jaeger
+curl -s "http://localhost:3200/api/traces/<traceId>"                          # Tempo
 ```
 
 ## Verdict
 
-- **Criterion met for traces**: Jaeger shows house traces with `house.*`
-  attributes legible; JSONL checksum invariant; doc committed.
+- **Criterion met for traces**: Jaeger AND Tempo show house traces with
+  `house.*` attributes legible; JSONL checksum invariant; doc committed.
 - **F4b (10-sep-2026): gap closed.** The exporter wrapper now tolerates a
   tracing-only backend (metrics 404): `run_export()` succeeds against
   Jaeger as documented (`ok:true`, metrics leg `skipped-404`, cursor
   advanced). Follow-up t_dd2eb1bb delivered.
+- **OBJ-36 successor (10-sep-2026): Tempo verified E2E.** The catalog's
+  top-1 non-Jaeger tracing candidate passes the same protocol as Jaeger —
+  exporter's exact payload accepted (200, no auth), `house.*` legible via
+  `/api/traces/<id>`, `gen_ai.*` verbatim, JSONL invariant. OpenObserve
+  recorded as not-verified (auth + `doubleValue` gaps on its traces
+  receiver), not a blocker.
