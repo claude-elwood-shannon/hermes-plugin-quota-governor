@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -80,19 +81,20 @@ class Base(unittest.TestCase):
                                "eta_100_hours": None, "confidence": 2},
             },
             "next_weekly_reset_iso": "2026-09-14T00:00:00Z",
+            "hours_to_reset": 95.8,
         }))
 
     def _seed_board(self):
         db = Path(self.tmp) / "kanban.db"
         con = sqlite3.connect(db)
-        con.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, "
-                    "body TEXT)")
+        con.execute("CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, "
+                    "assignee TEXT, body TEXT, completed_at REAL)")
         con.execute("INSERT INTO tasks VALUES "
-                    "('t_1','done','pr-ollama','objective:OBJ-27')")
+                    "('t_1','F0 trace','done','pr-ollama','objective:OBJ-27', 1788998186)")
         con.execute("INSERT INTO tasks VALUES "
-                    "('t_2','running','pr-ollama','objective:OBJ-30 | cost:small')")
+                    "('t_2','F5 matrix','running','pr-ollama','objective:OBJ-30 | cost:small', NULL)")
         con.execute("INSERT INTO tasks VALUES "
-                    "('t_3','blocked','pr-ollama','objective:OBJ-22')")
+                    "('t_3','privacy','blocked','pr-ollama','objective:OBJ-22', NULL)")
         con.commit()
         con.close()
 
@@ -147,8 +149,106 @@ class TestBoardScreen(Base):
         self.assertIn("t_2 [running]", out)
         self.assertIn("t_3 [blocked]", out)
 
+    def test_renders_done_24h_and_supply_ratio_placeholder(self):
+        self._seed_board()
+        out = screen.build_board_screen(hermes_home=self.home())
+        self.assertIn("done 24h: 1", out)
+        self.assertIn("t_1", out)
+        self.assertIn("supply_ratio diario: n/d", out)
+
     def test_missing_db_returns_empty(self):
         self.assertEqual(screen.build_board_screen(hermes_home=self.home()), "")
+
+
+class TestVerdict(Base):
+    def test_verdict_ok_when_eta_above_margin(self):
+        self._seed_forecast()
+        out = screen.build_forecast_screen(hermes_home=self.home())
+        self.assertIn("VEREDICTO", out)
+        self.assertIn("pr-ollama: eta_90=105.9h vs reset 95.8h -> OK", out)
+
+    def test_verdict_board_off_when_eta_under_1h(self):
+        path = Path(self.tmp) / "quota-governor" / "forecast.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "providers": {"pr-ollama": {"pct_now": 95.0,
+                                        "eta_90_hours": 0.5,
+                                        "eta_100_hours": 1.0,
+                                        "confidence": 3}},
+            "next_weekly_reset_iso": "2026-09-14T00:00:00Z",
+            "hours_to_reset": 95.0,
+        }))
+        out = screen.build_forecast_screen(hermes_home=self.home())
+        self.assertIn("BOARD OFF", out)
+
+    def test_verdict_reduce_workers_when_eta_below_margin(self):
+        path = Path(self.tmp) / "quota-governor" / "forecast.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "providers": {"pr-ollama": {"pct_now": 90.0,
+                                        "eta_90_hours": 10.0,
+                                        "eta_100_hours": 12.0,
+                                        "confidence": 3}},
+            "next_weekly_reset_iso": "2026-09-14T00:00:00Z",
+            "hours_to_reset": 20.0,
+        }))
+        out = screen.build_forecast_screen(hermes_home=self.home())
+        self.assertIn("max_workers=1, cap cost", out)
+
+
+class TestAlerts(Base):
+    def test_no_anomaly_says_sin_incidencias(self):
+        # trace with attributed cost (unattributed < 20%) + healthy forecast
+        _write_jsonl(Path(self.tmp) / "quota-governor" / "obs" / "trace.jsonl", [
+            {"ts_epoch_utc": 1788998186.0, "consumer_class": "worker",
+             "consumer_id": "t_1", "cause": "claimed", "model": None,
+             "provider": None, "tokens_in": None, "tokens_out": None,
+             "costUsd": 0.001, "requestId": None, "objective": "OBJ-27",
+             "source": "task-events", "otel": {}},
+            {"ts_epoch_utc": 1788998200.0, "consumer_class": "cron-llm",
+             "consumer_id": "f1", "cause": "cron-fire",
+             "model": "glm-5.3-flash", "provider": None,
+             "tokens_in": 1000, "tokens_out": 100, "costUsd": 0.0002,
+             "requestId": None, "objective": "OBJ-27",
+             "source": "usage-audit", "otel": {}},
+        ])
+        self._seed_forecast()
+        out = screen.build_alerts_screen(hermes_home=self.home())
+        self.assertIn("sin incidencias", out)
+
+    def test_unattributed_over_threshold_alerts(self):
+        # all cost is unattributed -> >20% -> alert
+        self._seed_trace()
+        out = screen.build_alerts_screen(hermes_home=self.home())
+        self.assertIn("unattributed", out)
+
+    def test_crash_loop_alerts(self):
+        db = Path(self.tmp) / "kanban.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, "
+                    "task_id TEXT, started_at REAL, outcome TEXT)")
+        now = time.time()
+        for i in range(3):
+            con.execute("INSERT INTO task_runs (task_id, started_at, outcome) "
+                        "VALUES ('t_x', ?, 'crashed')", (now - 100,))
+        con.commit()
+        con.close()
+        out = screen.build_alerts_screen(hermes_home=self.home())
+        self.assertIn("loop de crashes", out)
+
+    def test_burn_alert(self):
+        path = Path(self.tmp) / "quota-governor" / "forecast.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "providers": {"pr-ollama": {"pct_now": 95.0,
+                                        "eta_90_hours": 0.5,
+                                        "eta_100_hours": 1.0,
+                                        "confidence": 3}},
+            "next_weekly_reset_iso": "2026-09-14T00:00:00Z",
+            "hours_to_reset": 95.0,
+        }))
+        out = screen.build_alerts_screen(hermes_home=self.home())
+        self.assertIn("burn pr-ollama", out)
 
 
 class TestCompose(Base):
