@@ -48,6 +48,14 @@ Append-only, one JSON per line, idempotent per task_id (a task already
 in the ledger is skipped; usage is a session total, not a delta, so
 re-writing would only drift).
 
+CSV EXPORT + INTEGRITY (the predictor's input table)
+----------------------------------------------------
+export_csv() writes the flat training table next to the trace at
+<profile>/quota-governor/obs/task-cost-train.csv (one row per task,
+flat columns, dominant model). integrity_check() verifies ledger rows ==
+closed tasks with a body in kanban.db (no drift). Both fail open and
+never raise.
+
 Cron: every 15m, no_agent, wrapper in the profile scripts dir execs
 this file from the repo (single source of truth, budget-check pattern).
 Watchdog stdout: silent when nothing new; one line when rows were
@@ -80,6 +88,7 @@ def _load_module(name: str, path: Path):
 # (the canonical stamp, OBJ-28 §1.3); pricing from the calibrated ledger.
 _trace = _load_module("obj35_trace", HERE / "trace.py")
 parse_objective = _trace.parse_objective
+obs_dir = _trace.obs_dir
 
 _MCL_PATH = HERE.parent / "model-cost-ledger.py"
 try:
@@ -186,7 +195,7 @@ def load_closed_tasks(kanban_db: Path) -> list:
         try:
             rows = con.execute(
                 "SELECT t.id, t.body, t.assignee, t.created_at, "
-                "t.completed_at, t.session_id, "
+                "t.completed_at, t.session_id, t.status, "
                 "  (SELECT COUNT(*) FROM task_events e "
                 "   WHERE e.task_id = t.id AND e.kind IN "
                 "         ('crashed','gave_up')) AS crashes, "
@@ -339,6 +348,7 @@ def build_row(task: dict, usage_rows: list, session_tasks: int,
         "cost_class": cost_class,
         "clase": clase,
         "assignee": task.get("assignee"),
+        "resultado": task.get("status") or "done",
         "created_at": created,
         "completed_at": completed,
         "duration_s": duration,
@@ -473,6 +483,119 @@ def collect(ledger=None, kanban_db=None, now=None) -> dict:
         "skipped_known": len(tasks) - len(fresh) - no_body,
         "no_body": no_body,
         "ledger": str(ledger),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CSV export (training table next to the trace) + integrity check
+# ---------------------------------------------------------------------------
+
+# Flat columns for the CSV — the training table the estimator consumes.
+CSV_COLUMNS = [
+    "task_id", "objective", "cost_class", "clase", "assignee", "resultado",
+    "model", "billing_provider", "tokens_in", "tokens_out", "cache_read",
+    "reasoning", "costUsd", "cost_source", "duration_s", "runs", "crashes",
+    "attributed", "shared_session", "session_tasks", "created_at",
+    "completed_at",
+]
+
+
+def _csv_value(v):
+    """JSON scalar -> CSV cell (None -> empty, bool -> 0/1, float rounded)."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return "%.6f" % v
+    return str(v)
+
+
+def export_csv(ledger=None, csv_path=None) -> int:
+    """Write the training table as CSV next to the trace (obs dir).
+
+    One row per kind=task line in the ledger, flat columns only (the
+    nested 'models' list is dropped — the dominant model is the column).
+    Returns the number of rows written; 0 on any error (never raises).
+    """
+    ledger = ledger or ledger_path()
+    if csv_path is None:
+        csv_path = obs_dir() / "task-cost-train.csv"
+    rows = []
+    try:
+        with open(ledger, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("kind") != "task":
+                    continue
+                rows.append(r)
+    except OSError:
+        return 0
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(",".join(CSV_COLUMNS) + "\n")
+            for r in rows:
+                fh.write(",".join(_csv_value(r.get(c)) for c in CSV_COLUMNS)
+                         + "\n")
+    except OSError:
+        return 0
+    return len(rows)
+
+
+def integrity_check(ledger=None, kanban_db=None) -> dict:
+    """Verify ledger rows == closed tasks in the window (no drift).
+
+    Compares the set of task_ids recorded in the ledger against the set
+    of closed tasks in kanban.db. Returns counts and a mismatch list.
+    Never raises; missing sources yield empty sets.
+    """
+    ledger = ledger or ledger_path()
+    kanban_db = kanban_db or kanban_db_path()
+    ledger_ids = set()
+    try:
+        with open(ledger, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("kind") == "task" and r.get("task_id"):
+                    ledger_ids.add(r["task_id"])
+    except OSError:
+        pass
+    closed_ids = set()
+    try:
+        con = sqlite3.connect(f"file:{kanban_db}?mode=ro", uri=True)
+        try:
+            # Only closed tasks WITH a body are expected in the ledger —
+            # the observer skips no-body tasks (no_body counter), so the
+            # integrity contract is: ledger rows == closed tasks with body.
+            for (tid,) in con.execute(
+                    "SELECT id FROM tasks WHERE completed_at IS NOT NULL "
+                    "AND body IS NOT NULL AND trim(body) != ''"):
+                closed_ids.add(tid)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+    missing = sorted(closed_ids - ledger_ids)
+    extra = sorted(ledger_ids - closed_ids)
+    return {
+        "ledger_rows": len(ledger_ids),
+        "closed_tasks": len(closed_ids),
+        "missing": missing,
+        "extra": extra,
+        "ok": not missing and not extra,
     }
 
 

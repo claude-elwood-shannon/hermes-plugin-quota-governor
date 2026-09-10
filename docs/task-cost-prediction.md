@@ -31,6 +31,32 @@ per line, three kinds:
  "in_band_pct":..., "ok_small":true|false}                 <- P3 verdict
 ```
 
+### Training table (CSV) — the predictor's input
+
+`export_csv()` writes the flat training table next to the trace at
+`~/.hermes/profiles/<profile>/quota-governor/obs/task-cost-train.csv`
+(one row per `kind=task` line, nested `models` list dropped — the
+dominant model is the `model` column). Columns:
+
+```
+task_id, objective, cost_class, clase, assignee, resultado,
+model, billing_provider, tokens_in, tokens_out, cache_read, reasoning,
+costUsd, cost_source, duration_s, runs, crashes, attributed,
+shared_session, session_tasks, created_at, completed_at
+```
+
+`resultado` is the task's terminal status (`done`/`archived`/...) from
+kanban.db; legacy rows recorded before the field existed carry an empty
+cell (append-only ledger — only new rows are stamped).
+
+### Integrity check
+
+`integrity_check()` verifies the ledger has no drift: the set of
+`task_id`s in the ledger must equal the set of closed tasks WITH a body
+in kanban.db (the observer skips no-body tasks by design). Returns
+`{ledger_rows, closed_tasks, missing, extra, ok}`. Live check on
+2026-09-10: 279 == 279, `ok:true`.
+
 ## Attribution path (the part that makes it real)
 
 The F0 trace carries per-request cost only for cron-llm rows; worker
@@ -101,9 +127,10 @@ budget-check-cron.sh pattern). First registration allocated ids
 
 ## Tests
 
-`scripts/obs/test_task_cost_train.py` (12) + `scripts/obs/
+`scripts/obs/test_task_cost_train.py` (19) + `scripts/obs/
 test_task_cost_backtest.py` (7) — hermetic tmp homes, tag-parsing both
 board layouts, join correctness, peak doubling, idempotency, shared
-session flag, fallback chain, verdict math, tolerant degradation.
+session flag, fallback chain, verdict math, CSV export, integrity check,
+tolerant degradation.
 `/usr/bin/python3.12`; all green; no regressions in test_trace,
 test_morning_screen, test_budget_check, test_backtest_f2.

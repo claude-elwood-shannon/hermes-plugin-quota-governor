@@ -65,7 +65,7 @@ def _make_kanban(base: Path, tasks: list, events=None):
     con.execute(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, body TEXT,"
         " assignee TEXT, created_at REAL, completed_at REAL,"
-        " session_id TEXT)")
+        " session_id TEXT, status TEXT)")
     con.execute(
         "CREATE TABLE task_events (task_id TEXT, kind TEXT,"
         " created_at REAL)")
@@ -73,10 +73,10 @@ def _make_kanban(base: Path, tasks: list, events=None):
         "CREATE TABLE task_runs (task_id TEXT, id INTEGER)")
     for t in tasks:
         con.execute(
-            "INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+            "INSERT INTO tasks VALUES (?,?,?,?,?,?,?)",
             (t["id"], t.get("body"), t.get("assignee"),
              t.get("created_at"), t.get("completed_at"),
-             t.get("session_id")))
+             t.get("session_id"), t.get("status")))
     for e in (events or []):
         con.execute("INSERT INTO task_events VALUES (?,?,?)",
                     (e[0], e[1], e[2]))
@@ -286,6 +286,112 @@ class TestCollect(Base):
             if r["task_id"] in ("t_sh1", "t_sh2"):
                 self.assertTrue(r["shared_session"])
                 self.assertEqual(r["session_tasks"], 2)
+
+    def test_resultado_field(self):
+        self.collect()
+        rows = [json.loads(l) for l in
+                self.ledger.read_text().strip().splitlines()]
+        by_id = {r["task_id"]: r for r in rows}
+        # t_join has no status in the test schema -> defaults to "done"
+        self.assertEqual(by_id["t_join"]["resultado"], "done")
+
+
+class TestCsvExport(Base):
+    def setUp(self):
+        super().setUp()
+        self._scenario()
+        self.set_env()
+        self.collect()
+
+    def _scenario(self):
+        _make_profile_home(self.base, "pr-ollama", [
+            {"session_id": "s1", "model": "deepseek-v4-flash",
+             "task": None, "api_call_count": 30,
+             "input_tokens": 57242, "output_tokens": 17548,
+             "cache_read_tokens": 1191808, "reasoning_tokens": 0,
+             "billing_provider": "ollama-cloud",
+             "last_seen": "2026-09-10T16:56:13+00:00"},
+        ])
+        _make_kanban(self.base, [
+            {"id": "t_join", "body": self.BODY_CONCRETE,
+             "assignee": "pr-ollama", "created_at": 1789050000.0,
+             "completed_at": 1789051800.0, "session_id": "s1"},
+        ])
+
+    BODY_CONCRETE = ("objective:OBJ-27 | cost:small | clase:B\n"
+                     "cuerpo de prueba")
+
+    def test_export_writes_csv(self):
+        csv_path = self.base / "task-cost-train.csv"
+        n = tct.export_csv(ledger=self.ledger, csv_path=csv_path)
+        self.assertEqual(n, 1)
+        lines = csv_path.read_text().strip().splitlines()
+        self.assertEqual(lines[0], ",".join(tct.CSV_COLUMNS))
+        self.assertEqual(len(lines), 2)  # header + 1 row
+        # row has the flat columns
+        row = lines[1].split(",")
+        self.assertEqual(len(row), len(tct.CSV_COLUMNS))
+
+    def test_export_missing_ledger_ok(self):
+        n = tct.export_csv(ledger=self.base / "nope.jsonl",
+                           csv_path=self.base / "x.csv")
+        self.assertEqual(n, 0)
+
+
+class TestIntegrity(Base):
+    def setUp(self):
+        super().setUp()
+        self.set_env()
+
+    def test_ok_when_synced(self):
+        _make_kanban(self.base, [
+            {"id": "t1", "body": "objective:OBJ-1 | cost:tiny",
+             "assignee": "pr-ollama", "created_at": 1789040000.0,
+             "completed_at": 1789041000.0, "session_id": None},
+        ])
+        self.collect()
+        res = tct.integrity_check(ledger=self.ledger,
+                                  kanban_db=self.base / "kanban.db")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["ledger_rows"], 1)
+        self.assertEqual(res["closed_tasks"], 1)
+
+    def test_missing_rows_detected(self):
+        _make_kanban(self.base, [
+            {"id": "t1", "body": "objective:OBJ-1 | cost:tiny",
+             "assignee": "pr-ollama", "created_at": 1789040000.0,
+             "completed_at": 1789041000.0, "session_id": None},
+            {"id": "t2", "body": "objective:OBJ-1 | cost:tiny",
+             "assignee": "pr-ollama", "created_at": 1789040000.0,
+             "completed_at": 1789042000.0, "session_id": None},
+        ])
+        # only record t1 in the ledger
+        self.ledger.write_text(
+            json.dumps({"kind": "task", "task_id": "t1"}) + "\n")
+        res = tct.integrity_check(ledger=self.ledger,
+                                  kanban_db=self.base / "kanban.db")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["missing"], ["t2"])
+
+    def test_no_body_tasks_not_expected(self):
+        # a closed task with no body is skipped by the observer (no_body),
+        # so it must NOT count as a missing ledger row
+        _make_kanban(self.base, [
+            {"id": "t_nobody", "body": None,
+             "assignee": "pr-ollama", "created_at": 1789040000.0,
+             "completed_at": 1789041000.0, "session_id": None},
+        ])
+        res = tct.integrity_check(ledger=self.ledger,
+                                  kanban_db=self.base / "kanban.db")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["closed_tasks"], 0)
+
+    def test_missing_sources_ok(self):
+        res = tct.integrity_check(ledger=self.base / "nope.jsonl",
+                                  kanban_db=self.base / "nope.db")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["ledger_rows"], 0)
+        self.assertEqual(res["closed_tasks"], 0)
 
 
 class TestEstimator(Base):
