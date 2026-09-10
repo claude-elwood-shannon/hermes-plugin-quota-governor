@@ -11,6 +11,9 @@ Covers (fixtures only, no external network):
   7. failure: server down -> ok=False, trace + cursor untouched
   8. rotation: cursor offset beyond file size resets and re-exports
   9. privacy: no absolute host paths in the repo module (portability)
+ 10. tracing-only backend: /v1/metrics 404 (Jaeger) -> ok=True, cursor
+     advances, no retries on the deterministic 404; traces 404 and
+     non-404 metrics failures stay hard failures
 
 Run:  /usr/bin/python3.12 test_otlp_exporter.py  (or pytest)
 """
@@ -51,19 +54,42 @@ def _row(ts, cid="t_x", cls="worker", cause="claimed", costUsd=0.5,
             "otel": otel}
 
 
+class _FixtureHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with the fixture's dynamic attrs declared."""
+    received: dict
+    fail: bool
+    status: dict
+    attempts: dict
+    daemon_threads = True
+
+
 class FixtureServer:
-    """Local OTLP/HTTP fixture: records POSTs to /v1/traces and /v1/metrics."""
+    """Local OTLP/HTTP fixture: records POSTs to /v1/traces and /v1/metrics.
+
+    `fail` -> every POST answers 500. `status` maps a path to a fake
+    status code (e.g. {"/v1/metrics": 404} fakes a tracing-only backend).
+    `attempts` counts POSTs per path (to assert 404 is not retried).
+    """
 
     def __init__(self):
         self.received = {"traces": [], "metrics": []}
+        self.attempts = {}
+        self.status = {}
         self._fail = False
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                self.server.attempts[self.path] = \
+                    self.server.attempts.get(self.path, 0) + 1
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
                 if self.server.fail:
                     self.send_response(500)
+                    self.end_headers()
+                    return
+                fake = self.server.status.get(self.path)
+                if fake is not None:
+                    self.send_response(fake)
                     self.end_headers()
                     return
                 if self.path == "/v1/traces":
@@ -81,9 +107,11 @@ class FixtureServer:
             def log_message(self, *a):
                 pass
 
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd = _FixtureHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.received = self.received
         self.httpd.fail = self._fail
+        self.httpd.status = self.status
+        self.httpd.attempts = self.attempts
         self.thread = threading.Thread(target=self.httpd.serve_forever,
                                        daemon=True)
         self.thread.start()
@@ -277,6 +305,82 @@ class ExportTest(Base):
         self.assertEqual(rep["exported"], 1)
         spans = srv.received["traces"][1]["resourceSpans"][0]["scopeSpans"][0]["spans"]
         self.assertEqual(len(spans), 1)
+
+
+class TracingOnlyBackendTest(Base):
+    """F4b: a 404 on /v1/metrics is 'no metrics backend', not a failure."""
+
+    def test_metrics_404_ok_and_cursor_advances(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        srv.status["/v1/metrics"] = 404  # Jaeger: tracing-only backend
+        self._write_trace([_row(100.0, cid="t_a"), _row(200.0, cid="t_b")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=1,
+                             base_delay=0.01)
+        self.assertTrue(rep["ok"])
+        self.assertFalse(rep["noop"])
+        self.assertEqual(rep["exported"], 2)
+        self.assertEqual(rep["legs"],
+                         {"traces": True, "metrics": "skipped-404"})
+        self.assertIn("skipped-404", rep["metrics"])
+        # traces delivered exactly once
+        self.assertEqual(len(srv.received["traces"]), 1)
+        spans = srv.received["traces"][0]["resourceSpans"][0][
+            "scopeSpans"][0]["spans"]
+        self.assertEqual(len(spans), 2)
+        attrs = {a["key"]: a["value"] for a in spans[0]["attributes"]}
+        self.assertEqual(attrs["house.consumer_id"]["stringValue"], "t_a")
+        # nothing recorded as "delivered metrics"
+        self.assertEqual(srv.received["metrics"], [])
+        # cursor advanced to file size (the whole point of F4b)
+        self.assertEqual(self._cursor().get("offset"),
+                         (Path(self.tmp) / "quota-governor" / "obs"
+                          / "trace.jsonl").stat().st_size)
+        # the deterministic 404 was NOT retried (1 attempt, not 2)
+        self.assertEqual(srv.attempts.get("/v1/metrics"), 1)
+
+    def test_metrics_404_incremental_cursor_only_new_lines(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        srv.status["/v1/metrics"] = 404
+        self._write_trace([_row(100.0, cid="t_a")])
+        self.assertTrue(exp.run_export(endpoint=srv.endpoint,
+                                       base_delay=0.01)["ok"])
+        self._write_trace([_row(200.0, cid="t_b")])
+        rep = exp.run_export(endpoint=srv.endpoint, base_delay=0.01)
+        self.assertTrue(rep["ok"])
+        self.assertEqual(rep["exported"], 1)
+        self.assertEqual(len(srv.received["traces"]), 2)
+        spans = srv.received["traces"][1]["resourceSpans"][0][
+            "scopeSpans"][0]["spans"]
+        attrs = {a["key"]: a["value"] for a in spans[0]["attributes"]}
+        self.assertEqual(attrs["house.consumer_id"]["stringValue"], "t_b")
+
+    def test_traces_404_is_still_a_hard_failure(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        srv.status["/v1/traces"] = 404  # a backend that takes no traces
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=1,
+                             base_delay=0.01)
+        self.assertFalse(rep["ok"])
+        self.assertEqual(self._cursor(), {})  # cursor NOT advanced
+        self.assertEqual(rep["legs"], {"traces": False, "metrics": False})
+        # traces 404 is deterministic too: no retries
+        self.assertEqual(srv.attempts.get("/v1/traces"), 1)
+        self.assertNotIn("/v1/metrics", srv.attempts)  # never reached
+
+    def test_metrics_500_is_still_a_hard_failure(self):
+        # full backends keep the strict both-endpoints semantics: only a
+        # metrics *404* degrades to a no-op; other statuses must fail the run
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        srv.status["/v1/metrics"] = 500
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=0)
+        self.assertFalse(rep["ok"])
+        self.assertEqual(self._cursor(), {})
+        self.assertEqual(rep["legs"], {"traces": True, "metrics": False})
 
 
 class PrivacyTest(Base):

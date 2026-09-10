@@ -37,10 +37,15 @@ python3 scripts/obs/otlp_exporter.py --endpoint http://localhost:4318
 ```
 
 The exporter POSTs two OTLP/HTTP JSON payloads per run:
-`/v1/traces` (spans) and `/v1/metrics` (cost gauge). Both must succeed for
-the cursor to advance; on any failure the run reports `ok:false` and the
-trace + cursor are left untouched, so the next run re-exports (idempotent
-via stable span IDs).
+`/v1/traces` (spans) and `/v1/metrics` (cost gauge). Full backends
+(OpenTelemetry Collector, SigNoz, Grafana) require both to succeed for the
+cursor to advance. A **tracing-only** backend (Jaeger) has no
+`/v1/metrics`: its deterministic `404` is treated as "no metrics backend
+here" — the metrics leg is skipped (reported as `skipped-404`, without
+retries) and the cursor advances on traces success. A `404` on
+`/v1/traces`, or any non-404 failure on either leg, still fails the run
+(`ok:false`) and leaves the trace + cursor untouched, so the next run
+re-exports (idempotent via stable span IDs).
 
 ## Semantic-convention mapping (the namespace rule)
 
@@ -92,11 +97,11 @@ Set `OBS_OTLP_ENDPOINT` to the base URL of the collector:
 
 | Backend        | Endpoint example                          | Notes |
 |----------------|-------------------------------------------|-------|
-| **Jaeger**     | `http://localhost:4318`                   | OTLP/HTTP collector; view at `http://localhost:16686` |
+| **Jaeger**     | `http://localhost:4318`                   | Tracing-only: `/v1/metrics` 404 is tolerated (`skipped-404`), cursor advances on traces success; view at `http://localhost:16686` |
 | **SigNoz**     | `http://localhost:4318`                   | Self-hosted OTLP collector; or the cloud ingest URL |
 | **Grafana Cloud** | `https://otlp-gateway-<region>.grafana.net` | Add `X-OTLP-...` auth headers via a gateway/proxy |
 | **Langfuse**   | `https://cloud.langfuse.com/api/public/otel` | OTLP ingest endpoint; add `Authorization: Bearer <pk-lf-...>` |
-| **OpenTelemetry Collector** | `http://<collector>:4318` | The standard OTLP/HTTP receiver |
+| **OpenTelemetry Collector** | `http://<collector>:4318` | The standard OTLP/HTTP receiver; both endpoints expected |
 
 > **Auth headers.** The exporter sends only `Content-Type: application/json`
 > (the OTLP/HTTP JSON contract). Backends that require auth (Grafana Cloud,
@@ -111,16 +116,20 @@ Set `OBS_OTLP_ENDPOINT` to the base URL of the collector:
   the exporter's own run.
 - **Never degrades the JSONL.** The trace is the source of truth; OTLP is
   output. A failed export leaves the trace and cursor byte-identical.
-- **Retries with backoff.** Each endpoint is retried up to 3 times with
-  exponential backoff (`0.5s * 2^attempt`); both `/v1/traces` and
-  `/v1/metrics` must succeed for the cursor to advance.
+- **Retries with backoff.** Each leg is retried up to 3 times with
+  exponential backoff (`0.5s * 2^attempt`). A `404` is deterministic and
+  is never retried: on `/v1/metrics` it means "tracing-only backend"
+  (metrics skipped, cursor advances on traces success); on `/v1/traces`
+  it is a hard failure. Every other failure on either leg fails the run.
 
 ## Tests
 
-`scripts/obs/test_otlp_exporter.py` — 10 tests, fixtures only, no external
+`scripts/obs/test_otlp_exporter.py` — 14 tests, fixtures only, no external
 network, `/usr/bin/python3.12`: silent no-op when the endpoint is unset,
 house.*/gen_ai.* namespace mapping with zero collision, payload shape and
 stable span IDs, batch export against a local HTTP fixture server,
 incremental cursor (only new lines), `--export-once` backfill idempotency,
-failure keeps trace + cursor untouched, rotation resets a stale cursor, and
-privacy (no absolute host paths in the module).
+failure keeps trace + cursor untouched, rotation resets a stale cursor,
+privacy (no absolute host paths in the module), and the tracing-only
+backend contract (metrics 404 → `ok:true` + cursor advances + no retry on
+the 404; traces 404 and non-404 metrics failures stay hard failures).

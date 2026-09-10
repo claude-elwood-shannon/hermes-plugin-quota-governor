@@ -12,7 +12,7 @@ images). No real user data — the house's own synthetic consumption trace
 
 This task only verifies the standard (OTLP/OTel semconv). It adopts no tool.
 
-## Stack 1 — Jaeger all-in-one (PASS for traces, gap for metrics)
+## Stack 1 — Jaeger all-in-one (PASS for traces; metrics gap -> RESOLVED by F4b)
 
 ```bash
 # pull + run ephemeral (OTLP receiver on 4318, UI on 16686)
@@ -47,7 +47,21 @@ The namespace rule holds in a real backend: house fields live in `house.*`,
 `gen_ai.*` is taken verbatim from the canonical `otel` field, and no standard
 namespace is invaded.
 
-### Metrics path — GAP (exporter wrapper fails against Jaeger)
+### Metrics path — GAP -> RESOLVED (F4b, 10-sep-2026)
+
+> **UPDATE (F4b, 10-sep-2026): RESOLVED.** The exporter now tolerates a
+> tracing-only backend: a deterministic `404` on `/v1/metrics` is treated
+> as "no metrics backend here" — the metrics leg is skipped
+> (`skipped-404`, no retries) and the cursor advances on traces success.
+> `run_export()` against this same Jaeger stack now reports `ok:true`
+> with `"metrics": "skipped-404 (tracing-only backend: /v1/metrics 404)"`.
+> The strict both-endpoints semantics are kept for full backends
+> (OpenTelemetry Collector, SigNoz, Grafana), and a `404` on
+> `/v1/traces` (or any non-404 failure on either leg) is still a hard
+> failure. Fix + fixture tests: `scripts/obs/otlp_exporter.py`,
+> `TracingOnlyBackendTest` in `scripts/obs/test_otlp_exporter.py`.
+
+Original finding (kept for the record):
 
 Jaeger is a **tracing-only** backend: its OTLP receiver returns
 `404 page not found` for `/v1/metrics` (verified directly). The exporter's
@@ -93,7 +107,8 @@ left the trace and cursor untouched.
 # 1. run Jaeger (above)
 # 2. export the traces payload to Jaeger and assert house.* via the API
 /usr/bin/python3.12 scripts/obs/otlp_exporter.py --endpoint http://localhost:4318 --export-once
-#    -> ok:false (metrics 404) — the traces ARE ingested; see the gap above
+#    -> ok:true, "metrics": "skipped-404 (...)" — F4b tolerates the
+#       tracing-only backend; the cursor advances (traces are ingested)
 # 3. query Jaeger for the house service
 curl -s "http://localhost:16686/api/traces?service=quota-governor&limit=5"
 ```
@@ -102,6 +117,7 @@ curl -s "http://localhost:16686/api/traces?service=quota-governor&limit=5"
 
 - **Criterion met for traces**: Jaeger shows house traces with `house.*`
   attributes legible; JSONL checksum invariant; doc committed.
-- **Follow-up required**: the exporter wrapper must tolerate a tracing-only
-  backend (metrics 404) so `run_export()` succeeds against Jaeger as
-  documented. This is F4 scope, not verification scope.
+- **F4b (10-sep-2026): gap closed.** The exporter wrapper now tolerates a
+  tracing-only backend (metrics 404): `run_export()` succeeds against
+  Jaeger as documented (`ok:true`, metrics leg `skipped-404`, cursor
+  advanced). Follow-up t_dd2eb1bb delivered.

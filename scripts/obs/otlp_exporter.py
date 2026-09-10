@@ -54,6 +54,15 @@ so collectors dedupe re-sent spans.
 history, then advances the cursor to the end. Idempotent: stable span IDs
 mean re-running it never duplicates at the collector.
 
+TRACING-ONLY BACKENDS (Jaeger, ...)
+-----------------------------------
+Some OTLP endpoints are traces-only: they answer `404` for `/v1/metrics`.
+That is NOT a failure — it means "no metrics backend here". The exporter
+skips the metrics leg immediately (a 404 is deterministic; no retries)
+and advances its cursor when `/v1/traces` succeeded, reporting
+`"metrics": "skipped-404"`. Full backends (OpenTelemetry Collector,
+SigNoz, Grafana) keep the strict both-endpoints semantics.
+
 FAIL-OPEN: every public helper never raises into a caller; a network
 failure returns ok=False and leaves the trace and cursor untouched.
 """
@@ -63,6 +72,7 @@ import hashlib
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -272,29 +282,66 @@ def _post(url: str, payload: dict) -> int:
         return resp.status
 
 
+class _Endpoint404(Exception):
+    """The endpoint answered 404: the path does not exist there."""
+
+
+def _post_retry(url: str, payload: dict, max_retries: int,
+                base_delay: float) -> bool:
+    """POST with exponential backoff. False when retries are exhausted.
+
+    A 404 answer is a *deterministic* no (the path does not exist on this
+    backend): it raises `_Endpoint404` immediately, without retrying.
+    Never raises anything else into the caller.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            _post(url, payload)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise _Endpoint404(url) from exc
+            if attempt < max_retries:
+                time.sleep(base_delay * (2 ** attempt))
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(base_delay * (2 ** attempt))
+    return False
+
+
 def _post_payload(payload: dict, endpoint: str,
                   max_retries: int = _DEFAULT_MAX_RETRIES,
-                  base_delay: float = _DEFAULT_BASE_DELAY) -> bool:
+                  base_delay: float = _DEFAULT_BASE_DELAY) -> dict:
     """POST to /v1/traces and /v1/metrics with exponential backoff.
 
-    Returns True only when BOTH endpoints succeed. On any failure the
-    cursor is NOT advanced, so the next run re-exports (idempotent via
-    stable span IDs). Never raises.
+    Returns a dict of per-leg outcomes: ``{"traces": bool,
+    "metrics": bool | "skipped-404"}``. A 404 on /v1/metrics is the
+    tracing-only-backend contract (Jaeger): the metrics leg is skipped
+    (no retries — the 404 is deterministic) and the run counts as ok
+    when /v1/traces succeeded. A 404 on /v1/traces is a real failure
+    (a backend that takes no traces is no backend at all). On any other
+    failure the cursor is NOT advanced, so the next run re-exports
+    (idempotent via stable span IDs). Never raises.
     """
     base = endpoint.rstrip("/")
-    for path in ("/v1/traces", "/v1/metrics"):
-        ok = False
-        for attempt in range(max_retries + 1):
-            try:
-                _post(base + path, payload)
-                ok = True
-                break
-            except Exception:
-                if attempt < max_retries:
-                    time.sleep(base_delay * (2 ** attempt))
-        if not ok:
-            return False
-    return True
+    out: dict = {"traces": False, "metrics": False}
+    try:
+        out["traces"] = _post_retry(base + "/v1/traces", payload,
+                                    max_retries, base_delay)
+    except _Endpoint404:
+        # A backend that answers 404 for traces cannot take the trace:
+        # that is a hard failure, not a degraded one.
+        return out
+    try:
+        leg = _post_retry(base + "/v1/metrics", payload,
+                          max_retries, base_delay)
+        out["metrics"] = leg
+    except _Endpoint404:
+        # Tracing-only backend (Jaeger): /v1/metrics does not exist.
+        # Not a failure — degrade to a metrics no-op and let the
+        # traces success carry the cursor.
+        out["metrics"] = "skipped-404"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -356,21 +403,29 @@ def run_export(hermes_home=None, endpoint=None, export_once=False,
                 "offset": offset}
 
     payload = build_payload(rows)
-    ok = _post_payload(payload, endpoint,
-                       max_retries=max_retries if max_retries is not None
-                       else _DEFAULT_MAX_RETRIES,
-                       base_delay=base_delay if base_delay is not None
-                       else _DEFAULT_BASE_DELAY)
+    legs = _post_payload(payload, endpoint,
+                         max_retries=max_retries if max_retries is not None
+                         else _DEFAULT_MAX_RETRIES,
+                         base_delay=base_delay if base_delay is not None
+                         else _DEFAULT_BASE_DELAY)
+    # ok = traces leg succeeded AND the metrics leg is either delivered or
+    # explicitly absent (tracing-only backend, metrics 404 -> "skipped-404").
+    metrics_ok = legs.get("metrics") is not False
+    ok = bool(legs.get("traces")) and metrics_ok
     if ok:
         _save_cursor({"offset": size}, hermes_home)
-    return {
+    rep = {
         "ok": ok,
         "noop": False,
         "exported": len(rows),
-        "offset": size,
+        "offset": size if ok else offset,
         "endpoint": endpoint,
         "export_once": bool(export_once),
+        "legs": legs,
     }
+    if legs.get("metrics") == "skipped-404":
+        rep["metrics"] = "skipped-404 (tracing-only backend: /v1/metrics 404)"
+    return rep
 
 
 # ---------------------------------------------------------------------------
