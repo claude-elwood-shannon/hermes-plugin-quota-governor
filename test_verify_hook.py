@@ -32,6 +32,12 @@ TEST_HOME = tempfile.mkdtemp(prefix="qg-verify-hook-test-")
 os.environ["HERMES_HOME"] = TEST_HOME
 os.environ["HERMES_KANBAN_DB"] = os.path.join(TEST_HOME, "kanban.db")
 
+# The verify-task.py SCRIPT lives in the real Hermes home; resolve it
+# BEFORE the HOME override below (expanduser would resolve to TEST_HOME).
+VERIFY_TASK_SCRIPT = os.environ.get(
+    "VERIFY_TASK_SCRIPT",
+    os.path.join(os.path.expanduser("~"), ".hermes", "scripts", "verify-task.py"))
+
 # Also set the verifications file to the test home
 # verify-task.py uses ~/.hermes/quota-governor/verifications.jsonl
 # We need to override HOME to isolate
@@ -139,7 +145,7 @@ def test_verify_single_task_verified():
     # override the paths. Let's import it directly with path overrides.
 
     # Save and override env
-    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+    verify_script = VERIFY_TASK_SCRIPT
     script_dir = os.path.dirname(verify_script)
 
     # We'll use importlib to load verify-task.py with overridden paths
@@ -198,7 +204,7 @@ def test_verify_single_task_phantom():
     if os.path.exists(verifications_file):
         os.unlink(verifications_file)
 
-    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+    verify_script = VERIFY_TASK_SCRIPT
     import importlib.util
     spec = importlib.util.spec_from_file_location("verify_task_phantom", verify_script)
     vt = importlib.util.module_from_spec(spec)
@@ -250,7 +256,7 @@ def test_verify_single_task_not_found():
         conn.commit()
         conn.close()
 
-    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+    verify_script = VERIFY_TASK_SCRIPT
     import importlib.util
     spec = importlib.util.spec_from_file_location("verify_task_nf", verify_script)
     vt = importlib.util.module_from_spec(spec)
@@ -290,7 +296,7 @@ def test_spawn_verify_task():
 
         # We need to define _spawn_verify_task inline since importing __init__.py
         # has complex dependencies. Let's test the logic directly.
-        _VERIFY_TASK_SCRIPT = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+        _VERIFY_TASK_SCRIPT = VERIFY_TASK_SCRIPT
 
         def _spawn_verify_task(task_id):
             if not os.path.exists(_VERIFY_TASK_SCRIPT):
@@ -374,7 +380,7 @@ def test_task_id_bypasses_idempotency():
             "verifier_version": "1.0"
         }) + "\n")
 
-    verify_script = os.path.expanduser("~/.hermes/scripts/verify-task.py")
+    verify_script = VERIFY_TASK_SCRIPT
     import importlib.util
     spec = importlib.util.spec_from_file_location("verify_task_idemp", verify_script)
     vt = importlib.util.module_from_spec(spec)

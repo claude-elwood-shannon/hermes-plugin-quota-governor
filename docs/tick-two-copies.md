@@ -2,7 +2,7 @@
 
 The tick has TWO copies on this host:
 
-  repo (source of truth):  REPO/scripts/quota-governor-tick.sh
+  repo (source of truth):  <repo>/scripts/quota-governor-tick.sh
   deployed (cron runs this): ~/.hermes/scripts/quota-governor-tick.sh
 
 Cron job quota-governor-tick (660d1cf8f994, no_agent, 15 min) executes the
