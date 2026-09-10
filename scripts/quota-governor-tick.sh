@@ -173,9 +173,16 @@ log "session=${SESSION_PCT}% weekly=${WEEKLY_PCT}% reqs=${SESSION_REQS}/${WEEKLY
 
 # ── Observation row (OBJ-26a follow-up, t_92d7f0d6) ──────────────────────────
 # ── Portable default: resolve the plugin repo from THIS script's location ──
-# (works on any clone path; overrides via env still win)
+# Repo copy: dirname(scripts/) IS the repo. Deployed copy (~/.hermes/scripts/):
+# fall back to the plugins symlink (points at the live checkout). Env wins.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_DIR="${PLUGIN_DIR:-$(dirname "$SCRIPT_DIR")}"
+PLUGIN_DIR="${PLUGIN_DIR:-}"
+if [[ -z "$PLUGIN_DIR" ]]; then
+    for _cand in "$HOME/.hermes/plugins/hermes-plugin-quota-governor" "$(dirname "$SCRIPT_DIR")"; do
+        if [[ -f "$_cand/concurrency_guard.py" ]]; then PLUGIN_DIR="$_cand"; break; fi
+    done
+    PLUGIN_DIR="${PLUGIN_DIR:-$(dirname "$SCRIPT_DIR")}"
+fi
 export PLUGIN_DIR
 
 # The tick decides but never persisted a snapshot; the in-process hooks do
