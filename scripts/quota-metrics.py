@@ -10,9 +10,23 @@ Salida:
     {ts, running, ready, blocked, triage,
      ollama_session_pct, ollama_weekly_pct, ollama_weekly_reqs,
      nanogpt_weekly_pct, opencode_weekly_pct, opencode_rolling_pct,
-     providers_ok}
+     providers_ok,
+     supply_created_24h, supply_closed_24h, supply_ratio}
   - stdout SOLO en anomalia (patron watchdog): si no se pudo muestrear
     NINGUN provider o el board esta ilegible. Silencio = muestra OK.
+
+OBJ-29 (t_a821194b; diseno en triage t_99e3b849, capa 1 EXTRACCION):
+supply_ratio = tareas_creadas / tareas_cerradas en la ventana rodante de
+24h UTC (ventana "por dia" rodante; los buckets diarios se reconstruyen
+con la ultima fila de cada dia UTC).
+  created = task_events kind='created' — exactamente una por tarea.
+  closed  = task_events kind='completed' — done sellado. 'archived' NO
+            cuenta: es limpieza posterior de tareas ya completadas y
+            duplicaria el denominador.
+  supply_ratio = created/closed (3 decimales). None cuando closed==0:
+            indefinido, NO deficit — consumidores (alarma OBJ-27 F2)
+            deben mirar supply_created_24h/supply_closed_24h crudos.
+  Ratio < 1.0 sostenido con cuota libre = deficit de suministro.
 
 Reutiliza providers.py del plugin (retries + last-good fallback).
 Fallo de un provider no rompe la fila: se registra providers_ok y pcts=None.
@@ -28,6 +42,11 @@ PLUGIN_DIR = "REPO"
 KANBAN_DB = Path("~/.hermes/kanban.db")
 OUT = Path("~/.hermes/profiles/pr-ollama/quota-governor/metrics-history.jsonl")
 LAST_GOOD_DIR = Path("~/.hermes/profiles/pr-ollama/quota-governor")
+# OBJ-26: ledger de balance NanoGPT (constante inyectable para tests —
+# MainRow la apunta a un path inexistente para que el bloque degrade a
+# campos ausentes sin tocar el perfil real ni sondear la API).
+NANOGPT_LEDGER = ("REPO"
+                  "/scripts/nanogpt-balance-ledger.py")
 
 
 def board_counts():
@@ -41,6 +60,44 @@ def board_counts():
             "blocked": n[2] or 0, "triage": n[3] or 0}
 
 
+VENTANA_SUPPLY_SEG = 86400  # OBJ-29: ventana rodante 24h (UTC)
+
+
+def supply_counts(now_epoch=None, db_path=None):
+    """OBJ-29: (creadas, cerradas) en la ventana rodante de 24h UTC.
+
+    created: task_events kind='created' — exactamente una por tarea
+    (verificado live: COUNT(created) == COUNT(tasks) en el board completo).
+    closed:  kind='completed' — done sellado. 'archived' NO cuenta (limpieza
+    posterior de tareas ya completadas; contarlas duplicaria el denominador).
+    """
+    now = time.time() if now_epoch is None else now_epoch
+    lo = now - VENTANA_SUPPLY_SEG
+    con = sqlite3.connect(f"file:{db_path or KANBAN_DB}?mode=ro", uri=True)
+    try:
+        created, closed = con.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM task_events "
+            " WHERE kind='created' AND created_at >= ?), "
+            "(SELECT COUNT(*) FROM task_events "
+            " WHERE kind='completed' AND created_at >= ?)",
+            (lo, lo)).fetchone()
+    finally:
+        con.close()
+    return int(created), int(closed)
+
+
+def supply_ratio(created, closed):
+    """created/closed redondeado a 3 decimales; None si closed <= 0.
+
+    None NO significa deficit: sin cierres el ratio es indefinido — los
+    consumidores (alarma OBJ-27 F2) miran los componentes crudos.
+    """
+    if not closed or closed <= 0:
+        return None
+    return round(created / closed, 3)
+
+
 def from_last_good(name):
     try:
         d = json.load(open(LAST_GOOD_DIR / f"{name}-last-good.json"))
@@ -50,7 +107,7 @@ def from_last_good(name):
 
 
 def main():
-    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    row: dict = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     # board
     try:
@@ -58,6 +115,18 @@ def main():
     except Exception as e:
         print(f"quota-metrics: board ilegible: {e}")
         return 0
+
+    # OBJ-29: supply_ratio (suministro de objetivos, t_99e3b849 capa 1).
+    # Fallo de lectura no rompe la fila: campos a None (known-unknown).
+    try:
+        created, closed = supply_counts()
+        row["supply_created_24h"] = created
+        row["supply_closed_24h"] = closed
+        row["supply_ratio"] = supply_ratio(created, closed)
+    except Exception:
+        row["supply_created_24h"] = None
+        row["supply_closed_24h"] = None
+        row["supply_ratio"] = None
 
     # providers via last-good (el tick/gate ya los refresco hace <15min;
     # providers.py directo seria una segunda probe — evitamos duplicar
@@ -81,9 +150,8 @@ def main():
     try:
         sys.path.insert(0, "REPO/scripts")
         import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location(
-            "nanogpt_balance_ledger",
-            "REPO/scripts/nanogpt-balance-ledger.py")
+        _spec = _ilu.spec_from_file_location("nanogpt_balance_ledger",
+                                             NANOGPT_LEDGER)
         if _spec is None or _spec.loader is None:
             raise ImportError("cannot load nanogpt-balance-ledger spec")
         _mod = _ilu.module_from_spec(_spec)
