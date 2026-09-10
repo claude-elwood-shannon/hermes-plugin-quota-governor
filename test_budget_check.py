@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-PLUGIN = "REPO"
+PLUGIN = str(Path(__file__).resolve().parent)
 SPEC = importlib.util.spec_from_file_location(
     "budget_check", f"{PLUGIN}/scripts/budget_check.py")
 bc = importlib.util.module_from_spec(SPEC)

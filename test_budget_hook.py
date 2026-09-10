@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 # importar el plugin como package real: sys.path incluye el PADRE del plugin
-PLUGIN_DIR = "REPO"
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(PLUGIN_DIR))
 import hermes_plugin_quota_governor as plug  # noqa: E402
 

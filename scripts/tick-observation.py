@@ -38,7 +38,7 @@ import sys
 from pathlib import Path
 
 PLUGIN_DIR = os.environ.get(
-    "PLUGIN_DIR", "REPO")
+    "PLUGIN_DIR", str(Path(__file__).resolve().parent.parent))
 _LEDGER_SCRIPT = os.path.join(
     PLUGIN_DIR, "scripts", "nanogpt-balance-ledger.py")
 

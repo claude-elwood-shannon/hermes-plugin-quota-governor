@@ -26,7 +26,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-GOV_DIR = "REPO"
+GOV_DIR = str(Path(__file__).resolve().parent.parent.parent)
 TRACE_SCRIPT = os.path.join(GOV_DIR, "scripts", "obs", "trace.py")
 
 _spec = importlib.util.spec_from_file_location("obs_trace", TRACE_SCRIPT)

@@ -76,8 +76,9 @@ def _nanogpt_budget_ctx():
     _NANOGPT_BUDGET["loaded"] = True
     try:
         import importlib.util
-        path = ("REPO/scripts/"
-                "nanogpt-balance-ledger.py")
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts", "nanogpt-balance-ledger.py")
         spec = importlib.util.spec_from_file_location(
             "nanogpt_balance_ledger", path)
         if spec is None or spec.loader is None:

@@ -47,13 +47,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-HERMES_SRC = "~/.hermes/hermes-agent"
+HERMES_SRC = os.environ.get(
+    "HERMES_SRC", os.path.expanduser("~/.hermes/hermes-agent"))
+_HERMES_ROOT = Path(os.environ.get("HERMES_HOME",
+                                   os.path.expanduser("~/.hermes")))
 KANBAN_DB = Path(os.environ.get("TRIAGE_BRIDGE_DB",
-                                "~/.hermes/kanban.db"))
+                                str(_HERMES_ROOT / "kanban.db")))
 LEDGER = Path(os.environ.get("TRIAGE_BRIDGE_LEDGER",
-    "~/.hermes/quota-governor/triage-bridge.jsonl"))
+    str(_HERMES_ROOT / "quota-governor" / "triage-bridge.jsonl")))
 KILL_SWITCH = Path(os.environ.get("TRIAGE_BRIDGE_KILL_SWITCH",
-                                  "~/.hermes/quota-governor/PROMOTE-STOP"))
+    str(_HERMES_ROOT / "quota-governor" / "PROMOTE-STOP")))
 MAX_PER_TICK = 1
 VALID_COSTS = {"micro", "tiny", "small", "medium"}
 

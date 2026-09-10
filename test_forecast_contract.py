@@ -20,9 +20,7 @@ import time
 import unittest
 from pathlib import Path
 
-PLUGIN = "REPO"
-
-
+PLUGIN = str(Path(__file__).resolve().parent)
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)

@@ -57,7 +57,7 @@ from pathlib import Path
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-REPO_DIR = "REPO"
+REPO_DIR = str(Path(__file__).resolve().parent.parent)
 KANBAN_DB = os.path.expanduser("~/.hermes/kanban.db")
 SYNC_FILE = os.path.expanduser("~/.hermes/quota-governor/repo-sync.jsonl")
 LOG_FILE = os.path.expanduser("~/.hermes/logs/repo-sync-check.log")

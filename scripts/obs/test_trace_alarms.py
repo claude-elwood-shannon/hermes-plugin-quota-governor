@@ -28,7 +28,7 @@ import time
 import unittest
 from pathlib import Path
 
-GOV_DIR = "REPO"
+GOV_DIR = str(Path(__file__).resolve().parent.parent.parent)
 ALARMS_SCRIPT = os.path.join(GOV_DIR, "scripts", "obs", "trace-alarms.py")
 
 _spec = importlib.util.spec_from_file_location("trace_alarms", ALARMS_SCRIPT)

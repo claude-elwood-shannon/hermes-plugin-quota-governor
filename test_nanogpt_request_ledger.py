@@ -22,7 +22,7 @@ import tempfile
 import types
 import unittest
 
-GOV_DIR = "REPO"
+GOV_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(GOV_DIR, "scripts", "nanogpt-balance-ledger.py")
 CAPTURE = "~/.hermes/hermes-agent/agent/nanogpt_pricing_capture.py"
 

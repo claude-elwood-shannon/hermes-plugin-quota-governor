@@ -16,7 +16,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-PLUGIN = "REPO"
+PLUGIN = str(Path(__file__).resolve().parent)
 SPEC = importlib.util.spec_from_file_location(
     "backtest_f2", f"{PLUGIN}/scripts/backtest-f2.py")
 assert SPEC is not None and SPEC.loader is not None

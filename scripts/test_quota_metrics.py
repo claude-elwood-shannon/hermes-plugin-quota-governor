@@ -26,7 +26,7 @@ import time
 import unittest
 from pathlib import Path
 
-GOV_DIR = "REPO"
+GOV_DIR = str(Path(__file__).resolve().parent.parent)
 METRICS_SCRIPT = Path(GOV_DIR) / "scripts" / "quota-metrics.py"
 
 _spec = importlib.util.spec_from_file_location("quota_metrics", METRICS_SCRIPT)

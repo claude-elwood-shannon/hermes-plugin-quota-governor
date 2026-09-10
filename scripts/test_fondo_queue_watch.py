@@ -34,7 +34,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-GOV_DIR = "REPO"
+GOV_DIR = str(Path(__file__).resolve().parent.parent)
 SCRIPT = os.path.join(GOV_DIR, "scripts", "fondo-queue-watch.py")
 
 _spec = importlib.util.spec_from_file_location("fondo_queue_watch", SCRIPT)

@@ -13,4 +13,5 @@
 # live) regardless of which profile runs the cron daemon. Same convention as
 # morning-screen-cron.sh / trace-alarms-cron.sh.
 export HERMES_HOME="$HOME/.hermes/profiles/pr-ollama"
-exec /usr/bin/python3.12 "REPO/scripts/fondo-queue-watch.py" --execute
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec /usr/bin/python3.12 "$SCRIPT_DIR/fondo-queue-watch.py" --execute

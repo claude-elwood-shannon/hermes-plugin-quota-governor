@@ -32,21 +32,25 @@ Reutiliza providers.py del plugin (retries + last-good fallback).
 Fallo de un provider no rompe la fila: se registra providers_ok y pcts=None.
 """
 import json
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
-HERMES_SRC = "~/.hermes/hermes-agent"
-PLUGIN_DIR = "REPO"
-KANBAN_DB = Path("~/.hermes/kanban.db")
-OUT = Path("~/.hermes/profiles/pr-ollama/quota-governor/metrics-history.jsonl")
-LAST_GOOD_DIR = Path("~/.hermes/profiles/pr-ollama/quota-governor")
+HERMES_SRC = os.environ.get(
+    "HERMES_SRC", os.path.expanduser("~/.hermes/hermes-agent"))
+_PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERMES_ROOT = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+PLUGIN_DIR = _PLUGIN_ROOT
+KANBAN_DB = Path(HERMES_ROOT) / "kanban.db"
+OUT = Path(HERMES_ROOT) / "profiles" / "pr-ollama" / "quota-governor" / "metrics-history.jsonl"
+LAST_GOOD_DIR = Path(HERMES_ROOT) / "profiles" / "pr-ollama" / "quota-governor"
 # OBJ-26: ledger de balance NanoGPT (constante inyectable para tests —
 # MainRow la apunta a un path inexistente para que el bloque degrade a
 # campos ausentes sin tocar el perfil real ni sondear la API).
-NANOGPT_LEDGER = ("REPO"
-                  "/scripts/nanogpt-balance-ledger.py")
+NANOGPT_LEDGER = os.path.join(_PLUGIN_ROOT, "scripts",
+                              "nanogpt-balance-ledger.py")
 
 
 def board_counts():
@@ -148,7 +152,7 @@ def main():
     # nanogpt-balance-ledger.py, 60s cache) + level + weekly budget state.
     ng_mod = None
     try:
-        sys.path.insert(0, "REPO/scripts")
+        sys.path.insert(0, os.path.join(_PLUGIN_ROOT, "scripts"))
         import importlib.util as _ilu
         _spec = _ilu.spec_from_file_location("nanogpt_balance_ledger",
                                              NANOGPT_LEDGER)

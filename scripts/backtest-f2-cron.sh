@@ -4,4 +4,5 @@
 # HERMES_HOME is pinned to pr-ollama (where F1/F2 keep metrics-history
 # and forecast.json) regardless of which profile runs the cron daemon.
 export HERMES_HOME="$HOME/.hermes/profiles/pr-ollama"
-exec /usr/bin/python3.12 "REPO/scripts/backtest-f2.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec /usr/bin/python3.12 "$SCRIPT_DIR/backtest-f2.py"

@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 # Add the plugin directory to the path
-PLUGIN_DIR = "REPO"
+PLUGIN_DIR = str(Path(__file__).resolve().parent)
 sys.path.insert(0, PLUGIN_DIR)
 
 # Isolate HERMES_HOME and kanban DB

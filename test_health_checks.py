@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Add the plugin directory to the path
-PLUGIN_DIR = "REPO"
+PLUGIN_DIR = str(Path(__file__).resolve().parent)
 sys.path.insert(0, PLUGIN_DIR)
 
 # We need to import health_checks with a modified HERMES_HOME

@@ -57,7 +57,7 @@ PROPOSALS_FILE = os.path.expanduser(
 LOG_FILE = os.path.expanduser("~/.hermes/logs/objective-proposer.log")
 
 # validate-guardrails.py location: prefer plugin repo, fall back to scripts dir
-PLUGIN_REPO = "REPO"
+PLUGIN_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VALIDATE_SCRIPT_CANDIDATES = [
     os.path.join(PLUGIN_REPO, "scripts", "validate-guardrails.py"),
     os.path.expanduser("~/.hermes/scripts/validate-guardrails.py"),

@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-GOV_DIR = "REPO"
+GOV_DIR = str(Path(__file__).resolve().parent)
 LEDGER_SCRIPT = os.path.join(GOV_DIR, "scripts", "nanogpt-balance-ledger.py")
 TICK_OBS_SCRIPT = os.path.join(GOV_DIR, "scripts", "tick-observation.py")
 
