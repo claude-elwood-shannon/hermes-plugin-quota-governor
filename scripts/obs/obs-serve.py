@@ -254,6 +254,9 @@ def main(argv=None) -> int:
     ap.add_argument("--headless", action="store_true",
                     help="no server: regenerate the static portal and exit "
                          "(adoptants)")
+    ap.add_argument("--out", default=None,
+                    help="with --headless: write the static portal here "
+                         "instead of the default obs/portal/")
     ap.add_argument("--check", action="store_true",
                     help="supervisor probe: exit 0 when the URL is alive, "
                          "1 when dead (the tick's respawn trigger)")
@@ -273,7 +276,7 @@ def main(argv=None) -> int:
         print("obs-serve: stopped" if ok else "obs-serve: not running")
         return 0
     if args.headless:
-        target = pb.write_portal()
+        target = pb.write_portal(out=args.out)
         print(f"obs-serve: static portal at {target}")
         return 0
 
