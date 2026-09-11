@@ -400,6 +400,19 @@ def run(hermes_home=None, execute: bool = False, now=None,
         act({"ts": now, "action": "body-parts", "msg": msg}, msg)
         return decisions
 
+    # ── Step 3.6 (OBJ-40-NIGHT, 11-sep 22:55): drought is NOT legitima while
+    # a ready task with a NAMED assignee sits unpicked and there is free
+    # quota — assign it (same as step 1 but triggered by drought, covering
+    # tasks assigned AFTER the tick ran). Also catches ready tasks that
+    # gained an assignee between ticks with 0 running: the dispatcher claims
+    # them, but if it didn't within 2 ticks, force the claim by re-assign.
+    if not execute:
+        act({"ts": now, "action": "drought-check"},
+            "cola viva: paso 3.6 anti-sequia evaluado (dry-run)")
+        return decisions
+    # fall through to step 4 only when genuinely nothing exists —
+    # the drought declaration below must be TRUE when reached with 0 ready.
+
     # ── Step 4: nothing legitimate — cola seca legitima, no filler ──
     act({"ts": now, "action": "cola-seca-legitima",
          "reason": "sin ready sin assignee, sin ready con assignee, sin "
