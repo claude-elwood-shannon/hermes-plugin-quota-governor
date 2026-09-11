@@ -273,11 +273,16 @@ class TestRunChecks(Base):
                                            now=NOW), [])
 
     def test_main_prints_one_line_per_alarm(self):
-        rows = [_trace_event(NOW - 3600 * i, "claimed", "t_loop")
-                for i in range(1, 4)]
-        self._write_trace(rows)
+        # main() reads the trace from disk with the WALL CLOCK: the loop
+        # fixture must be relative to now, not to the module's fixed NOW
+        # (fixed epochs made this test detonate two days after it was
+        # written — the crash-loop window is "last 24h", always relative).
         import io
         import contextlib
+        rows = [dict(_trace_event(time.time() - 3600 * i, "claimed",
+                                  "t_loop"))
+                for i in range(1, 4)]
+        self._write_trace(rows)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = alarms.main([])

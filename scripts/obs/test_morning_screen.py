@@ -89,8 +89,12 @@ class Base(unittest.TestCase):
         con = sqlite3.connect(db)
         con.execute("CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, "
                     "assignee TEXT, body TEXT, completed_at REAL)")
+        # done 24h is wall-clock relative (the screen compares against
+        # time.time()): the fixture must be relative, never a fixed epoch.
+        recent = time.time() - 60
         con.execute("INSERT INTO tasks VALUES "
-                    "('t_1','F0 trace','done','pr-ollama','objective:OBJ-27', 1788998186)")
+                    "('t_1','F0 trace','done','pr-ollama','objective:OBJ-27', ?)",
+                    (recent,))
         con.execute("INSERT INTO tasks VALUES "
                     "('t_2','F5 matrix','running','pr-ollama','objective:OBJ-30 | cost:small', NULL)")
         con.execute("INSERT INTO tasks VALUES "
