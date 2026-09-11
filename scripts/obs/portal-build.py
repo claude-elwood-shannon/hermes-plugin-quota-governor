@@ -799,21 +799,28 @@ def page_consumo(data: dict, query: dict = None) -> str:
     else:
         toc = []
         sections = []
-        picked = [n for n, _ in dims["obj"][:12]]
-        if "unattributed" in dict(dims["obj"]) and \
-                "unattributed" not in picked:
-            picked.append("unattributed")
-        for name in picked:
-            sid = f"d-obj-{_slug(name)}"
-            sub_reqs = [r for r in reqs_all
-                        if (r.get("objective") or "unattributed") == name]
-            usd = dict(dims["obj"]).get(name, {}).get("usd", 0.0)
-            toc.append(f'<a href="#{sid}">{_esc(name)}</a>')
-            sections.append(
-                f'<div class="detail-block" id="{sid}">'
-                f'<h3>{_esc(name)} · {_esc(_usd(usd))} · '
-                f'{len(sub_reqs)} requests</h3>'
-                + _request_table(sub_reqs, limit=30) + "</div>")
+        # every DIMENSION gets drill-down blocks (the index/consumo tables
+        # link to them); objetivo first, then clase/modelo/proveedor.
+        dim_specs = (("obj", "objective", "objetivo"), ("cls",
+                      "consumer_class", "clase"), ("model", "model",
+                                                   "modelo"),
+                     ("prov", "provider", "proveedor"))
+        for dim, key, cap in dim_specs:
+            picked = [n for n, _ in dims[dim][:12]]
+            if "unattributed" in dict(dims[dim]) and \
+                    "unattributed" not in picked:
+                picked.append("unattributed")
+            for name in picked:
+                sid = f"d-{dim}-{_slug(name)}"
+                sub_reqs = [r for r in reqs_all
+                            if (r.get(key) or "unattributed") == name]
+                usd = dict(dims[dim]).get(name, {}).get("usd", 0.0)
+                toc.append(f'<a href="#{sid}">{_esc(cap)}:{_esc(name)}</a>')
+                sections.append(
+                    f'<div class="detail-block" id="{sid}">'
+                    f'<h3>{_esc(cap)} {_esc(name)} · {_esc(_usd(usd))} · '
+                    f'{len(sub_reqs)} requests</h3>'
+                    + _request_table(sub_reqs, limit=30) + "</div>")
         out.append('<div class="toc">' + "".join(toc) + "</div>")
         out.extend(sections)
     out.append("</section>")
