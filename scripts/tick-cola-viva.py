@@ -12,10 +12,16 @@ Cascade (max 1 action per tick, idempotent):
      silent stop: ready-without-assignee is claimed by nobody).
   2. Else if ready tasks WITH assignee exist, the queue is alive (the
      dispatcher claims them within ~60s) — log and skip, no new work.
-  3. Else create ONE structural class-C successor of the most recent done
+  3. Create ONE structural class-C successor of the most recent done
      task (<24h, body 'clase:C') that has no open successor yet
      (pattern: docs of the undocumented, test of the new, hardening of the
      fragile). assignee pr-ollama, cost tiny/small.
+  3.5 (OBJ-39) Successors from closed bodies: closed multi-part tasks
+     (body declaring R1/R2/.../Fase N) whose evidence never covered all
+     declared parts spawn a successor carrying the pending parts — via
+     tick_body_parts.cascade_step. Runs BEFORE the structural successor
+     and BEFORE the drought verdict: a dry queue with pending parts in
+     sealed bodies is not a legitima dry queue.
   4. Else log 'cola seca legitima' and create nothing (golden rule: no filler).
 
 Gates (all must hold to act):
@@ -38,6 +44,7 @@ Exit codes: 0 always (the tick must never break on this).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -124,12 +131,14 @@ def ready_tasks(db_path: Path) -> list:
     return [dict(r) for r in rows]
 
 
-def recent_clase_c_done(db_path: Path, hours: int = DONE_WINDOW_HOURS) -> list:
+def recent_clase_c_done(db_path, hours: int = DONE_WINDOW_HOURS,
+                        now: float | None = None) -> list:
     """Recently closed (done) class-C tasks, newest first — for structural
-    successors. A task is class-C if its body carries the 'clase:C' tag."""
+    successors. A task is class-C if its body carries the 'clase:C' tag.
+    `now` injectable for deterministic tests (fixed-epoch convention)."""
     if not db_path.exists():
         return []
-    cutoff = time.time() - hours * 3600
+    cutoff = (time.time() if now is None else float(now)) - hours * 3600
     try:
         con = _connect(db_path)
         try:
@@ -245,6 +254,42 @@ def assign_task(task_id: str, assignee: str) -> bool:
     return _cli("assign", task_id, assignee).returncode == 0
 
 
+def _load_body_parts():
+    """Lazy-load tick_body_parts.cascade_step from PLUGIN_DIR (OBJ-39).
+
+    Fail-open: if the module is missing (older deployed plugin) the
+    body-parts step is simply skipped — the cola-viva cascade keeps its
+    pre-OBJ-39 behavior and the tick never breaks."""
+    plugin_dir = os.environ.get("PLUGIN_DIR", "")
+    candidates = []
+    if plugin_dir:
+        candidates.append(Path(plugin_dir) / "scripts" / "tick_body_parts.py")
+    candidates.append(Path(__file__).resolve().parent / "tick_body_parts.py")
+    for cand in candidates:
+        try:
+            if not cand.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location(
+                "tick_body_parts", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.cascade_step
+        except Exception:
+            continue
+    return None
+
+
+BP_CASCADE = None
+
+
+def _bp_cascade(db, ledger, execute=False, now=None):
+    global BP_CASCADE
+    if BP_CASCADE is None:
+        BP_CASCADE = _load_body_parts()
+    return BP_CASCADE(db, ledger, execute=execute, now=now) \
+        if BP_CASCADE else None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -325,7 +370,7 @@ def run(hermes_home=None, execute: bool = False, now=None,
 
     # ── Step 3: create ONE structural class-C successor of the most recent
     # done task (<24h, clase:C) that has no open successor yet ──
-    for parent in recent_clase_c_done(db):
+    for parent in recent_clase_c_done(db, now=now):
         if has_open_successor(db, parent["id"]):
             continue
         title, body = build_successor(parent)
@@ -343,6 +388,16 @@ def run(hermes_home=None, execute: bool = False, now=None,
             return decisions
         act({"ts": now, "action": "create-failed", "parent": parent["id"]},
             f"cola seca: fallo al crear sucesor de {parent['id']}")
+        return decisions
+
+    # ── Step 3.5: successors from closed bodies (OBJ-39-REBELION) ──
+    # BEFORE the structural successor and BEFORE declaring the drought
+    # legitima: closed multi-part bodies with unevidenced parts are work
+    # waiting in the seal. Only step 1 (assign an existing ready task)
+    # outranks this. Actions come from tick_body_parts.cascade_step.
+    msg = _bp_cascade(db, ledger, execute=execute, now=now)
+    if msg:
+        act({"ts": now, "action": "body-parts", "msg": msg}, msg)
         return decisions
 
     # ── Step 4: nothing legitimate — cola seca legitima, no filler ──
