@@ -174,6 +174,18 @@ consumed per provider from the model-cost + burn ledgers).
 - Cron (register once):
   `hermes cron create weekly-progress --name weekly-progress --script weekly-progress-cron.sh --no-agent --deliver local "0 23 * * 0"`
 
+## GPU health section (OBJ-27)
+
+The observability portal's **GPU ml-host** page
+(`scripts/obs/portal-build.py` → `read_gpu_health` / `page_gpu`) shows
+temperature, VRAM, utilization, the active vLLM model, daily rounds, service
+state and a thermal sparkline. Its configuration surface is documented in
+[`docs/gpu-health-config.md`](docs/gpu-health-config.md) — note there is
+currently **no dynamic config surface**: every option is a hardcoded module
+constant (`_GPU_HOST`, `_GPU_API`, `_GPU_CACHE`, `_GPU_CACHE_TTL`), the
+section is always rendered, and unreachable-host cases degrade to empty
+states (`n/d`, `unknown`) rather than fake zeros.
+
 ## Deterministic zombie guard (OBJ-21)
 
 Guardrail G3 of the autonomous-task-creator prompt ("any running task older
