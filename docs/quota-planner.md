@@ -150,7 +150,15 @@ that in three ways:
    4.6x apart. The PROFILE_WORKER_MODELS enforcement (G7 fix, same
    window) is the real cost control; tiering without pinning the worker
    model is not.
-3. **Window budget pressure at current dispatch rate.** The 18:45Z
+3. **Provider resolution drift (Sep 12 2026, t_8aca6e5b).** The G7 map
+   assumed pr-ollama's default provider was ollama-cloud, but
+   config.yaml had drifted to `provider: custom` (nano-gpt.com/v1).
+   Tasks pinned `--model gpt-oss:20b` WITHOUT `--provider` fell to
+   custom/nano-gpt and crashed with HTTP 400. Fix: `model_aliases` in
+   pr-ollama config.yaml now maps gpt-oss:20b and deepseek-v4-flash to
+   ollama-cloud, so `--model` alone resolves correctly. The cron
+   prompt G7 PROVIDER RULE was updated to reflect this.
+4. **Window budget pressure at current dispatch rate.** The 18:45Z
    window metered $14.01 ledger-estimated vs $12 budget (console
    confirmed 100.2% — the +16% upper bound). One glm-5.2 small task
    alone = 43% of a window; at the observed untagged mean ($1.00/task
