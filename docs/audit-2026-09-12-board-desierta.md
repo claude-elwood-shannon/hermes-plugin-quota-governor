@@ -66,3 +66,34 @@ misma auditoría) con su verificación y las anomalías restantes del día.
   t_61fed817 requiere limpieza manual de override (remediación logueada
   por el watchdog; no hay canal de mutación kanban desde este contexto).
 - Watchdog v3.1 desplegado y probado; sin sucesores fantasma en cola.
+
+## Corrección t_35af47ea (audit independiente, 14:15 CEST)
+
+1. REFUTADA — los "7 blocks sin evento a las 13:00:49" no existen. Query
+   label-based (sin manipulación de epochs) sobre `task_events`:
+   cero eventos `blocked`/`gave_up` en 13:00:40–13:01:10; en toda la
+   ventana 13:00-13:01 solo hay heartbeats/comments/completed de otras
+   tareas. Cada una de las 7 tareas llevaba su evento legítimo previo:
+   t_03352224 blocked Sep-10 20:11, t_b128cb7d blocked Sep-11 01:35,
+   t_fdbba03c blocked 11:57:22, t_f4c24cca/t_3de9e23f/t_33a26e4c gave_up
+   10:15–11:57 (+13:17/13:18), t_61fed817 gave_up 13:03:50 — y ni
+   siquiera existía a las 13:00:49 (created 13:02:18). El "13:00:49" es
+   un artefacto de zona horaria en la consulta original (epoch UTC
+   tratado como local desplaza la ventana ~2h; la ventana real de los
+   gave_up agrupados es ~11:00–11:03 y 13:17–13:18). No hay autor
+   sin identificar: no hay misterio que identificar.
+2. NUEVA — Autoría del override envenenado de t_61fed817: el evento
+   `model_override_set` (liodon-ai/Qwen2.5-7B-Instruct-FP8, provider
+   custom) ocurrió 13:49:23, 19s después del spawn del run 682 de esta
+   misma auditoría (t_66abe2b5, spawned 13:49:04, murió rc=0 sin
+   terminal-call). La auditoría hermana fijó el override y su muerte
+   dejó la mutación sin documentar; el crash-loop rc=0 (runs 691-702)
+   es consecuencias de esa mutación con un modelo 404, no fallos
+   transitorios. t_66abe2b5 completó en su run 701 (14:09, commit
+   caf6f35) pero la remediación sigue abierta: `hermes kanban set-model
+   t_61fed817 none` + unblock (canal con mutación kanban).
+3. Confirmación operativa: sin daemon externo (`pgrep -f 'kanban
+   daemon'` vacío desde 14:01), guard v2 activo en el tick (14:01:43
+   "gateway dispatcher active — NOT respawning"), test de copias
+   desplegadas 7/7, y el único pid_not_alive del día posterior a 13:59
+   es ninguno (la firma post-guerra es solo rc=0-sin-terminal).
