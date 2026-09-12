@@ -25,6 +25,14 @@ Safety properties (mirrors diagnose-crash.py):
   - Max 1 sync task per tick total (flood prevention across all repos).
   - Per-repo idempotency: queries the board for an existing pending sync task
     for that repo before creating; tracks created tasks in repo-sync.jsonl.
+  - Sibling-WIP suppression (t_261f31e3): uncommitted files while a kanban
+    task holds a live claim (status='running', heartbeat < 10 min old) AND the
+    desync itself is fresh (< 2h) are treated as that task's WIP — no sync
+    card. Untracked '??' files younger than 6h are ignored entirely (fresh
+    WIP is not debt). Suppression is per-tick: it lifts automatically when
+    the heartbeat goes stale or the files persist past the window.
+  - Dedupe window: a sync card for the same repo created within the last 2h
+    (ANY status — a just-resolved card counts) suppresses a new alert.
   - Oldest-desync priority: from the dirty repos that need a task, creates the
     task for the repo that has been desynced the longest.
   - Fail-safe config: a corrupt/malformed repo-watch.json aborts with no tasks
@@ -78,6 +86,18 @@ DEPLOY_DIRS = (
 DEFAULT_ASSIGNEE = "pr-nanogpt"
 DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE = "origin"
+
+# ── Sibling-WIP suppression (t_261f31e3) ─────────────────────────────────────
+# A desync signal that is actually WORK-IN-PROGRESS of a live kanban worker is
+# a false positive: two identical "Repo sync needed" cards were created 30 min
+# apart (t_f2ff57c5, t_ad90e6e4) for files being edited by t_a8d38c10's worker.
+# A task whose worker holds a claim with fresh heartbeats is ALIVE; its repo
+# edits are that task's deliverable, not a sync debt.
+WIP_HEARTBEAT_MAX_AGE = 600      # task heartbeat younger than this => live worker
+UNTRACKED_MIN_AGE = 6 * 3600     # only count '??' files older than 6h (fresh WIP is not debt)
+DEDUPE_WINDOW_SECONDS = 2 * 3600 # no re-alert for the same repo within 2h
+WIP_MAX_DESYNC_AGE = 2 * 3600    # suppress only if the desync itself is younger than 2h
+LIVE_TASK_STATUSES = ("running",)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -163,12 +183,23 @@ def git(args, cwd=REPO_DIR):
         out = out[:-1]
     return result.returncode, out, result.stderr.strip()
 
-def get_uncommitted_changes(cwd=REPO_DIR):
-    """Return list of changed tracked files (excluding .worktrees/ and untracked)."""
-    rc, out, _ = git(["status", "--porcelain", "--untracked-files=no"], cwd=cwd)
+def get_uncommitted_changes(cwd=REPO_DIR, include_untracked=False):
+    """Return list of changed files (tracked by default; untracked opt-in).
+
+    With include_untracked=True, '??' entries are returned too, each carrying
+    an 'age_seconds' field (now - mtime; 0 if the file vanished mid-scan).
+    .worktrees/ paths are always excluded.
+    """
+    args = ["status", "--porcelain"]
+    if include_untracked:
+        args.append("--untracked-files=normal")
+    else:
+        args.append("--untracked-files=no")
+    rc, out, _ = git(args, cwd=cwd)
     if rc != 0:
         log(f"git status failed (rc={rc}) in {cwd}", "ERROR")
         return []
+    now = time.time()
     changes = []
     for line in out.splitlines():
         if not line.strip():
@@ -182,7 +213,11 @@ def get_uncommitted_changes(cwd=REPO_DIR):
             path = line[3:].split(" -> ")[-1].strip()
         if not path or path.startswith(".worktrees/"):
             continue
-        changes.append({"status": status, "path": path})
+        entry = {"status": status, "path": path, "age_seconds": None}
+        if status == "??":
+            mtime = _min_mtime_for_changes(cwd, [{"path": path}])
+            entry["age_seconds"] = max(0, now - mtime) if mtime else 0
+        changes.append(entry)
     return changes
 
 def get_ahead_count(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
@@ -474,6 +509,117 @@ def _legacy_key(rec):
     # Old single-repo records: treat as the legacy REPO_DIR.
     return f"{REPO_DIR}@{DEFAULT_REMOTE}"
 
+# ── Sibling-WIP suppression (t_261f31e3) ─────────────────────────────────────
+
+def find_live_sibling_workers(conn, exclude_task_id=None,
+                              heartbeat_max_age=WIP_HEARTBEAT_MAX_AGE,
+                              now=None):
+    """Return live claimed tasks: status='running' with a recent heartbeat.
+
+    Uses the tasks table only (last_heartbeat_at is updated by the dispatcher
+    on every worker heartbeat, ~60s cadence). `now`/`heartbeat_max_age` are
+    injectable for tests. A stale heartbeat (>= max_age old) does NOT count:
+    a crashed worker keeps status='running' until reclaim, and its claim's
+    repo edits may then be genuine sync debt.
+    """
+    if conn is None:
+        return []
+    now = time.time() if now is None else now
+    placeholders = ",".join("?" for _ in LIVE_TASK_STATUSES)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id, assignee, last_heartbeat_at, worker_pid, current_run_id
+            FROM tasks
+            WHERE status IN ({placeholders})
+              AND last_heartbeat_at IS NOT NULL
+            """,
+            LIVE_TASK_STATUSES,
+        ).fetchall()
+    except sqlite3.Error as e:
+        # Minimal/legacy tasks schema without heartbeat columns: cannot detect
+        # live workers — fail open (no suppression) rather than crash.
+        log(f"find_live_sibling_workers: query failed ({e}) — WIP detection unavailable", "WARN")
+        return []
+    live = []
+    for r in rows:
+        hb = r["last_heartbeat_at"]
+        try:
+            hb = float(hb)
+        except (TypeError, ValueError):
+            continue
+        age = now - hb
+        if age < 0 or age > heartbeat_max_age:
+            continue
+        if exclude_task_id and r["id"] == exclude_task_id:
+            continue
+        live.append({
+            "task_id": r["id"],
+            "assignee": r["assignee"],
+            "heartbeat_age": round(age, 1),
+            "worker_pid": r["worker_pid"],
+            "run_id": r["current_run_id"],
+        })
+    return live
+
+
+def find_recent_sync_task(conn, repo, window_seconds=DEDUPE_WINDOW_SECONDS, now=None):
+    """Return the most recent OBJ-13 sync card for this repo within `window_seconds`.
+
+    Matches on repo basename in the title (the title embeds it), regardless of
+    status — a recently RESOLVED sync card also suppresses a new identical
+    alert, because the board history shows the signal was already handled. This
+    complements has_pending_sync_task(), which only sees still-open cards.
+    """
+    if conn is None:
+        return None
+    now = time.time() if now is None else now
+    basename = repo_basename(repo)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, status, created_at, completed_at
+            FROM tasks
+            WHERE title LIKE 'OBJ-13: Repo sync%'
+              AND title LIKE ?
+              AND created_at >= ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (f"%{basename}%", now - window_seconds),
+        ).fetchall()
+    except sqlite3.Error as e:
+        log(f"find_recent_sync_task: query failed ({e}) — dedupe unavailable", "WARN")
+        return None
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "task_id": r["id"],
+        "title": r["title"],
+        "status": r["status"],
+        "age_seconds": round(now - r["created_at"], 1),
+    }
+
+
+def annotate_wip_files(cwd, changes):
+    """Return (tracked_changes, fresh_untracked, old_untracked).
+
+    fresh_untracked: '??' files younger than UNTRACKED_MIN_AGE (likely live
+    worker WIP — excluded from alert counts). old_untracked: the rest.
+    """
+    tracked, fresh_untracked, old_untracked = [], [], []
+    for c in changes:
+        if c.get("status") == "??":
+            age = c.get("age_seconds")
+            if age is not None and age < UNTRACKED_MIN_AGE:
+                fresh_untracked.append(c)
+            else:
+                old_untracked.append(c)
+        else:
+            tracked.append(c)
+    return tracked, fresh_untracked, old_untracked
+
 # ── Task Creation ────────────────────────────────────────────────────────────
 
 def build_sync_body(uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH, assignee=None):
@@ -584,34 +730,50 @@ def create_sync_task(uncommitted, ahead_commits, cfg):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def _repo_needs_sync(cfg):
-    """Return (uncommitted, ahead_commits) or (None, None) if repo is clean/invalid.
+    """Return (uncommitted, ahead_commits, wip) or (None, None, None) if clean/invalid.
 
-    Also verifies the repo dir is a valid git checkout; invalid repos are
-    skipped with a warning (fail-safe), never fatal.
+    uncommitted = tracked changes + OLD untracked files (age >= UNTRACKED_MIN_AGE).
+    Fresh untracked files (likely live-worker WIP) are excluded from the signal
+    and returned in wip["fresh_untracked"] for verbose reporting. Invalid repos
+    are skipped with a warning (fail-safe), never fatal.
     """
     repo = cfg["repo"]
     if not os.path.isdir(os.path.join(repo, ".git")):
         log(f"Repo not found or not a git checkout at {repo} — skipping", "WARN")
-        return None, None
-    uncommitted = get_uncommitted_changes(cwd=repo)
+        return None, None, None
+    raw_changes = get_uncommitted_changes(cwd=repo, include_untracked=True)
+    tracked, fresh_untracked, old_untracked = annotate_wip_files(repo, raw_changes)
+    if fresh_untracked:
+        log(f"Repo {repo}: {len(fresh_untracked)} fresh untracked file(s) ignored "
+            f"(< {UNTRACKED_MIN_AGE}s old — likely live worker WIP)", "INFO")
+    uncommitted = tracked + old_untracked
     ahead_commits = get_ahead_commits(cwd=repo, remote=cfg["remote"], branch=cfg["branch"])
     if not uncommitted and not ahead_commits:
-        return [], []
-    return uncommitted, ahead_commits
+        return [], [], {"fresh_untracked": fresh_untracked}
+    return uncommitted, ahead_commits, {"fresh_untracked": fresh_untracked}
 
 def _gather_dirty_repos(configs, db_path):
-    """Return list of {cfg, uncommitted, ahead_commits, desync_time, pending} for dirty repos."""
+    """Return list of dirty-repo dicts with WIP-suppression and dedupe decisions.
+
+    Each entry carries: cfg, uncommitted, ahead_commits, desync_time, pending,
+    pending_id, live_workers, recent_sync (dedupe hit) and eligible (final
+    decision for this tick).
+    """
     dirty = []
     conn = None
+    now_ts = time.time()
     try:
         if os.path.isfile(db_path):
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
+        # Live workers are board-global (a task's scratch workspace says nothing
+        # about which repo its worker edits), so evaluate once, not per repo.
+        live_workers = find_live_sibling_workers(conn, now=now_ts)
         for cfg in configs:
             if not cfg["enabled"]:
                 log(f"Repo disabled in config: {cfg['repo']} — skipping", "INFO")
                 continue
-            uncommitted, ahead_commits = _repo_needs_sync(cfg)
+            uncommitted, ahead_commits, wip = _repo_needs_sync(cfg)
             if uncommitted is None:
                 continue
             if not uncommitted and not ahead_commits:
@@ -623,6 +785,28 @@ def _gather_dirty_repos(configs, db_path):
                 pending = has_pending_sync_task(conn, repo=cfg["repo"])
                 pending_id = pending[0]["id"] if pending else None
             desync_time = compute_desync_time(cfg["repo"], uncommitted, ahead_commits, cfg["remote"], cfg["branch"])
+
+            # Sibling-WIP suppression: uncommitted files (not ahead commits —
+            # commits are deliberate, publishable work) while a worker holds a
+            # live claim are that task's WIP, not sync debt. Only suppress
+            # while the desync itself is young (WIP_MAX_DESYNC_AGE): an
+            # uncommitted debt that PRE-DATES the worker's claim — or survives
+            # a live worker by hours — is a real orphaned change, not WIP.
+            # Desync timestamp unavailable (all mtimes unreadable) → fall
+            # through to suppression only if no dedupe/pending hit applies.
+            wip_window = (desync_time is None) or (now_ts - desync_time <= WIP_MAX_DESYNC_AGE)
+            wip_suppressed = bool(live_workers) and bool(uncommitted) and not ahead_commits and wip_window
+            if wip_suppressed:
+                live_ids = ", ".join(w["task_id"] for w in live_workers)
+                log(f"Repo {cfg['repo']}: uncommitted files match live worker claim(s) "
+                    f"[{live_ids}] and desync is fresh — suppressed as sibling WIP", "INFO")
+
+            # Dedupe: a sync card for this repo created inside the dedupe
+            # window (ANY status — resolved counts too) means the signal was
+            # already surfaced; re-creating it is noise (t_f2ff57c5 → t_ad90e6e4).
+            recent_sync = find_recent_sync_task(conn, cfg["repo"], now=now_ts) if conn is not None else None
+
+            eligible = not pending_id and not wip_suppressed and not recent_sync
             dirty.append({
                 "cfg": cfg,
                 "uncommitted": uncommitted,
@@ -630,6 +814,11 @@ def _gather_dirty_repos(configs, db_path):
                 "desync_time": desync_time,
                 "pending": bool(pending_id),
                 "pending_id": pending_id,
+                "live_workers": live_workers,
+                "wip_suppressed": wip_suppressed,
+                "recent_sync": recent_sync,
+                "fresh_untracked": wip["fresh_untracked"] if wip else [],
+                "eligible": eligible,
             })
     finally:
         if conn:
@@ -693,19 +882,51 @@ def main():
         sys.exit(0)
 
     # A repo that already has a pending sync task for IT is not eligible to
-    # create a new one this tick; it's already covered.
-    candidates = [d for d in dirty if not d["pending"]]
+    # create a new one this tick; it's already covered. Sibling-WIP
+    # suppression and the dedupe window add two more skip reasons (computed
+    # per-repo in _gather_dirty_repos).
+    candidates = [d for d in dirty if d["eligible"]]
 
     # Flood prevention: cap total new tasks at 1 per tick. Among eligible
     # (non-pending) dirty repos, pick the one with the OLDEST desync.
     if not candidates:
-        # Every dirty repo already has a pending task on the board.
-        if VERBOSE:
-            print("SKIP: all dirty repos already have pending sync tasks on board")
         for d in dirty:
             p = d.get("pending_id")
             if p:
                 log(f"Repo {d['cfg']['repo']} already pending ({p}) — not creating duplicate", "INFO")
+                continue
+            if d.get("wip_suppressed"):
+                lw = d.get("live_workers") or []
+                ids = ", ".join(w["task_id"] for w in lw) or "?"
+                print(
+                    f"SKIP_WIP: {repo_basename(d['cfg']['repo'])} uncommitted files are sibling-WIP "
+                    f"of live task(s) {ids} — not creating a sync card (suppression re-evaluated every tick)"
+                )
+                continue
+            if d.get("recent_sync"):
+                rs = d["recent_sync"]
+                print(
+                    f"SKIP_DEDUPE: {repo_basename(d['cfg']['repo'])} already alerted "
+                    f"{rs['age_seconds']/60:.0f} min ago ({rs['task_id']}, status={rs['status']}) — "
+                    f"within the {DEDUPE_WINDOW_SECONDS//60} min dedupe window"
+                )
+                continue
+            if d.get("live_workers"):
+                # No uncommitted files (else WIP would have matched) — pure
+                # unpushed-commits debt while workers happen to be live.
+                # Fallback guard: the ledger may still show a very recent
+                # creation that the board query missed (DB write lag).
+                if recently_synced_repo(d["cfg"]["repo"], d["cfg"]["remote"], window_seconds=DEDUPE_WINDOW_SECONDS):
+                    print(
+                        f"SKIP_DEDUPE: {repo_basename(d['cfg']['repo'])} ledger records a sync card "
+                        f"created within the last {DEDUPE_WINDOW_SECONDS//60} min — not re-alerting"
+                    )
+                    continue
+        if VERBOSE:
+            for d in dirty:
+                fu = d.get("fresh_untracked") or []
+                if fu:
+                    print(f"  fresh untracked (ignored, WIP): {', '.join(c['path'] for c in fu[:10])}")
         sys.exit(0)
 
     candidates.sort(key=lambda d: d["desync_time"] if d["desync_time"] is not None else float("inf"))
@@ -741,7 +962,9 @@ def main():
         if uncommitted:
             summary_parts.append(f"{len(uncommitted)} uncommitted files")
             for c in uncommitted[:10]:
-                print(f"  UNCOMMITTED: [{c['status']}] {c['path']}")
+                age = c.get("age_seconds")
+                age_s = f" (age {int(age)}s)" if age is not None else ""
+                print(f"  UNCOMMITTED: [{c['status']}] {c['path']}{age_s}")
         if ahead_commits:
             summary_parts.append(f"{len(ahead_commits)} unpushed commits")
             for c in ahead_commits[:10]:

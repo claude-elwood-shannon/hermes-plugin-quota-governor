@@ -24,6 +24,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -50,6 +51,9 @@ from repo_sync_check import (
     load_synced_records,
     record_sync,
     build_sync_body,
+    find_live_sibling_workers,
+    find_recent_sync_task,
+    annotate_wip_files,
 )
 
 
@@ -631,8 +635,8 @@ class TestGatherDirtyRepos(_LogIsolationMixin, unittest.TestCase):
         """2 dirty repos → both gathered; desync_time allows oldest-first pick."""
         self._patch("repo_sync_check._repo_needs_sync",
                     side_effect=[
-                        ([{"status": " M", "path": "a.py"}], []),
-                        ([{"status": " M", "path": "b.py"}], []),
+                        ([{"status": " M", "path": "a.py"}], [], {"fresh_untracked": []}),
+                        ([{"status": " M", "path": "b.py"}], [], {"fresh_untracked": []}),
                     ])
         self._patch("repo_sync_check.compute_desync_time",
                     side_effect=[100, 50])
@@ -655,7 +659,7 @@ class TestGatherDirtyRepos(_LogIsolationMixin, unittest.TestCase):
         """A repo disabled in config is not gathered."""
         self._patch("repo_sync_check._repo_needs_sync",
                     side_effect=[
-                        ([{"status": " M", "path": "a.py"}], []),  # only repoA called
+                        ([{"status": " M", "path": "a.py"}], [], {"fresh_untracked": []}),  # only repoA called
                     ])
         self._patch("repo_sync_check.os.path.isfile", return_value=False)
 
@@ -673,7 +677,7 @@ class TestGatherDirtyRepos(_LogIsolationMixin, unittest.TestCase):
         """A repo with an existing pending board task is flagged as pending."""
         self._patch("repo_sync_check._repo_needs_sync",
                     side_effect=[
-                        ([{"status": " M", "path": "a.py"}], []),
+                        ([{"status": " M", "path": "a.py"}], [], {"fresh_untracked": []}),
                     ])
         db = _make_kanban_db([{"id": "t_p", "title": "OBJ-13: Repo sync repoA needed", "status": "todo"}])
         self._patch("repo_sync_check.os.path.isfile", return_value=True)
@@ -685,6 +689,230 @@ class TestGatherDirtyRepos(_LogIsolationMixin, unittest.TestCase):
         self.assertEqual(len(dirty), 1)
         self.assertTrue(dirty[0]["pending"])
         self.assertEqual(dirty[0]["pending_id"], "t_p")
+
+
+class TestSiblingWipSuppression(_LogIsolationMixin, unittest.TestCase):
+    """Sibling-WIP suppression + dedupe (t_261f31e3).
+
+    Regression: the scanner created two identical "Repo sync needed" cards 30
+    min apart (t_f2ff57c5, t_ad90e6e4) for files that were the WIP of live
+    task t_a8d38c10 (OBJ-42 capa 2, worker pr-ollama, heartbeats every ~60s).
+    """
+
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        super().setUp()  # LOG_FILE redirect
+        self.patchers = []
+
+    def tearDown(self):
+        for p in self.patchers:
+            try:
+                p.stop()
+            except Exception:
+                pass
+        super().tearDown()
+
+    def _patch(self, target, **kw):
+        p = patch(target, **kw)
+        p.start()
+        self.patchers.append(p)
+        return p
+
+    @staticmethod
+    def _db(tasks):
+        """Temp kanban.db with full-column tasks; returns path."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(path)
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT, status TEXT,
+                assignee TEXT, last_heartbeat_at REAL, worker_pid INTEGER,
+                current_run_id INTEGER, created_at REAL, completed_at REAL
+            )
+        """)
+        for t in tasks:
+            conn.execute(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    t.get("id"), t.get("title", "x"), t.get("status", "todo"),
+                    t.get("assignee"), t.get("last_heartbeat_at"),
+                    t.get("worker_pid"), t.get("current_run_id"),
+                    t.get("created_at", 0), t.get("completed_at"),
+                ),
+            )
+        conn.commit()
+        conn.close()
+        return path
+
+    def _gather(self, db_tasks, db_path, uncommitted=None, ahead=None, desync=None):
+        self._patch("repo_sync_check._repo_needs_sync",
+                    side_effect=[(uncommitted or [{"status": " M", "path": "gateway/kanban_watchers.py"}],
+                                  ahead or [], {"fresh_untracked": []})])
+        self._patch("repo_sync_check.compute_desync_time", return_value=desync if desync is not None else self.NOW - 120)
+        self._patch("repo_sync_check.time.time", return_value=self.NOW)
+        return _mod._gather_dirty_repos(self._configs([{"repo": "/r/hermes-agent"}]), db_path=db_path)
+
+    def _configs(self, entries):
+        return [_mod._normalize_config(e) for e in entries]
+
+    # -- find_live_sibling_workers ------------------------------------------
+
+    def test_live_worker_fresh_heartbeat(self):
+        db = self._db([{"id": "t_a8d38c10", "status": "running", "assignee": "pr-ollama",
+                        "last_heartbeat_at": self.NOW - 60, "worker_pid": 862}])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            live = find_live_sibling_workers(conn, now=self.NOW)
+        finally:
+            conn.close()
+        self.assertEqual([l["task_id"] for l in live], ["t_a8d38c10"])
+        self.assertEqual(live[0]["assignee"], "pr-ollama")
+
+    def test_stale_heartbeat_not_live(self):
+        db = self._db([{"id": "t_dead", "status": "running", "last_heartbeat_at": self.NOW - 3600}])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(find_live_sibling_workers(conn, now=self.NOW), [])
+        finally:
+            conn.close()
+
+    def test_done_and_heartbeatless_not_live(self):
+        db = self._db([
+            {"id": "t_done", "status": "done", "last_heartbeat_at": self.NOW - 10},
+            {"id": "t_nohb", "status": "running", "last_heartbeat_at": None},
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(find_live_sibling_workers(conn, now=self.NOW), [])
+        finally:
+            conn.close()
+
+    def test_future_heartbeat_ignored(self):
+        """Clock skew guard: heartbeat in the future is not 'live'."""
+        db = self._db([{"id": "t_skew", "status": "running", "last_heartbeat_at": self.NOW + 999}])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(find_live_sibling_workers(conn, now=self.NOW), [])
+        finally:
+            conn.close()
+
+    # -- find_recent_sync_task (dedupe window) -------------------------------
+
+    def test_dedupe_matches_recent_card_any_status(self):
+        db = self._db([
+            {"id": "t_f2ff57c5",
+             "title": "OBJ-13: Repo sync hermes-agent needed (2 uncommitted) [2026-09-12 22:31]",
+             "status": "done", "created_at": self.NOW - 30 * 60},
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            hit = find_recent_sync_task(conn, "/home/iinstances/.hermes/hermes-agent", now=self.NOW)
+        finally:
+            conn.close()
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["task_id"], "t_f2ff57c5")
+        self.assertEqual(hit["status"], "done")
+
+    def test_dedupe_ignores_card_outside_window(self):
+        db = self._db([
+            {"id": "t_old", "title": "OBJ-13: Repo sync hermes-agent needed", "status": "done",
+             "created_at": self.NOW - 3 * 3600},
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertIsNone(find_recent_sync_task(conn, "/home/iinstances/.hermes/hermes-agent", now=self.NOW))
+        finally:
+            conn.close()
+
+    def test_dedupe_ignores_other_repo(self):
+        db = self._db([
+            {"id": "t_qg", "title": "OBJ-13: Repo sync hermes-plugin-quota-governor needed (1 unpushed)",
+             "status": "todo", "created_at": self.NOW - 5 * 60},
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertIsNone(find_recent_sync_task(conn, "/home/iinstances/.hermes/hermes-agent", now=self.NOW))
+        finally:
+            conn.close()
+
+    # -- annotate_wip_files ---------------------------------------------------
+
+    def test_annotate_splits_by_untracked_age(self):
+        changes = [
+            {"status": " M", "path": "tracked.py", "age_seconds": None},
+            {"status": "??", "path": "fresh.py", "age_seconds": 120},
+            {"status": "??", "path": "old.py", "age_seconds": 7 * 3600},
+            {"status": "??", "path": "unknown.py", "age_seconds": None},
+        ]
+        tracked, fresh, old = annotate_wip_files("/tmp", changes)
+        self.assertEqual([c["path"] for c in tracked], ["tracked.py"])
+        self.assertEqual([c["path"] for c in fresh], ["fresh.py"])
+        self.assertEqual([c["path"] for c in old], ["old.py", "unknown.py"])
+
+    # -- _gather_dirty_repos integration --------------------------------------
+
+    def test_wip_of_live_worker_suppressed(self):
+        """THE t_a8d38c10 replay: fresh uncommitted + live worker → no card."""
+        db = self._db([{"id": "t_a8d38c10", "status": "running",
+                        "last_heartbeat_at": self.NOW - 60}])
+        dirty = self._gather(db_tasks=None, db_path=db)
+        self.assertEqual(len(dirty), 1)
+        self.assertTrue(dirty[0]["wip_suppressed"])
+        self.assertFalse(dirty[0]["eligible"])
+
+    def test_uncommitted_with_live_worker_but_old_desync_eligible(self):
+        """Debt older than WIP_MAX_DESYNC_AGE predates the claim → alert."""
+        db = self._db([{"id": "t_live", "status": "running",
+                        "last_heartbeat_at": self.NOW - 60}])
+        dirty = self._gather(db_tasks=None, db_path=db, desync=self.NOW - 5 * 3600)
+        self.assertFalse(dirty[0]["wip_suppressed"])
+        self.assertTrue(dirty[0]["eligible"])
+
+    def test_unpushed_commits_not_suppressed_by_live_worker(self):
+        """Ahead commits are deliberate work: WIP suppression must not eat them."""
+        db = self._db([{"id": "t_live", "status": "running",
+                        "last_heartbeat_at": self.NOW - 60}])
+        dirty = self._gather(db_tasks=None, db_path=db,
+                             uncommitted=[], ahead=[{"hash": "abc1234", "message": "feat"}],
+                             desync=self.NOW - 60)
+        self.assertFalse(dirty[0]["wip_suppressed"])
+        self.assertTrue(dirty[0]["eligible"])
+
+    def test_dedupe_window_blocks_realert_even_when_resolved(self):
+        """Second identical alert 30 min after the first was handled → skip."""
+        db = self._db([
+            {"id": "t_live", "status": "running", "last_heartbeat_at": self.NOW - 3 * 3600},  # dead
+            {"id": "t_ad90e6e4", "title": "OBJ-13: Repo sync hermes-agent needed (2 uncommitted)",
+             "status": "done", "created_at": self.NOW - 30 * 60},
+        ])
+        dirty = self._gather(db_tasks=None, db_path=db)
+        self.assertFalse(dirty[0]["wip_suppressed"])
+        self.assertIsNotNone(dirty[0]["recent_sync"])
+        self.assertFalse(dirty[0]["eligible"])
+
+    def test_missing_desync_ts_suppresses_conservatively(self):
+        """desync_time=None + live worker + uncommitted → suppress (safe side)."""
+        db = self._db([{"id": "t_live", "status": "running",
+                        "last_heartbeat_at": self.NOW - 60}])
+        dirty = self._gather(db_tasks=None, db_path=db, desync=None)
+        self.assertTrue(dirty[0]["wip_suppressed"])
+
+    def test_no_db_fail_open(self):
+        """Board DB unavailable → no suppression, no dedupe (create if needed)."""
+        dirty = self._gather(db_tasks=None, db_path="/nonexistent/db")
+        self.assertFalse(dirty[0]["wip_suppressed"])
+        self.assertIsNone(dirty[0]["recent_sync"])
+        self.assertTrue(dirty[0]["eligible"])
 
 
 class TestMainMultiRepo(unittest.TestCase):
@@ -718,6 +946,11 @@ class TestMainMultiRepo(unittest.TestCase):
                 "desync_time": 200,
                 "pending": False,
                 "pending_id": None,
+                "live_workers": [],
+                "wip_suppressed": False,
+                "recent_sync": None,
+                "fresh_untracked": [],
+                "eligible": True,
             },
             {
                 "cfg": _mod._normalize_config({"repo": "/r/repoB"}),
@@ -726,6 +959,11 @@ class TestMainMultiRepo(unittest.TestCase):
                 "desync_time": 100,  # older → this wins
                 "pending": False,
                 "pending_id": None,
+                "live_workers": [],
+                "wip_suppressed": False,
+                "recent_sync": None,
+                "fresh_untracked": [],
+                "eligible": True,
             },
         ]
         self._patch("repo_sync_check._gather_dirty_repos", return_value=dirty)
@@ -762,6 +1000,11 @@ class TestMainMultiRepo(unittest.TestCase):
                 "desync_time": 100,
                 "pending": True,
                 "pending_id": "t_p",
+                "live_workers": [],
+                "wip_suppressed": False,
+                "recent_sync": None,
+                "fresh_untracked": [],
+                "eligible": False,
             },
         ]
         self._patch("repo_sync_check._gather_dirty_repos", return_value=dirty)
