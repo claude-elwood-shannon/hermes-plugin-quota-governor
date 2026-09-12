@@ -41,7 +41,28 @@ from pathlib import Path
 HERMES_SRC = os.environ.get(
     "HERMES_SRC", os.path.expanduser("~/.hermes/hermes-agent"))
 _PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HERMES_ROOT = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+
+
+def _resolve_hermes_root() -> str:
+    """Root ~/.hermes for SHARED resources (kanban.db), profile home for
+    profile-scoped state. The cron env sets HERMES_HOME to the PROFILE
+    (…/profiles/pr-ollama); the kanban board lives at the root
+    (~/.hermes/kanban.db), so a bare HERMES_HOME/kanban.db points at a
+    nonexistent file and the board sample dies with 'unable to open
+    database file' (t_99e3b849: zero rows after 2026-09-10 15:15 UTC).
+    Mirrors health_checks._get_hermes_root / concurrency_guard: when
+    HERMES_HOME is a profile subdir, the shared root is ~/.hermes."""
+    val = os.environ.get("HERMES_HOME", "").strip() or os.path.expanduser("~/.hermes")
+    root = Path(val).resolve()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    try:
+        root.relative_to(profiles_root)
+        return str((Path.home() / ".hermes").resolve())
+    except ValueError:
+        return str(root)
+
+
+HERMES_ROOT = _resolve_hermes_root()
 PLUGIN_DIR = _PLUGIN_ROOT
 KANBAN_DB = Path(HERMES_ROOT) / "kanban.db"
 OUT = Path(HERMES_ROOT) / "profiles" / "pr-ollama" / "quota-governor" / "metrics-history.jsonl"

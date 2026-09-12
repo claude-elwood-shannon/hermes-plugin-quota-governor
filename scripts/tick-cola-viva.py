@@ -87,12 +87,30 @@ def state_dir(hermes_home=None) -> Path:
     return base / "quota-governor"
 
 
+def _get_hermes_root() -> Path:
+    """Shared root (~/.hermes) for board/state that lives OUTSIDE profiles.
+
+    The cron env sets HERMES_HOME to the profile (…/profiles/pr-ollama);
+    the kanban board is a shared resource at ~/.hermes/kanban.db, so a
+    bare HERMES_HOME/kanban.db points at a nonexistent file (t_99e3b849).
+    Mirrors health_checks._get_hermes_root / concurrency_guard."""
+    val = os.environ.get("HERMES_HOME", "").strip()
+    home = Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    try:
+        home.relative_to(profiles_root)
+        return (Path.home() / ".hermes").resolve()
+    except ValueError:
+        return home
+
+
 def kanban_db_path(hermes_home=None) -> Path:
     env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if env_db:
         return Path(env_db).expanduser().resolve()
-    base = Path(hermes_home) if hermes_home else get_hermes_home()
-    return base / "kanban.db"
+    if hermes_home:
+        return Path(hermes_home) / "kanban.db"
+    return _get_hermes_root() / "kanban.db"
 
 
 def ledger_path(hermes_home=None) -> Path:
@@ -306,7 +324,10 @@ def run(hermes_home=None, execute: bool = False, now=None,
     """One tick. Returns list of decision strings (empty = silent)."""
     now = time.time() if now is None else float(now)
     home = Path(hermes_home) if hermes_home else get_hermes_home()
-    db = kanban_db_path(home)
+    # Board resolution: only pin the DB from an EXPLICIT hermes_home arg
+    # (tests pass a fixture dir). In production main() passes nothing and
+    # kanban_db_path() resolves the shared root board from the env.
+    db = kanban_db_path(home) if hermes_home else kanban_db_path()
     ledger = ledger_path(home)
 
     decisions: list[str] = []
