@@ -895,14 +895,14 @@ PROFILE_MODELS = {
 # Internal server error — also not usable.
 PROFILE_WORKER_MODELS = {
     # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.1 approved by the user in
-    # t_bef3cbf0): deepseek-v4-flash -> gpt-oss:20b for cheap workers.
-    # Data: gpt-oss:20b $0.07/$0.30 USD/M in/out, NO peak pricing, probe
-    # 200 OK (10.2 §4.2), $0.000028/micro-call measured (10.3 §5.2) — 3x
-    # cheaper than deepseek off-peak and 6x during DeepSeek peak windows
-    # (price x2 Mon-Fri 12:00-18:00 UTC = EU working hours, MULTI-PROV-07).
-    # deepseek-v4-flash ($0.22/$0.66, peak x2) remains callable on
-    # ollama-cloud (19/19 models OK) as fallback.
-    "pr-ollama": "gpt-oss:20b",             # $0.07/$0.30/M, no peak pricing
+    # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.1): gpt-oss:20b for cheap workers —
+    #    REVOKED Sep 12 2026 (user order, after 4 workers died with
+    #    rc=0/protocol-violation): gpt-oss:20b DOES NOT EXIST on this host's
+    #    ollama (no local inference — /api/tags only lists :cloud models).
+    #    The 10.5 probe hit ollama-cloud's catalog, not the local server.
+    #    Worker pin restored to deepseek-v4-flash:cloud (present in /api/tags,
+    #    free with session, tool-calling proven on 30+ kanban tasks).
+        "pr-ollama": "deepseek-v4-flash:cloud", # RESTORED Sep 12 2026 — verified in local /api/tags
     "pr-nanogpt": "z-ai/glm-5.3-flash",     # Sep 8 2026: subscription-COVERED (proven by
                                             # worker t_154b29f2, run 407 — no HTTP 402, real
                                             # artifacts in workspace).  Probe 8-sep 00:55 CEST:
