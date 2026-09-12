@@ -81,6 +81,20 @@ if [[ -f "$STOP_FILE" ]]; then
     exit 0
 fi
 
+# DIRECCION-STOP kill switch (OBJ-42): direction-mode emergency stop.
+# Independent of the quota STOP above: while this file exists the tick does
+# NOTHING (no quota gate, no decision, no daemon touch, no cola viva, no
+# dual-dispatcher guard) — every autonomous layer of delegated direction
+# halts and the flight returns to the pre-OBJ-42 regime. Cleared only by
+# the user (rm) or the clear command below. The quota STOP remains the
+# automatic fuel guard; DIRECCION-STOP is the user's hand on the switch.
+DIRECCION_STOP_FILE="$HERMES_HOME/quota-governor/DIRECCION-STOP"
+if [[ -f "$DIRECCION_STOP_FILE" ]]; then
+    log "DIRECCION-STOP active (mandate halted by user) — tick inert"
+    echo "DIRECCION-STOP: mandato de dirección detenido por el usuario — tick inerte"
+    exit 0
+fi
+
 # Query + decide in one python3 call (avoids proxy issues with curl)
 # Output: action|max_workers|session_pct|weekly_pct|session_reqs|weekly_reqs|cost|write_stop|reason
 RESULT=$(python3 -c "

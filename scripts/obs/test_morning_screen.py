@@ -89,8 +89,12 @@ class Base(unittest.TestCase):
         con = sqlite3.connect(db)
         con.execute("CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, "
                     "assignee TEXT, body TEXT, completed_at REAL)")
+        # Relative epoch (pitfall: never hard-code calendar dates in tests —
+        # a fixed 'done 24h' fixture silently expires and fails forever).
+        t_1_completed = time.time() - 600
         con.execute("INSERT INTO tasks VALUES "
-                    "('t_1','F0 trace','done','pr-ollama','objective:OBJ-27', 1788998186)")
+                    "('t_1','F0 trace','done','pr-ollama','objective:OBJ-27', ?)",
+                    (t_1_completed,))
         con.execute("INSERT INTO tasks VALUES "
                     "('t_2','F5 matrix','running','pr-ollama','objective:OBJ-30 | cost:small', NULL)")
         con.execute("INSERT INTO tasks VALUES "
@@ -263,6 +267,58 @@ class TestCompose(Base):
 
     def test_empty_when_all_sources_missing(self):
         self.assertEqual(screen.build_screen(hermes_home=self.home()), "")
+
+
+class TestFlightReport(Base):
+    # Injected `now` per the same pitfall as the board fixture: a Monday
+    # computed from the live clock expires when the test runs on another day.
+    # 2026-09-14 08:00 CEST is a Monday (weekday 0 local). Never hand-compute
+    # an epoch — derive it: dt.datetime(2026, 9, 14, 8, tzinfo=CEST).timestamp()
+    MONDAY_NOW = 1789365600.0
+
+    def test_renders_on_monday_grouped_by_objective(self):
+        self._seed_board()
+        out = screen.build_flight_report(hermes_home=self.home(),
+                                         now=self.MONDAY_NOW)
+        self.assertIn("VUELO", out)
+        self.assertIn("cerradas 7d: 1", out)
+        self.assertIn("OBJ-27: 1 cerradas (t_1)", out)
+
+    def test_absent_other_days(self):
+        self._seed_board()
+        saturday = self.MONDAY_NOW + 5 * 86400
+        self.assertEqual(screen.build_flight_report(hermes_home=self.home(),
+                                                    now=saturday), "")
+
+    def test_no_closures_7d_flagged_for_verification(self):
+        # A done task OUTSIDE the 7d window (8d old) must exercise the
+        # 'sin cierres' branch — window boundary, not a missing db.
+        db = Path(self.tmp) / "kanban.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, "
+                    "assignee TEXT, body TEXT, completed_at REAL)")
+        con.execute("INSERT INTO tasks VALUES "
+                    "('t_9','old','done','pr-ollama','objective:OBJ-27', ?)",
+                    (self.MONDAY_NOW - 8 * 86400,))
+        con.commit()
+        con.close()
+        out = screen.build_flight_report(hermes_home=self.home(),
+                                         now=self.MONDAY_NOW)
+        self.assertIn("sin cierres en 7d", out)
+        self.assertIn("verificar", out)
+
+    def test_balance_spend_only_counts_costusd_rows(self):
+        self._seed_board()
+        _write_jsonl(Path(self.tmp) / "quota-governor" / "obs" / "trace.jsonl", [
+            # costUsd > 0 inside the window = balance-billed; counts
+            {"ts_epoch_utc": self.MONDAY_NOW - 100, "costUsd": 0.5},
+            # costUsd None (free quota) and outside window rows don't count
+            {"ts_epoch_utc": self.MONDAY_NOW - 100, "costUsd": None},
+            {"ts_epoch_utc": self.MONDAY_NOW - 10 * 86400, "costUsd": 9.0},
+        ])
+        out = screen.build_flight_report(hermes_home=self.home(),
+                                         now=self.MONDAY_NOW)
+        self.assertIn("$0.5000", out)
 
 
 class TestPortability(unittest.TestCase):

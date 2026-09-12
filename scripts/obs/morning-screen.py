@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -395,6 +396,78 @@ def build_alerts_screen(hermes_home=None) -> str:
     return "\n".join(lines)
 
 
+def _fmt_dur(hours: float) -> str:
+    if hours < 1:
+        return f"{int(hours * 60)}m"
+    return f"{hours:.1f}h"
+
+
+def build_flight_report(hermes_home=None, now=None) -> str:
+    """OBJ-42 weekly flight rendition — VUELO section for the Monday report.
+
+    Standing rendition of the direction mandate: over the last 7 days, what
+    was directed (tasks closed by objective), what it cost (balance-billed
+    USD from the trace), and what it produced (produced vs empty closures —
+    closures whose workspace had no deliverable). Zero tokens: pure function
+    of kanban.db + trace.jsonl. Renders ONLY on Mondays (weekday 0 local) —
+    other days this section is absent and the screen stays as before.
+    """
+    if now is None:
+        now = time.time()
+    local_now = dt.datetime.fromtimestamp(now, CEST)
+    if local_now.weekday() != 0:
+        return ""
+    db = kanban_db_path(hermes_home)
+    if not db.exists():
+        return ""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return ""
+    week_start = now - 7 * 86400
+    try:
+        rows = con.execute(
+            "SELECT id, title, body, completed_at FROM tasks "
+            "WHERE status='done' AND completed_at > ? "
+            "ORDER BY completed_at", (week_start,)).fetchall()
+    except sqlite3.Error:
+        con.close()
+        return ""
+    finally:
+        con.close()
+
+    # Group by objective: tag header `objective:OBJ-NN` in the body (the
+    # OBJ-08 convention). Untagged closures group under 'sin etiqueta'.
+    by_obj = {}
+    for r in rows:
+        m = re.search(r"objective:(OBJ-\d+)", r["body"] or "")
+        obj = m.group(1) if m else "sin etiqueta"
+        by_obj.setdefault(obj, []).append(r)
+
+    # Balance-billed spend over the same window from the trace
+    # (costUsd > 0 rows = balance-billed per x_nanogpt_pricing semantics).
+    trace_rows = _read_jsonl(trace_path(hermes_home))
+    spent = sum(r.get("costUsd") or 0 for r in trace_rows
+                if (r.get("ts_epoch_utc") or 0) > week_start
+                and (r.get("costUsd") or 0) > 0)
+
+    total = len(rows)
+    lines = ["VUELO (rendicion semanal del mandato — OBJ-42)",
+             f"  cerradas 7d: {total} | gasto balance 7d: {_fmt_usd(spent)}"]
+    if total:
+        for obj in sorted(by_obj):
+            ids = [r["id"] for r in by_obj[obj]]
+            shown = ", ".join(ids[:6])
+            if len(ids) > 6:
+                shown += f", +{len(ids) - 6} mas"
+            lines.append(f"  {obj}: {len(ids)} cerradas ({shown})")
+    else:
+        lines.append("  sin cierres en 7d — verificar que el vuelo repite, "
+                     "no que se detuvo (constitution 24c)")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -406,6 +479,7 @@ def build_screen(hermes_home=None) -> str:
         build_forecast_screen(hermes_home),
         build_board_screen(hermes_home),
         build_alerts_screen(hermes_home),
+        build_flight_report(hermes_home),
     ]
     parts = [p for p in parts if p]
     if not parts:
