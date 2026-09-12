@@ -961,7 +961,9 @@ class TestCostModelMap(unittest.TestCase):
         # Sep 12 2026: gpt-oss:20b REVOKED — absent from local ollama /api/tags
         # (no local inference on this host; 4 workers died rc=0). Back to
         # deepseek-v4-flash:cloud per user order.
-        self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "deepseek-v4-flash:cloud")
+        # Sep 12 2026 21:15: deepseek-v4-flash:cloud REVOKED as kanban worker
+        # (does not call kanban_heartbeat; 3 workers rc=0). glm-5.2 proven.
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "glm-5.2")
         # Sep 8 2026: migrated to z-ai/glm-5.3-flash (0.075/0.25 USD/M in/out),
         # 5.6x/5.3x cheaper than glm-5.2.  Coverage proven by worker t_154b29f2
         # (run 407, no HTTP 402, real artifacts).  Previous: zai-org/glm-5.2

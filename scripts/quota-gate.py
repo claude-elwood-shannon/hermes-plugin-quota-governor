@@ -902,7 +902,12 @@ PROFILE_WORKER_MODELS = {
     #    The 10.5 probe hit ollama-cloud's catalog, not the local server.
     #    Worker pin restored to deepseek-v4-flash:cloud (present in /api/tags,
     #    free with session, tool-calling proven on 30+ kanban tasks).
-        "pr-ollama": "deepseek-v4-flash:cloud", # RESTORED Sep 12 2026 — verified in local /api/tags
+        "pr-ollama": "glm-5.2",                 # Sep 12 2026 21:15: deepseek-v4-flash:cloud REVOKED
+                                            # as kanban worker — present in /api/tags but does
+                                            # NOT call kanban_heartbeat (greps the FS instead, 3
+                                            # workers rc=0 without terminal call). glm-5.2:
+                                            # subscription-covered, tool-calling kanban proven
+                                            # (2344 reqs). deepseek stays callable for non-kanban.
     "pr-nanogpt": "z-ai/glm-5.3-flash",     # Sep 8 2026: subscription-COVERED (proven by
                                             # worker t_154b29f2, run 407 — no HTTP 402, real
                                             # artifacts in workspace).  Probe 8-sep 00:55 CEST:
