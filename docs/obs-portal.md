@@ -14,7 +14,7 @@ forecast), the past reconstructed (backfill) and the alarms awake.
 HERMES_HOME=~/.hermes/profiles/pr-ollama python3 scripts/obs/trace-backfill.py
 HERMES_HOME=~/.hermes/profiles/pr-ollama python3 scripts/obs/trace-backfill.py --dry-run
 
-# F5c — portal: 6 static dark pages (works opened as a file too)
+# F5c — portal: 7 static dark pages (works opened as a file too)
 HERMES_HOME=~/.hermes/profiles/pr-ollama python3 scripts/obs/portal-build.py
 #   -> <home>/quota-governor/obs/portal/{index,consumo,board,providers,alarms,docs}.html
 
