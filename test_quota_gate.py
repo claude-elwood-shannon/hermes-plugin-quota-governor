@@ -958,7 +958,10 @@ class TestCostModelMap(unittest.TestCase):
         # deepseek-v4-flash -> gpt-oss:20b.  Data: $0.07/$0.30 USD/M in/out,
         # no peak pricing, probe 200 OK (10.2 §4.2), $0.000028/micro-call
         # (10.3 §5.2) — 3x cheaper off-peak, 6x during DeepSeek peak windows.
-        self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "gpt-oss:20b")
+        # Sep 12 2026: gpt-oss:20b REVOKED — absent from local ollama /api/tags
+        # (no local inference on this host; 4 workers died rc=0). Back to
+        # deepseek-v4-flash:cloud per user order.
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "deepseek-v4-flash:cloud")
         # Sep 8 2026: migrated to z-ai/glm-5.3-flash (0.075/0.25 USD/M in/out),
         # 5.6x/5.3x cheaper than glm-5.2.  Coverage proven by worker t_154b29f2
         # (run 407, no HTTP 402, real artifacts).  Previous: zai-org/glm-5.2
