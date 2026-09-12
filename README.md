@@ -439,3 +439,6 @@ hermes-plugin-quota-governor/
 ## License
 
 MIT
+## Additional Features
+- **pr‑vllm** local worker profile now integrated; see `docs/quota-planner.md` for routing rules.
+- **supply_ratio** knob in the planner controls perpetual supply; documented in `docs/obj29-perpetual-supply.md`.
