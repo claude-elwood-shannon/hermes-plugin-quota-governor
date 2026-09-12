@@ -64,6 +64,13 @@ PRIVACY_GATE = os.path.expanduser(
 # Only reassign tasks in these statuses (not running, done, blocked, archived)
 REASSIGNABLE_STATUSES = {"ready", "todo", "triage"}
 
+# OBJ-43-FIX (Sep 12 2026): capability-based sensitive routing.
+# A sensitive task is only misrouted when the assignee's provider cannot
+# handle sensitive data. pr-vllm (vllm-local: self-hosted vLLM on the LAN,
+# inference never leaves the host) is capable — do NOT steal its cards.
+# Mirrors quota-gate.py PRIVACY_CAPABILITIES["sensitive"].
+SENSITIVE_CAPABLE_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-vllm"}
+
 # Privacy tags that trigger sensitive routing
 SENSITIVE_TAGS = {"high", "sensitive", "medium"}
 
@@ -183,7 +190,7 @@ def find_misrouted_sensitive_tasks(
     for row in rows:
         task_id, title, body, assignee, status = row
         privacy_value = parse_privacy_tag(body)
-        if is_sensitive(privacy_value) and assignee != correct_profile:
+        if is_sensitive(privacy_value) and assignee not in SENSITIVE_CAPABLE_PROFILES:
             misrouted.append((task_id, title, assignee, privacy_value, status))
 
     return misrouted

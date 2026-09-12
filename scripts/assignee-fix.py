@@ -64,7 +64,10 @@ KANBAN_DB = os.path.expanduser("~/.hermes/kanban.db")
 # Guardrail G1: only these profiles may receive auto-created tasks.
 # Mirrors quota-gate.py ALLOWED_PROFILES.
 # pr-opencode added in MULTI-PROV-06 (OpenCode Go provider).
-ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-opencode"}
+# OBJ-43-FIX (Sep 12 2026): pr-vllm added — user-approved OBJ-40 (Sep 10):
+# the $0 confidential worker on ml-host LAN. quota-gate.py already carries
+# it; this list had drifted out of sync and was stealing pr-vllm cards.
+ALLOWED_PROFILES = {"pr-ollama", "pr-nanogpt", "pr-opencode", "pr-vllm"}
 
 # Preference order for fallback reassignment: pr-ollama first (cheaper,
 # availability-first), then pr-nanogpt, then pr-opencode (newest

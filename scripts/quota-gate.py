@@ -130,7 +130,10 @@ PRIVACY_CAPABILITIES = {
     # take the same conservative stance as OpenRouter without
     # data_collection:deny. Revisit if a ZDR policy is verified.
     "public": {"ollama-cloud", "nanogpt", "openrouter", "opencode-go", "custom"},
-    "sensitive": {"ollama-cloud", "nanogpt", "custom"},
+    # OBJ-43-FIX (Sep 12 2026): vllm-local added to sensitive — inference on
+    # ml-host LAN (self-hosted vLLM) never leaves the host, strictly stronger
+    # than the sensitive requirement (zero-retention). Owner-approved OBJ-40.
+    "sensitive": {"ollama-cloud", "nanogpt", "custom", "vllm-local"},
     # OBJ-40 (Sep 10 2026, user-approved): vllm-local added to confidential —
     # the only provider whose inference NEVER leaves the user's LAN
     # (ml-host 192.168.1.32, self-hosted vLLM, no third-party TOS).
