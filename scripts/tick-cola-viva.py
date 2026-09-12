@@ -60,11 +60,14 @@ from pathlib import Path
 
 QUOTA_THRESHOLD_PCT = 80.0     # session AND weekly must be < this to act
 DONE_WINDOW_HOURS = 24         # recently closed tasks eligible for successors
-MAX_ACTIONS_PER_TICK = 1       # warm-up-then-scale: one action per tick
-VALID_COSTS = {"micro", "tiny", "small", "medium"}
-SMALL_COSTS = {"micro", "tiny", "small"}   # class-C promotable volume
-ACTIVE_STATUSES = ("running", "ready", "todo")
-QUEUE_STATUSES = ("ready", "running")
+DEFAULT_ASSIGNEE = "pr-ollama"  # step-1 assignment + successor fallback
+CLI_TIMEOUT_S = 60             # hermes kanban CLI subprocess timeout
+TITLE_MAX_CHARS = 120          # successor title hard cap
+TITLE_LOG_CHARS = 60           # title width in decision/ledger lines
+TITLE_LOG_CHARS_SHORT = 40     # title width in execute-path decision lines
+WORKSPACE_KIND = "scratch"     # created tasks land in a scratch workspace
+# Kanban task id extracted from CLI output when --json parsing fails.
+TASK_ID_RE = re.compile(r"\bt_\w+\b")
 
 # Class-C marker: the task body carries the literal 'clase:C' tag (the
 # convention objective-proposer.py / the autonomous-task-creator emit).
@@ -209,7 +212,7 @@ def build_successor(parent: dict) -> tuple:
     """Return (title, body) for a structural class-C successor of parent."""
     pattern = successor_pattern(parent["title"], parent.get("body", ""))
     base = (parent["title"] or "").strip()
-    title = f"Sucesor estructural de {parent['id']}: {pattern} de {base}"[:120]
+    title = f"Sucesor estructural de {parent['id']}: {pattern} de {base}"[:TITLE_MAX_CHARS]
     body = (
         f"objective:OBJ-30 | cost:tiny | privacy:low | clase:C\n\n"
         f"Sucesor estructural de {parent['id']} ({base}) — OBJ-30b cola viva: "
@@ -230,7 +233,7 @@ class _CliResult:
         self.stderr = stderr
 
 
-def _cli(*args, timeout=60):
+def _cli(*args, timeout=CLI_TIMEOUT_S):
     try:
         return subprocess.run(["hermes", "kanban", *args],
                               capture_output=True, text=True, timeout=timeout)
@@ -239,14 +242,14 @@ def _cli(*args, timeout=60):
 
 
 def create_task(title: str, body: str, assignee: str) -> str | None:
-    r = _cli("create", title, "--assignee", assignee, "--workspace", "scratch",
-             "--body", body, "--json")
+    r = _cli("create", title, "--assignee", assignee,
+             "--workspace", WORKSPACE_KIND, "--body", body, "--json")
     if r.returncode != 0:
         return None
     try:
         return json.loads(r.stdout).get("id")
     except (ValueError, AttributeError):
-        m = re.search(r"(t_\w+)", r.stdout)
+        m = TASK_ID_RE.search(r.stdout)
         return m.group(1) if m else None
 
 
@@ -343,16 +346,16 @@ def run(hermes_home=None, execute: bool = False, now=None,
     # (fix the silent stop: ready-without-assignee is claimed by nobody)
     for t in ready_tasks(db):
         if not (t.get("assignee") or "").strip():
-            assignee = "pr-ollama"
+            assignee = DEFAULT_ASSIGNEE
             if not execute:
                 act({"ts": now, "action": "assigned-ready", "task": t["id"],
-                     "assignee": assignee, "title": t["title"][:60]},
+                     "assignee": assignee, "title": t["title"][:TITLE_LOG_CHARS]},
                     f"cola viva: asignado {t['id']} -> {assignee}")
                 return decisions
             if assign_task(t["id"], assignee):
                 act({"ts": now, "action": "assigned-ready", "task": t["id"],
-                     "assignee": assignee, "title": t["title"][:60]},
-                    f"cola viva: asignado {t['id']} ({t['title'][:40]}) -> {assignee}")
+                     "assignee": assignee, "title": t["title"][:TITLE_LOG_CHARS]},
+                    f"cola viva: asignado {t['id']} ({t['title'][:TITLE_LOG_CHARS_SHORT]}) -> {assignee}")
                 return decisions
             act({"ts": now, "action": "assign-failed", "task": t["id"]},
                 f"cola seca: fallo al asignar {t['id']}")
@@ -374,17 +377,17 @@ def run(hermes_home=None, execute: bool = False, now=None,
         if has_open_successor(db, parent["id"]):
             continue
         title, body = build_successor(parent)
-        assignee = parent.get("assignee") or "pr-ollama"
+        assignee = parent.get("assignee") or DEFAULT_ASSIGNEE
         if not execute:
             act({"ts": now, "action": "created-successor", "parent": parent["id"],
-                 "title": title[:60], "assignee": assignee},
-                f"cola viva: sucesor estructural de {parent['id']} ({title[:40]})")
+                 "title": title[:TITLE_LOG_CHARS], "assignee": assignee},
+                f"cola viva: sucesor estructural de {parent['id']} ({title[:TITLE_LOG_CHARS_SHORT]})")
             return decisions
         tid = create_task(title, body, assignee)
         if tid:
             act({"ts": now, "action": "created-successor", "parent": parent["id"],
-                 "task": tid, "title": title[:60], "assignee": assignee},
-                f"cola viva: sucesor estructural de {parent['id']} -> {tid} ({title[:40]})")
+                 "task": tid, "title": title[:TITLE_LOG_CHARS], "assignee": assignee},
+                f"cola viva: sucesor estructural de {parent['id']} -> {tid} ({title[:TITLE_LOG_CHARS_SHORT]})")
             return decisions
         act({"ts": now, "action": "create-failed", "parent": parent["id"]},
             f"cola seca: fallo al crear sucesor de {parent['id']}")
