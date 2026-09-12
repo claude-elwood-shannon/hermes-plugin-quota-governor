@@ -126,8 +126,51 @@ This means the local worker is **NOT a drop-in provider** for general tasks. It 
 
 ---
 
-## 6. Files
+## 6. R1-R5-bis — full-niche rerun on the served Llama (12-sep)
+
+On 12-sep the night shift re-ran the full niche battery **against the model actually served at the time — `hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4`** — as five kanban board tasks (R1-bis … R5-bis), assigned to `pr-vllm` with `--model Meta-Llama-3.1-8B-Instruct-AWQ-INT4 --provider custom`. Intent: compare Llama against the Qwen numbers from the R2-R6 marathon on the **same** real tasks, not the hand-built 5-case harness above.
+
+### Data provenance (read first)
+The five tasks wrote their output to `/data/ml/data/hermes/work/maraton/llama_r*_bis.json` on ml-host and closed with `done`. **Three of those JSONs were cleaned from the marathon workspace by the rotation housekeeping before this consolidation ran**, so their raw per-round numbers are no longer recoverable from disk. What survives:
+- **R4-bis**: the worker's completion record explicitly reports **21/21 real hashes, 0 fabricated** — matching Qwen exactly.
+- **R1/R2/R3/R5-bis**: the board only retains the task title/summary (which echoes the task title, no numbers). The raw JSONs are gone. **Those four rows are marked `NR` (not recoverable) below — I will not fill them from memory.**
+
+This is the same "phantom deliverable file" failure the night-marathon integrity note flagged; the durable-number discipline this report enforces is the fix.
+
+### Consolidated table — R1-R5, both models
+
+Round | Task | Qwen2.5-7B-FP8 (R2-R6 marathon) | Llama-3.1-8B-AWQ (R1-R5 bis) | Verdict
+|---|---|---|---|---|
+| R1 | Classify 10 recent kanban bodies (cost/privacy) | 10/10 JSON valid, precision reported | `NR` (JSON cleaned) | — |
+| R2 | Summarize 5 skills, 3 lines each | 5/5 ok, 3/3 claims verified | `NR` (JSON cleaned) | — |
+| R3 | Extract requestId+costUsd from last 50 trace lines | **0.98** (49/50 exact; requestId 50/50; costUsd 49/50) | `NR` (JSON cleaned) | — |
+| R4 | Weekly changelog from `git log -30` | 21/21 hashes real, 0 fabricated | **21/21 real, 0 fabricated** (completion record) | **Tie** |
+| R5 | Autoscopy: classify own vllm.err.log, no state | HEALTH **critical** — WRONG (old-day's fixable errors read as current) | `NR` (JSON cleaned) | — |
+| R5-variant | Same log + live service state injected | HEALTH **degraded** — partially corrected | `NR` (JSON cleaned) | — |
+
+**Qwen baseline sources (survived on disk):** `r3_result.json` (0.98, 49/50 exact, reqId 50/50, costUsd 49/50, tok/s 30.0, 23.4s — verified by re-running the ground-truth parse), `r4_commits.txt` (all 30 cited commits verified present in `git cat-file`), `r2_results.json` (5/5 skill records, all `status: ok`).
+
+### What the surviving R4-bis row says
+Llama and Qwen are **exact ties** on the anti-hallucination synthesis task: both produced a themed weekly changelog where every cited git hash exists in the real commit list and none was fabricated. This is the least "model-capability" round of the battery (it is basically text summarization with a verifier), so a tie is the expected outcome for two 7-8B instruct models.
+
+### Veredicto firmado (12-sep)
+**Qwen2.5-7B-Instruct-FP8 remains the kanban worker of record.**
+
+Signed with the evidence that survives:
+- The R1-R5-bis rerun was **aborted mid-proof**: 3 of 5 Llama result files were lost to workspace rotation before consolidation, and the board held no numeric summary to fall back on. The Llama challenger cannot be certified on the two rounds that define the niche (R3 needle-extraction, R5 temporal-reasoning boundary) because those numbers no longer exist.
+- The **one durable Llama result — R4 (changelog) — ties Qwen 21/21**, i.e. on synthesis the challenger neither wins nor loses.
+- Nothing in the recovered evidence contradicts the original night verdict (Qwen's edge in strict tool-calls + needle extraction; Llama's edge only in tool-call latency). No counter-evidence surfaced.
+
+**Llama 8B-AWQ wins nothing decisively in the recovered record.** Its theoretical advantages — AWQ INT4 is ~2x faster on tool-calls (0.48s vs 0.91s) and native English — are real but sub-second and prompt-fixable, respectively, and neither was re-validated as a durable number in the bis run.
+
+**The real takeaway of R1-R5-bis is procedural, not model-ranked:** five workers executed the niche battery in minutes at $0 on the served model, but **3/5 result artifacts vanished with the workspace rotation**, leaving the board with titles instead of numbers. The niche (confidential micro/tiny work on the house GPU) is viable; the **retention of its evidence is not**. Fix: the next successor must either (a) `kanban_attach` the result JSON at completion, or (b) write numbers into the completion `summary`/`metadata` — never leave the only copy in a rotation-managed workspace.
+
+---
+
+## 7. Files
 - `duel.py` — the 4-test battery harness (reusable).
-- `results_A.json` / `results_B.json` — raw per-case results.
+- `results_A.json` / `results_B.json` — raw per-case results (night duel).
 - `kanban_bodies.json` — the 10 real bodies used for classification.
 - `all_bodies.txt` — 385 real bodies (~197K tokens) used for needle + summary context.
+- Night marathon (R2-R6, Qwen) artifacts: `r2_results.json`, `r3_result.json`, `r4_commits.txt`, `r4_result.json`, `r5_result.json`, `r6_result.json`, `vllm-night-marathon.md`.
+- R1-R5-bis (Llama) raw JSONs: **removed by ml-host rotation — see §6 provenance note**.
