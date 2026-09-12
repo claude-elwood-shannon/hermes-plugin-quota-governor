@@ -349,7 +349,18 @@ if [[ -f "$PIDFILE" ]]; then
     fi
 else
     if [[ "$ACTION" != "stop" ]]; then
-        DAEMON_NEEDS_ACTION=true
+        # Dual-dispatcher war (pitfall 24g): the gateway-embedded dispatcher
+        # (gateway.run) is the ONLY claimer allowed. The external kanban daemon
+        # reaped the gateway's workers as zombies for days (368 reaps in
+        # gateway.log since Aug 26; every worker dead ~60s after spawn). The
+        # respawn block below must never bring it back while the gateway lives.
+        # The tick's own kill of a dead pidfile process is fine; starting one
+        # is not. See docs/incident-2026-09-12-dual-dispatcher.md.
+        if pgrep -f 'kanban daemon' >/dev/null 2>&1; then
+            log "Dual-dispatcher guard: kanban daemon process detected — NOT respawning"
+        else
+            DAEMON_NEEDS_ACTION=false
+        fi
     fi
 fi
 
@@ -383,6 +394,18 @@ if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$ACTION" != "stop" ]]; then
     else
         log "ERROR: hermes binary not found"
     fi
+fi
+
+# ── Portal de observabilidad (OBJ-27 F5d): respawn si el URL murió ──────────
+# El hiperespacio (http://localhost:8917) debe estar vivo SIEMPRE que la
+# casa viva. obs-serve-cron.sh es silencioso cuando responde y lo levanta
+# (con evidencia de una línea) cuando murió — patrón daemon del tick, el
+# mismo contrato que el daemon kanban de arriba. Nunca rompe el tick.
+PORTAL_OUTPUT=$(HERMES_HOME="$HERMES_HOME" \
+    bash "$PLUGIN_DIR/scripts/obs/obs-serve-cron.sh" 2>/dev/null) || true
+if [[ -n "$PORTAL_OUTPUT" ]]; then
+    echo "$PORTAL_OUTPUT"
+    log "Portal: $PORTAL_OUTPUT"
 fi
 
 # ── Health checks (OBJ-09): fast burn, zombie workers, silent plugin ──
