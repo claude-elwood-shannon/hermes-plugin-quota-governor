@@ -95,7 +95,10 @@ PAGE_TITLES = {
     "docs": "Docs vivos",
 }
 REPO_DOCS = ("obs-report-format.md", "obs-otlp.md", "obs-dashboard.md",
-             "obs-trace-retention.md", "calibration-2026-09-08.md")
+             "obs-trace-retention.md", "calibration-2026-09-08.md",
+             # objectives in flight (one living doc per OBJ):
+             "obj28-budget-status.md", "obj29-perpetual-supply.md",
+             "obj30-innovation-fund.md", "obj37-collective-spending.md")
 
 # sources whose costUsd is REAL money charged to a balance; everything else
 # is a shadow estimate. The split is always shown (never merged silently).
@@ -1224,7 +1227,7 @@ def page_docs(data: dict, query: dict = None) -> str:
 
     out.append('<section class="card"><h2>Docs del repo (render crudo, '
                "fuentes vivas)</h2>")
-    docs_dir = _HERE.resolve().parents[2] / "docs"
+    docs_dir = _HERE.resolve().parents[1] / "docs"
     any_doc = False
     for name in REPO_DOCS:
         try:
