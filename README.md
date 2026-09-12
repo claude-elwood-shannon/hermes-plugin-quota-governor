@@ -1,5 +1,51 @@
 # hermes-plugin-quota-governor
 
+## Objectives status
+- 1: Initial plugin setup and documentation
+- 2: Add basic quota governor mechanism
+- 3: Implement observation hooks for task lifecycle
+- 4: Add per-model cost ledger
+- 5: Add quota time-series sampling
+- 6: Implement privacy routing matrix
+- 7: Add disaster recovery procedures
+- 8: Implement weekly objective progress reporting
+- 9: Add zombie guard for stale tasks
+- 10: Implement predictive quota forecasting
+- 11: Add per-request billing visibility for NanoGPT
+- 12: Add dynamic task generation for autonomous plugins
+- 13: Add autonomous objectives tracking
+- 14: Add observer dashboards
+- 15: Add task cost estimation
+- 16: Add model matrix documentation
+- 17: Add privacy by provider design
+- 18: Add opencode go reset semantics
+- 19: Add dynamic task generation
+- 20: Add autonomous-objectives.md
+- 21: Add privacy-routing-matrix.md
+- 22: Add rust-projects-to-contribute.md
+- 23: Add skills-discovery.md
+- 24: Add obj-07-audit.md
+- 25: Add disaster-recovery.md
+- 26: Objective 26: Description placeholder
+- 27: Objective 27: Description placeholder
+- 28: Objective 28: Description placeholder
+- 29: Objective 29: Description placeholder
+- 30: Objective 30: Description placeholder
+- 31: Objective 31: Description placeholder
+- 32: Objective 32: Description placeholder
+- 33: Objective 33: Description placeholder
+- 34: Objective 34: Description placeholder
+- 35: Objective 35: Description placeholder
+- 36: Objective 36: Description placeholder
+- 37: Objective 37: Description placeholder
+- 38: Objective 38: Description placeholder
+- 39: Objective 39: Description placeholder
+- 40: Objective 40: Description placeholder
+- 41: Objective 41: Description placeholder
+- 42: Objective 42: Description placeholder
+- 43: Objective 43: Description placeholder
+- 44: Objective 44: Description placeholder
+
 [![tests](https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor/actions/workflows/tests.yml/badge.svg)](https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org)
