@@ -349,18 +349,7 @@ if [[ -f "$PIDFILE" ]]; then
     fi
 else
     if [[ "$ACTION" != "stop" ]]; then
-        # Dual-dispatcher war (pitfall 24g): the gateway-embedded dispatcher
-        # (gateway.run) is the ONLY claimer allowed. The external kanban daemon
-        # reaped the gateway's workers as zombies for days (368 reaps in
-        # gateway.log since Aug 26; every worker dead ~60s after spawn). The
-        # respawn block below must never bring it back while the gateway lives.
-        # The tick's own kill of a dead pidfile process is fine; starting one
-        # is not. See docs/incident-2026-09-12-dual-dispatcher.md.
-        if pgrep -f 'kanban daemon' >/dev/null 2>&1; then
-            log "Dual-dispatcher guard: kanban daemon process detected — NOT respawning"
-        else
-            DAEMON_NEEDS_ACTION=false
-        fi
+        DAEMON_NEEDS_ACTION=true
     fi
 fi
 
@@ -370,6 +359,30 @@ fi
 # room for more workers.
 if [[ "$DAEMON_NEEDS_ACTION" == "true" && "$SHOULD_SPAWN" == "false" ]]; then
     log "Soft cap: ${LIVE_COUNT} live workers >= ${DESIRED_MAX} desired — skipping daemon restart"
+    DAEMON_NEEDS_ACTION=false
+fi
+
+# Dual-dispatcher war guard (pitfall 24g, incident 2026-09-12): exactly ONE
+# claimer may exist — the gateway-embedded dispatcher (gateway.run) OR an
+# external kanban daemon, never both. Both alive = each side reaps the
+# other's workers ~60s after spawn (368 zombie reaps in gateway.log during
+# the Sep 12 incident). Runs BEFORE the spawn decision so it can clear
+# DAEMON_NEEDS_ACTION and the spawn code below never executes afterwards:
+#   daemon + gateway -> kill the daemon, keep the gateway dispatcher
+#   daemon only      -> legitimate fallback dispatcher, leave it alone
+#   gateway only     -> do NOT spawn a daemon
+#   neither          -> spawn the daemon (original fallback design)
+if pgrep -f 'hermes kanban daemon' >/dev/null 2>&1; then
+    if pgrep -f 'gateway run' >/dev/null 2>&1; then
+        pkill -f 'hermes kanban daemon' 2>/dev/null || true
+        rm -f "$PIDFILE"
+        log "Dual-dispatcher guard: gateway dispatcher active — killed external kanban daemon"
+    else
+        log "Dual-dispatcher guard: kanban daemon is the only dispatcher — leaving it"
+    fi
+    DAEMON_NEEDS_ACTION=false
+elif pgrep -f 'gateway run' >/dev/null 2>&1; then
+    log "Dual-dispatcher guard: gateway dispatcher active — NOT respawning"
     DAEMON_NEEDS_ACTION=false
 fi
 
