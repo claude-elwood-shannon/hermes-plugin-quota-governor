@@ -268,6 +268,48 @@ def _build_verdict(fc: dict) -> list:
     return out
 
 
+def metrics_history_path(hermes_home=None) -> Path:
+    """metrics-history.jsonl under the pr-ollama profile state dir (OBJ-29).
+
+    quota-metrics.py appends there regardless of which profile's cron
+    writes it; fall back to the caller's own state dir for tests."""
+    if hermes_home:
+        return state_dir(hermes_home) / "metrics-history.jsonl"
+    return (Path.home() / ".hermes" / "profiles" / "pr-ollama"
+            / "quota-governor" / "metrics-history.jsonl")
+
+
+def _supply_ratio_daily(hermes_home=None) -> str:
+    """Most recent daily supply_ratio from metrics-history (OBJ-29).
+
+    Daily buckets = last row per UTC calendar day. The newest (partial)
+    day is skipped when its created count is 0/None to avoid a false
+    deficit; returns 'n/d' when no data — never a guess (fail open)."""
+    path = metrics_history_path(hermes_home)
+    try:
+        best = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                day = str(row.get("ts", ""))[:10]
+                if day:
+                    best[day] = row
+        for day in sorted(best, reverse=True):
+            row = best[day]
+            c, x = row.get("supply_created_24h"), row.get("supply_closed_24h")
+            if c and x:
+                return f"{day} ratio={row.get('supply_ratio')}"
+        return "n/d"
+    except OSError:
+        return "n/d"
+
+
 def build_board_screen(hermes_home=None) -> str:
     """Board state: counts by status + active tasks + done in last 24h."""
     db = kanban_db_path(hermes_home)
@@ -301,8 +343,8 @@ def build_board_screen(hermes_home=None) -> str:
     total = sum(counts.values())
     status_s = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     lines.append(f"  total {total} | {status_s}")
-    # supply_ratio diario (OBJ-29). Placeholder hasta que OBJ-29 lo aporte.
-    lines.append("  supply_ratio diario: n/d (OBJ-29 pendiente)")
+    # supply_ratio diario (OBJ-29): último bucket diario del metrics-history.
+    lines.append(f"  supply_ratio diario: {_supply_ratio_daily(hermes_home)}")
     if done24:
         ids = ", ".join(r["id"] for r in done24[:8])
         if len(done24) > 8:
