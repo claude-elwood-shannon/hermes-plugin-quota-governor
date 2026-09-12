@@ -1,7 +1,12 @@
 # OBJ-28 — Budget by Objective: design, implementation plan, and cost estimate
 
-**Status**: DESIGN (class C — docs/design, promotable under current rules). Nothing is built.
-**Date**: 2026-09-10
+**Status**: DESIGN + FASE 0 CONSTRUIDA (observer). Phase 0 (observer-only
+rollup) is LIVE: `scripts/obs/objective-budgets.py` (dual-currency rollup,
+unattributed cost shown explicitly, human ceilings preserved across runs),
+`objective-budgets-cron.sh` (hourly, no_agent watchdog), portal page
+"Objetivos" (7th page). Phases 1-3 (calibration → enforce) still require
+the user's §4 decisions — nothing vetoes anything yet.
+**Date**: 2026-09-10 (design) / 2026-09-12 (phase 0 built)
 **Source tasks**: t_d540cee7 (OBJ-28 sketch), t_ee079cfa (OBJ-27 observability), OBJ-24 F3 (budget_check.py), OBJ-26/26a (provider balance budget), OBJ-07 (model fitness).
 **Prerequisite**: OBJ-27 Fase 0 (trace with join by `objective:` tag). This design defines the contract between the two.
 

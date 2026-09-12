@@ -78,16 +78,19 @@ ms = _load_sibling("morning_screen", _HERE / "morning-screen.py")
 od = _load_sibling("obs_dashboard", _HERE / "obs-dashboard.py")
 ta = _load_sibling("trace_alarms", _HERE / "trace-alarms.py")
 tr = _load_sibling("obs_trace", _HERE / "trace.py")
+ob = _load_sibling("obj_budgets", _HERE / "objective-budgets.py")
 
 CEST = ms.CEST
 DAYS = 30                                   # the portal's history window
 DEFAULT_PORTAL_SUBDIR = "portal"
-PAGES = ("index", "consumo", "board", "providers", "alarms", "docs")
+PAGES = ("index", "consumo", "board", "providers", "objectives", "alarms",
+         "docs")
 PAGE_TITLES = {
     "index": "Overview",
     "consumo": "Consumo",
     "board": "Board",
     "providers": "Providers",
+    "objectives": "Objetivos",
     "alarms": "Alarmas & Salud",
     "docs": "Docs vivos",
 }
@@ -1101,6 +1104,108 @@ def page_alarms(data: dict, query: dict = None) -> str:
     return "\n".join(out)
 
 
+# --- objetivos (OBJ-28 phase 0) -----------------------------------------------
+
+_STATUS_BADGE = {"open": "mut", "warn": "warn", "exhausted": "bad",
+                 "done": "ok"}
+
+
+def page_objectives(data: dict, query=None) -> str:
+    """OBJ-28 phase 0: presupuesto por objetivo (observer).
+
+    Shows the rollup as it IS: task flow per objective stamp, spend still
+    unattributed (the visible gap), budgets waiting for the user's §4
+    decisions. No ceiling exists yet -> no warn/exhausted can appear.
+    """
+    doc = data.get("objective_budgets") or {}
+    objs = doc.get("objectives") or {}
+    ua = doc.get("unattributed_cost") or {}
+
+    n_open = sum(1 for o in objs.values() if o.get("status") == "open")
+    n_other = len(objs) - n_open
+    out = ['<section class="kpis">',
+           _kpi("Objetivos con stamp", str(len(objs)),
+                f"{n_open} open" + (f" · {n_other} en escalera"
+                                    if n_other else "")),
+           _kpi("Eventos tagged", str(doc.get("tagged_events", 0)),
+                "task-events con objective:"),
+           _kpi("Coste SIN atribuir",
+                _usd2(ua.get("spent_usd") or 0.0),
+                f"{ua.get('lines', 0)} líneas · hueco visible"),
+           _kpi("Coste atribuido", str(doc.get("cost_lines_attributed", 0)),
+                "líneas con coste + stamp (hoy 0)"),
+           "</section>"]
+
+    out.append('<section class="card"><h2>El hueco, a la vista (§1.3)</h2>')
+    if ua:
+        rows_s = "".join(
+            f"<tr><td class=mono>{_esc(p)}</td>"
+            f'<td class=num>{_usd2(v)}</td></tr>'
+            for p, v in (ua.get("by_provider") or {}).items())
+        out.append(f"<table><tr><th>provider</th><th>gasto 30d</th></tr>"
+                   f"{rows_s}</table>"
+                   '<div class="mut" style="font-size:11px;margin-top:6px">'
+                   "las fuentes con coste (nanogpt-requests · usage-audit · "
+                   "model-cost-ledger) no llevan task_id: ningún centavo se "
+                   "atribuye al objetivo sin su stamp. El rollup no inventa "
+                   "la unión — la muestra.</div>")
+    else:
+        out.append(empty_state("sin líneas de coste en la ventana"))
+    out.append("</section>")
+
+    out.append('<section class="card"><h2>Objetivos (flujo 30d, '
+               "fase observer — sin techos aún)</h2>")
+    if objs:
+        rows_s = []
+        for name, o in sorted(objs.items(),
+                              key=lambda kv: -sum(kv[1].get("flow", {})
+                                                  .values())):
+            f = o.get("flow") or {}
+            total = o.get("tasks_total") or 0
+            done = o.get("tasks_done") or 0
+            pct = (100.0 * done / total) if total else 0.0
+            badge = _badge(_STATUS_BADGE.get(o.get("status"), "mut"),
+                           o.get("status") or "open")
+            budget = (_usd2(o["budget_usd"])
+                      if o.get("budget_usd") is not None
+                      else ("—" if o.get("budget_quota_pct") is None
+                            else f"{o['budget_quota_pct']:g}% ventana"))
+            rows_s.append(
+                f"<tr><td class=mono>{_esc(name)}</td>"
+                f"<td>{badge}</td>"
+                f"<td>{budget}</td>"
+                f'<td class=num>{_usd2(o.get("spent_usd") or 0.0)}</td>'
+                f'<td class=num>{f.get("created", 0)}/{f.get("claimed", 0)}'
+                f'/{f.get("completed", 0)}</td>'
+                f'<td class=num>{f.get("crashed", 0)}</td>'
+                f'<td class=num>{f.get("gave_up", 0)}</td>'
+                f"<td>{done}/{total} {_bar(pct)}</td></tr>")
+        out.append("<table><tr><th>objetivo</th><th>status</th><th>budget"
+                   "</th><th>spent</th><th>crea/recla/compl</th><th>crash"
+                   "</th><th>gave_up</th><th>tareas</th></tr>"
+                   + "".join(rows_s) + "</table>"
+                   '<div class="mut" style="font-size:11px;margin-top:6px">'
+                   "budgets a null: esperan las decisiones §4 del diseño "
+                   "(default por clase, umbral warn, conducta del hard-stop). "
+                   "La escalera open→warn→exhausted→done está armada pero "
+                   "sin techo no dispara. Modo observer: nada de esto veta "
+                   "nada todavía.</div>")
+    else:
+        out.append(empty_state("sin objectives en el trace de la ventana"))
+    out.append("</section>")
+
+    out.append('<section class="card"><h2>Diseño</h2>'
+               '<div class="mut" style="font-size:12px">Fase 0 (observer, '
+               "7d) del presupuesto por objetivo: dual moneda (costUsd real "
+               "agrega entre providers; quota_pct NUNCA se suma entre "
+               "providers), gastos sin stamp en bucket unattributed "
+               "explícito, primera brecha = revisión no castigo (Goodhart). "
+               "Siguientes fases (calibración → enforce-warn → "
+               "enforce-hard-stop) requieren aprobación explícita — "
+               "clase B.</div></section>")
+    return "\n".join(out)
+
+
 # --- docs ---------------------------------------------------------------------
 
 def _doc_block(title: str, text: str) -> str:
@@ -1183,11 +1288,23 @@ def gather(hermes_home=None, now=None) -> dict:
     if agg.get("first_ts"):
         window_s = (f"{_fmt_ts(agg['first_ts'])} → "
                     f"{_fmt_ts(agg['last_ts'])}")
+    # OBJ-28 phase 0: rollup by objective, computed LIVE from the same
+    # trace rows (fresh even before the cron's first run) + the human-set
+    # ceilings merged back from the persisted state file (sticky budgets).
+    try:
+        ob_doc = ob.rollup(rows, window_days=DAYS, now=now)
+        ob_doc = ob.preserve_human_decisions(
+            ob_doc, ob.load_existing(hermes_home))
+    except Exception:
+        ob_doc = {"objectives": {}, "unattributed_cost": {},
+                  "unattributed_events": {}, "cost_lines_attributed": 0,
+                  "tagged_events": 0}
     return {
         "now": now, "rows": rows, "agg": agg, "dims": dims,
         "requests": requests, "board": board, "metrics": metrics,
         "forecast": fc, "verdicts": od.provider_verdicts(fc),
         "series": series, "doctor": doctor,
+        "objective_budgets": ob_doc,
         "alarm_lines": ta.run_checks(hermes_home, now=now),
         "alert_cards": od.alert_cards(hermes_home),
         "weekly_ledger": read_weekly_ledger(hermes_home),
@@ -1197,7 +1314,8 @@ def gather(hermes_home=None, now=None) -> dict:
 
 _PAGE_FN = {
     "index": page_index, "consumo": page_consumo, "board": page_board,
-    "providers": page_providers, "alarms": page_alarms, "docs": page_docs,
+    "providers": page_providers, "objectives": page_objectives,
+    "alarms": page_alarms, "docs": page_docs,
 }
 
 

@@ -248,10 +248,14 @@ class TestBackfill(Base):
     def test_usage_audit_respects_f0_cursor(self):
         # F0 cursor already at now-1800: the audit row (10 days old) is
         # ingested once; a NEWER audit row is left to the F0 collector.
+        # The "new" row is computed relative to test time — a hard-coded
+        # ISO stamp went stale once the wall clock passed it (time-bomb).
+        newer_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                  time.gmtime(self.now - 900))
         self.seed_audit([{"ts": "2026-08-28T10:00:00Z", "job_id": "j1",
                           "fire_id": "old_fire", "prompt_tokens": 10,
                           "completion_tokens": 5, "model": "glm-5.2"},
-                         {"ts": "2026-09-11T22:00:00Z", "job_id": "j2",
+                         {"ts": newer_iso, "job_id": "j2",
                           "fire_id": "new_fire", "prompt_tokens": 10,
                           "completion_tokens": 5, "model": "glm-5.2"}])
         bf.tr._save_cursor({"usage-audit": self.now - 1800},
