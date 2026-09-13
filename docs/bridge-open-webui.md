@@ -45,10 +45,21 @@ with nohup so it survives the shell:
 nohup python3 ~/.hermes/scripts/bridge/open-webui-bridge.py > /dev/null 2>&1 &
 ```
 
-In production it should never be started by hand: the supervisor
-(`scripts/bridge/open-webui-bridge-cron.sh`, 3 copies like the server, mode
-755) is invoked every 15 minutes by `cron-health-check.sh` and is the only
-component that respawns it.
+In production it should never be started by hand: two cron layers own the
+lifecycle (crontab of the host):
+
+```cron
+# supervisor: probe + converge + heartbeat, every 5 min
+*/5 * * * * /home/iinstances/.hermes/scripts/bridge/open-webui-bridge-cron.sh >> /home/iinstances/.hermes/logs/open-webui-bridge.log 2>&1
+# watchdog of the watchdog: verifies the heartbeat, every 15 min (already wired)
+*/15 * * * * /home/iinstances/.hermes/scripts/cron-health-check.sh >> /home/iinstances/.hermes/logs/cron-health-check.log 2>&1
+```
+
+The supervisor (`scripts/bridge/open-webui-bridge-cron.sh`, 3 copies like
+the server, mode 755) probes the service, touches the heartbeat when
+healthy, and respawns from the canonical path when needed. It is also the
+restart command that `cron-health-check.sh` executes when it finds the
+heartbeat stale.
 
 Liveness is HTTP-based, not log-mtime-based: the bridge is silent (its log
 only grows on respawn), so the supervisor probes
