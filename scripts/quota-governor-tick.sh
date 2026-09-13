@@ -457,4 +457,22 @@ if [[ -n "$HEALTH_OUTPUT" ]]; then
     log "Health alerts: $(echo "$HEALTH_OUTPUT" | wc -l) alert(s) detected"
 fi
 
+# ── Self-watch: cron-health-check (P3) — cadena de auto-vigilancia ──────
+# El watchdog del watchdog escribe su resumen en cron-health-check.log.
+# Si dejó de ejecutarse (cron muerto, script roto), el tick lo detecta por
+# freshness del log y lanza una pasada manual — nunca duplicados reales
+# (el health-check es idempotent) y nunca rompe el tick (fail-open).
+CHC_LOG="$HOME/.hermes/logs/cron-health-check.log"
+if [[ -f "$CHC_LOG" ]]; then
+    CHC_AGE=$(( $(date +%s) - $(stat -c %Y "$CHC_LOG" 2>/dev/null || echo 0) ))
+    if [[ "$CHC_AGE" -gt 2400 ]]; then   # ventana 15min x 1.5 + margen = 40min
+        echo "cron-health-check STALE (${CHC_AGE}s) — lanzando pasada manual"
+        log "cron-health-check log stale ${CHC_AGE}s — manual pass triggered"
+        bash "$HOME/.hermes/scripts/cron-health-check.sh" >> "$CHC_LOG" 2>&1 || true
+    fi
+else
+    log "cron-health-check log missing — lanzando primera pasada"
+    bash "$HOME/.hermes/scripts/cron-health-check.sh" >> "$CHC_LOG" 2>&1 || true
+fi
+
 exit 0
