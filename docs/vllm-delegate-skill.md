@@ -72,3 +72,15 @@ modelo local no encaja, hazlo tú y no pasa nada.
    presupuesto cloud); no se crean tareas nuevas.
 3. No toques el servicio vLLM ni el systemd del GPU host.
 4. Zero tokens cloud: la delegación no consume tu cuota.
+
+## Mantenimiento (hardening t_971bb19e + t_ef2376bd)
+
+- Tres copias: viva `~/.hermes/scripts/`, perfil
+  `~/.hermes/profiles/pr-ollama/scripts/`, repo `scripts/` (source of
+  truth). Suite: `test_vllm_invoke.py` junto al script y en `tests/`;
+  correr con `~/.hermes/venvs/pytest-312/bin/python -m pytest
+  ~/.hermes/scripts/test_vllm_invoke.py -q`. Todo cambio al script pasa
+  la suite ANTES de desplegarse y se backporta al repo (exit codes 0-4,
+  esquema jsonl y flags congelados).
+- argparse sale con exit 2 en error de uso (mismo código que
+  model-not-served): scriptar siempre con prompt explícito.

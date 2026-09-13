@@ -16,7 +16,11 @@ Exit codes (directive §2):
   1  "vLLM unreachable" (connection refused / timeout / DNS)
   2  "model not served" (404 from the server)
   3  "invalid response" (HTTP 200 but body unparseable / --json broken)
-  4  any other error
+  4  any other error (empty prompt, unreadable prompt-file, HTTP != 404)
+
+Usage/argument errors from argparse also exit 2; when scripting against
+this contract pass the prompt via --prompt/--prompt-file, then argparse
+errors are impossible and exit 2 always means "model not served".
 
 Usage:
   vllm-invoke.py --prompt "clasifica estas lineas: ..." [--json]
@@ -92,11 +96,15 @@ def main(argv=None) -> int:
     if not prompt and args.prompt_file:
         try:
             prompt = Path(args.prompt_file).read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError covers UnicodeDecodeError (non-UTF-8 prompt file)
             return fail(4, f"prompt-file unreadable: {exc}",
                         {"ts": _now(), "exit_code": 4, "hint_followed": False})
-    if not prompt and not sys.stdin.isatty():
-        prompt = sys.stdin.read()
+    if not prompt and sys.stdin is not None and not sys.stdin.isatty():
+        try:
+            prompt = sys.stdin.read()
+        except (OSError, ValueError):
+            prompt = ""  # unreadable stdin -> fall through to empty-prompt error
     if not prompt.strip():
         print("empty prompt (use --prompt, --prompt-file or stdin)",
               file=sys.stderr)
