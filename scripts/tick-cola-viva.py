@@ -326,7 +326,10 @@ def run(hermes_home=None, execute: bool = False, now=None,
     """One tick. Returns list of decision strings (empty = silent)."""
     now = time.time() if now is None else float(now)
     home = Path(hermes_home) if hermes_home else get_hermes_home()
-    db = kanban_db_path(home)
+    # Board resolution: only pin the DB from an EXPLICIT hermes_home arg
+    # (tests pass a fixture dir). In production main() passes nothing and
+    # kanban_db_path() resolves the shared root board from the env.
+    db = kanban_db_path(home) if hermes_home else kanban_db_path()
     ledger = ledger_path(home)
 
     decisions: list[str] = []

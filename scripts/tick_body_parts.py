@@ -148,12 +148,30 @@ def get_hermes_home() -> Path:
     return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
 
+def _get_hermes_root() -> Path:
+    """Shared root (~/.hermes) for the board, which lives OUTSIDE profiles.
+
+    The cron env sets HERMES_HOME to the profile (…/profiles/pr-ollama);
+    the kanban board is a shared resource at ~/.hermes/kanban.db, so a
+    bare HERMES_HOME/kanban.db points at a nonexistent file (t_99e3b849).
+    Mirrors health_checks._get_hermes_root / concurrency_guard."""
+    val = os.environ.get("HERMES_HOME", "").strip()
+    home = Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    try:
+        home.relative_to(profiles_root)
+        return (Path.home() / ".hermes").resolve()
+    except ValueError:
+        return home
+
+
 def kanban_db_path(hermes_home=None) -> Path:
     env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if env_db:
         return Path(env_db).expanduser().resolve()
-    base = Path(hermes_home) if hermes_home else get_hermes_home()
-    return base / "kanban.db"
+    if hermes_home:
+        return Path(hermes_home) / "kanban.db"
+    return _get_hermes_root() / "kanban.db"
 
 
 def ledger_path(hermes_home=None) -> Path:

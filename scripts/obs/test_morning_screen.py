@@ -158,7 +158,36 @@ class TestBoardScreen(Base):
         out = screen.build_board_screen(hermes_home=self.home())
         self.assertIn("done 24h: 1", out)
         self.assertIn("t_1", out)
+        # No metrics-history in the fixture home -> n/d (fail open)
         self.assertIn("supply_ratio diario: n/d", out)
+
+    def test_supply_ratio_from_metrics_history(self):
+        """OBJ-29: the BOARD line shows the latest daily bucket."""
+        self._seed_board()
+        _write_jsonl(
+            Path(self.tmp) / "quota-governor" / "metrics-history.jsonl", [
+                {"ts": "2026-09-10T15:15:20Z", "supply_created_24h": 26,
+                 "supply_closed_24h": 17, "supply_ratio": 1.529},
+                {"ts": "2026-09-11T15:15:20Z", "supply_created_24h": 9,
+                 "supply_closed_24h": 10, "supply_ratio": 0.9},
+            ])
+        out = screen.build_board_screen(hermes_home=self.home())
+        # newest day wins, verbatim ratio
+        self.assertIn("supply_ratio diario: 2026-09-11 ratio=0.9", out)
+
+    def test_supply_ratio_skips_incomplete_day(self):
+        """A newest row with zero/None components is skipped, not shown as
+        a false deficit or a false 0.0."""
+        self._seed_board()
+        _write_jsonl(
+            Path(self.tmp) / "quota-governor" / "metrics-history.jsonl", [
+                {"ts": "2026-09-10T15:15:20Z", "supply_created_24h": 26,
+                 "supply_closed_24h": 17, "supply_ratio": 1.529},
+                {"ts": "2026-09-12T09:00:00Z", "supply_created_24h": None,
+                 "supply_closed_24h": None, "supply_ratio": None},
+            ])
+        out = screen.build_board_screen(hermes_home=self.home())
+        self.assertIn("supply_ratio diario: 2026-09-10 ratio=1.529", out)
 
     def test_missing_db_returns_empty(self):
         self.assertEqual(screen.build_board_screen(hermes_home=self.home()), "")
