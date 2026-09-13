@@ -434,10 +434,25 @@ def run(hermes_home=None, execute: bool = False, now=None,
     # the drought declaration below must be TRUE when reached with 0 ready.
 
     # ── Step 4: nothing legitimate — cola seca legitima, no filler ──
-    act({"ts": now, "action": "cola-seca-legitima",
-         "reason": "sin ready sin assignee, sin ready con assignee, sin "
-                   "cierre clase:C <24h sin sucesor abierto"},
-        "cola seca legitima: sin trabajo legitimo (regla de oro: no filler)")
+    # C (13-sep, user-approved): drought with >=5 tasks in triage is NOT a
+    # quiet verdict — the board is waiting on the user. Name it.
+    try:
+        con = _connect(db)
+        try:
+            n_triage = con.execute(
+                "SELECT count(*) FROM tasks WHERE status='triage'").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        n_triage = 0
+    if n_triage >= 5:
+        act({"ts": now, "action": "waiting-user", "triage": n_triage},
+            f"INCIDENTE: sequia con {n_triage} tareas en triage — el board espera al usuario, no esta seco")
+    else:
+        act({"ts": now, "action": "cola-seca-legitima",
+             "reason": "sin ready sin assignee, sin ready con assignee, sin "
+                       "cierre clase:C <24h sin sucesor abierto"},
+            "cola seca legitima: sin trabajo legitimo (regla de oro: no filler)")
     return decisions
 
 
