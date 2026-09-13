@@ -95,6 +95,14 @@ _ASSIGNEE_FIX_SCRIPT = os.path.join(
     "assignee-fix.py",
 )
 
+# --- approval-ready-fix.py path (P5, 2026-09-13) ------------------------------
+
+_APPROVAL_FIX_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "scripts",
+    "approval-ready-fix.py",
+)
+
 
 # ---------------------------------------------------------------------------
 # Hooks
@@ -260,6 +268,27 @@ def _on_kanban_dispatch_tick(
         logger.debug("assignee-fix.py spawned after dispatch tick")
     except Exception as exc:
         logger.debug("failed to spawn assignee-fix.py: %s", exc)
+
+    # P5 (2026-09-13): approval-ready backstop — completes Flujo B packages
+    # and archives duplicate proposals (dedup by signature). Same pattern:
+    # enforce in code what the creator prompt cannot guarantee. Dry-run
+    # default inside the script; here we pass --execute because the hook
+    # is the deterministic enforcement point.
+    if not os.path.exists(_APPROVAL_FIX_SCRIPT):
+        logger.debug("approval-ready-fix.py not found at %s — skipping",
+                     _APPROVAL_FIX_SCRIPT)
+    else:
+        try:
+            subprocess.Popen(
+                ["/usr/bin/python3.12", _APPROVAL_FIX_SCRIPT, "--execute"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.debug("approval-ready-fix.py spawned after dispatch tick")
+        except Exception as exc:
+            logger.debug("failed to spawn approval-ready-fix.py: %s", exc)
 
 
 def _on_kanban_task_completed(

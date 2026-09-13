@@ -259,8 +259,9 @@ check("sensitive allows nanogpt",
       "nanogpt" in quota_gate.PRIVACY_CAPABILITIES["sensitive"])
 check("sensitive excludes openrouter",
       "openrouter" not in quota_gate.PRIVACY_CAPABILITIES["sensitive"])
-check("confidential only allows custom",
-      quota_gate.PRIVACY_CAPABILITIES["confidential"] == {"custom"})
+check("confidential only allows local (custom + vllm-local OBJ-40)",
+      quota_gate.PRIVACY_CAPABILITIES["confidential"] == {"custom",
+                                                          "vllm-local"})
 
 # Reverse mapping
 check("reverse: ollama-cloud handles public",

@@ -522,6 +522,53 @@ def build_efficiency_screen(hermes_home=None) -> str:
     return "\n".join(out)
 
 
+def build_approval_screen(hermes_home=None) -> str:
+    """APPROVAL-READY (P5): triage tasks stamped [APPROVAL: pending].
+
+    Reads approval_gate from the same dir (import; fail-open if absent —
+    the section simply does not render). Lists id/title/package-gap so the
+    owner can say si/no/condicion in chat."""
+    gate = None
+    here = Path(__file__).resolve().parent
+    for cand in (here / "approval_gate.py",
+                 here.parent / "approval_gate.py",
+                 Path.home() / ".hermes" / "scripts" / "approval_gate.py"):
+        if cand.exists():
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "approval_gate_ms", cand)
+                if spec is None or spec.loader is None:
+                    continue
+                gate = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(gate)
+                break
+            except Exception:
+                continue
+    if gate is None:
+        return ""
+    pend = gate.fetch_pending(gate.kanban_db_path())
+    if not pend:
+        return "APPROVAL-READY (pendientes de tu ok)\n  sin iniciativas pendientes de aprobacion"
+    lines = ["APPROVAL-READY (pendientes de tu ok):"]
+    n = 0
+    for t in pend:
+        body = t["body"] or ""
+        missing = gate.package_missing(body)
+        obj_m = gate.PACKAGE_FIELDS[6][1].search(body)
+        budget_m = gate.PACKAGE_FIELDS[0][1].search(body)
+        obj = obj_m.group(1) if obj_m else "-"
+        budget = budget_m.group(1).strip()[:28] if budget_m else "-"
+        gap = "" if not missing else \
+            f"  [falta {', '.join(missing)}]"
+        n += 1
+        lines.append(f"  {n}. {obj}: {(t['title'] or '')[:64]} — "
+                     f"{budget}{gap}")
+    lines.append('  -> Di "sí" en chat para arrancar, "no" para archivar,')
+    lines.append('     o "sí pero con <condición>".')
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -533,6 +580,7 @@ def build_screen(hermes_home=None) -> str:
         build_forecast_screen(hermes_home),
         build_board_screen(hermes_home),
         build_efficiency_screen(hermes_home),
+        build_approval_screen(hermes_home),
         build_alerts_screen(hermes_home),
         build_flight_report(hermes_home),
     ]
