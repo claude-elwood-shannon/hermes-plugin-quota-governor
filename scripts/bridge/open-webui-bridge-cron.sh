@@ -148,8 +148,19 @@ esac
 # independiente del proceso padre. El bridge resultante puede ejecutar
 # `hermes kanban create` sin restricciones de contexto delegado.
 mkdir -p "$(dirname "$LOG")"
+# §12 (MEDIATOR 2026-09-14): PATH mínimo RECONSTRUIDO, nunca PATH="$PATH".
+# El health-check corre desde cron (PATH=/usr/bin:/bin) o desde el contexto
+# restringido de Hermes (PATH sin ~/.local/bin). El bridge lanza `hermes`
+# por nombre desnudo (subprocess.run(["hermes", ...])) y hermes vive en
+# $HOME/.local/bin/hermes: con PATH="$PATH" el respawn heredaba un PATH sin
+# ~/.local/bin y TODOS los subprocess del bridge fallaban con
+# FileNotFoundError. env -i limpia el resto (HERMES_* del worker,
+# PYTHONPATH, AO_KANBAN_DB, ...); LANG se conserva si existe.
 setsid nohup env -i \
-    HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
+    HOME="$HOME" \
+    PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    LANG="${LANG:-C.UTF-8}" \
+    HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" \
     BRIDGE_PLUGIN_REPO="/data/git/hermes-plugin-quota-governor" \
     "$PY" "$BRIDGE" >> "$LOG" 2>&1 &
 sleep 2

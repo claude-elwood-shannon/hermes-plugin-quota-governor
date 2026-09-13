@@ -120,6 +120,18 @@ open-webui-bridge|~/.hermes/logs/open-webui-bridge.heartbeat|300|480|bash ~/.her
 - DIRECCION-STOP is respected: with the STOP file present, the health-check
   still verifies and alarms but does NOT restart.
 
+## Respawn environment
+
+`env -i` launches the daemon with a RECONSTRUCTED minimal PATH, never
+`PATH="$PATH"`: the wrapper may run from cron (`PATH=/usr/bin:/bin`) or the
+restricted Hermes worker context, where `~/.local/bin` is absent — and the
+bridge shells out to `hermes` (a bare `subprocess.run(["hermes", ...])`) which
+lives at `$HOME/.local/bin/hermes`. The respawn passes `HOME`, the minimal
+`PATH` (`$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin`), `LANG`,
+`HERMES_HOME`, and `BRIDGE_PLUGIN_REPO`; everything else (worker `HERMES_*`,
+`PYTHONPATH`, `AO_KANBAN_DB`, ...) is stripped by `env -i`, so the daemon can
+mutate the board without delegated-context restrictions.
+
 ## Convergence to the canonical path
 
 The supervisor does more than respawn-on-dead. Every tick it classifies the
