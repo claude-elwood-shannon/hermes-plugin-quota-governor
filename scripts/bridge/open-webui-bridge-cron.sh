@@ -23,6 +23,11 @@
 PY=/usr/bin/python3.12
 BRIDGE="$HOME/.hermes/scripts/bridge/open-webui-bridge.py"
 PORT=9120
+# El bridge deriva la raíz del plugin repo de su __file__ (portable); en una
+# copia desplegada fuera del repo hay que pinarla (convención house: los
+# wrappers pinnean la ruta del script del repo — portable adoptants
+# regeneran el wrapper desde su propio checkout).
+export BRIDGE_PLUGIN_REPO="/data/git/hermes-plugin-quota-governor"
 HEARTBEAT="$HOME/.hermes/logs/open-webui-bridge.heartbeat"
 LOG="$HOME/.hermes/logs/open-webui-bridge.log"
 

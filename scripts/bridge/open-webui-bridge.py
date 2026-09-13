@@ -8,7 +8,13 @@ from urllib.parse import parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HERMES_HOME = os.path.expanduser("~/.hermes")
-PLUGIN_REPO = "/data/git/hermes-plugin-quota-governor"
+# raíz del plugin repo: derivada del script (copia repo: <repo>/scripts/bridge/
+# -> <repo>). Adoptantes que corren una copia desplegada fuera del repo fijan
+# BRIDGE_PLUGIN_REPO (el wrapper del house la exporta).
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_REPO = os.environ.get("BRIDGE_PLUGIN_REPO") or os.path.dirname(
+    os.path.dirname(_PLUGIN_DIR)
+)
 PORT = 9120
 MAX_FILE_BYTES = 100 * 1024  # 100 KB por fichero
 

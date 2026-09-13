@@ -50,7 +50,7 @@ lifecycle (crontab of the host):
 
 ```cron
 # supervisor: probe + converge + heartbeat, every 5 min
-*/5 * * * * /home/iinstances/.hermes/scripts/bridge/open-webui-bridge-cron.sh >> /home/iinstances/.hermes/logs/open-webui-bridge.log 2>&1
+*/5 * * * * ~/.hermes/scripts/bridge/open-webui-bridge-cron.sh >> ~/.hermes/logs/open-webui-bridge.log 2>&1
 # watchdog of the watchdog: verifies the heartbeat, every 15 min (already wired)
 */15 * * * * /home/iinstances/.hermes/scripts/cron-health-check.sh >> /home/iinstances/.hermes/logs/cron-health-check.log 2>&1
 ```

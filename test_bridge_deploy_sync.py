@@ -161,7 +161,22 @@ def check_live_service():
         )
 
 
+def check_portability():
+    """House convention (TestPortability family): the server module must be
+    free of host-specific absolute paths — adoptants run it portably."""
+    if not REPO_SERVER.exists():
+        return
+    src = REPO_SERVER.read_text(encoding="utf-8")
+    home_name = Path.home().name
+    for needle in ("/home/", "/data/git", home_name, "/iinstances", "C:\\"):
+        if needle in src:
+            bad(f"host path leaked into open-webui-bridge.py: {needle}")
+        else:
+            ok(f"no host path {needle!r} in open-webui-bridge.py")
+
+
 def main():
+    check_portability()
     check_file(REPO_SERVER, CANDIDATE_SERVER, must_exec=False, syntax="python")
     check_file(REPO_WRAPPER, CANDIDATE_WRAPPER, must_exec=True, syntax="bash")
     check_live_service()
