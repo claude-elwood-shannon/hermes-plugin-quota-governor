@@ -71,7 +71,7 @@ TASK_ID_RE = re.compile(r"\bt_\w+\b")
 
 # Class-C marker: the task body carries the literal 'clase:C' tag (the
 # convention objective-proposer.py / the autonomous-task-creator emit).
-CLASE_C_RE = re.compile(r"\bclase\s*:\s*C\b", re.I)
+CLASE_C_RE = re.compile(r"\bclase\s*:\s*C\b(-\w+)?", re.I)  # C y C-estructural (fix 13-sep: autoqueue done no contaba como padre)
 # Human-approval gate markers, matched ONLY against title + header.
 APPROVAL_GATE_RE = re.compile(
     r"(kill[\s_-]?switch|hasta\s+(?:la\s+)?(?:autorizaci|aprobaci)"
@@ -90,14 +90,6 @@ def state_dir(hermes_home=None) -> Path:
     return base / "quota-governor"
 
 
-def kanban_db_path(hermes_home=None) -> Path:
-    env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if env_db:
-        return Path(env_db).expanduser().resolve()
-    base = Path(hermes_home) if hermes_home else get_hermes_home()
-    return base / "kanban.db"
-
-
 def ledger_path(hermes_home=None) -> Path:
     return state_dir(hermes_home) / "cola-viva.jsonl"
 
@@ -105,6 +97,31 @@ def ledger_path(hermes_home=None) -> Path:
 def stop_file_path(hermes_home=None) -> Path:
     base = Path(hermes_home) if hermes_home else get_hermes_home()
     return base / "quota-governor" / "STOP"
+
+
+def _get_hermes_root() -> Path:
+    """Root ~/.hermes (the kanban.db lives at root, NOT profile-scoped)."""
+    val = os.environ.get("HERMES_HOME", "").strip()
+    hermes_home = Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    try:
+        hermes_home.relative_to(profiles_root)
+        return (Path.home() / ".hermes").resolve()
+    except ValueError:
+        return hermes_home
+
+
+def kanban_db_path(hermes_home=None) -> Path:
+    """kanban.db path with root fallback (profile db does not exist)."""
+    env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if env_db:
+        return Path(env_db).expanduser().resolve()
+    base = Path(hermes_home) if hermes_home else _get_hermes_root()
+    if not (base / "kanban.db").exists():
+        root = _get_hermes_root()
+        if (root / "kanban.db").exists():
+            return root / "kanban.db"
+    return base / "kanban.db"
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +182,7 @@ def has_open_successor(db_path: Path, parent_id: str) -> bool:
         con = _connect(db_path)
         try:
             rows = con.execute(
-                "SELECT id FROM tasks WHERE status!='archived' AND body LIKE ?",
+                "SELECT id FROM tasks WHERE status IN ('ready','running','blocked','todo') AND body LIKE ?",
                 (f"%{parent_id}%",)).fetchall()
         finally:
             con.close()
