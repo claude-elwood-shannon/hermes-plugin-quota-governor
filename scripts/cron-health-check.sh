@@ -37,6 +37,14 @@ CRONS=(
   "obs-serve|${HERMES_HOME_DIR}/profiles/pr-ollama/logs/obs-serve.heartbeat|300|480|bash ${HERMES_HOME_DIR}/scripts/obs-serve-cron.sh"
   # P4: efficiency ratio (hourly; wrapper deja linea timestamped por tick).
   "efficiency-ratio|${HERMES_HOME_DIR}/logs/efficiency-ratio.log|3600|5400|bash ${HERMES_HOME_DIR}/scripts/obs/efficiency-ratio-cron.sh"
+  # P3: bridge Open WebUI (daemon HTTP en el puerto 9120, NO es cron). Es un
+  # servicio silencioso: su log solo crece en respawn, así que log-mtime no
+  # es señal de vida — el wrapper sondea GET /openapi.json (200 esperado) y
+  # toca el heartbeat file en cada tick sano (patrón obs-serve.heartbeat).
+  # El wrapper además converge el puerto a la copia canónica
+  # ~/.hermes/scripts/bridge/open-webui-bridge.py (mata holders puente
+  # legacy, respawnea desde la canónica). Ver docs/bridge-open-webui.md.
+  "open-webui-bridge|${HERMES_HOME_DIR}/logs/open-webui-bridge.heartbeat|300|480|bash ${HERMES_HOME_DIR}/scripts/bridge/open-webui-bridge-cron.sh"
 )
 
 mkdir -p "$(dirname "$LOG")"
