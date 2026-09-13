@@ -72,6 +72,30 @@ TASK_ID_RE = re.compile(r"\bt_\w+\b")
 # Class-C marker: the task body carries the literal 'clase:C' tag (the
 # convention objective-proposer.py / the autonomous-task-creator emit).
 CLASE_C_RE = re.compile(r"\bclase\s*:\s*C\b(-\w+)?", re.I)  # C y C-estructural (fix 13-sep: autoqueue done no contaba como padre)
+
+# objective:OBJ-xx tag anywhere in the body (MEDIATOR budget gate, §6).
+OBJECTIVE_TAG_RE = re.compile(
+    r"\bobjective\s*:\s*(OBJ-[A-Za-z0-9._-]+)", re.I)
+
+
+def _load_approved_objectives():
+    """Lazy-load scripts/approved_objectives.py (fail-open: None if absent
+    or broken — then tagged tasks are RETAINED, never dispatched blind)."""
+    here = Path(__file__).resolve().parent
+    for cand in (here / "approved_objectives.py",
+                 Path.home() / ".hermes" / "scripts" / "approved_objectives.py"):
+        if cand.exists():
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "approved_objectives", cand)
+                if spec is None or spec.loader is None:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception:
+                continue
+    return None
 # Human-approval gate markers, matched ONLY against title + header.
 APPROVAL_GATE_RE = re.compile(
     r"(kill[\s_-]?switch|hasta\s+(?:la\s+)?(?:autorizaci|aprobaci)"
@@ -344,6 +368,30 @@ def run(hermes_home=None, execute: bool = False, now=None,
             "cola seca: STOP signal activo")
         return decisions
 
+    # ── MEDIATOR 2026-09-14: approved_objectives housekeeping ──
+    # Ensure the inventory table (+ seed), refresh spent_today/spent_total
+    # from the trace (implicit CEST-midnight reset), and apply autonomous
+    # lifecycle transitions (achieved/paused/reactivated). Runs on EVERY
+    # tick regardless of backlog (spend accounting is not a supply action).
+    # Fail-open: any error never breaks the tick.
+    _ao = _load_approved_objectives()
+    if _ao is not None:
+        try:
+            if not _ao.table_exists(db):
+                _ao.ensure_table(db)
+            spend_res = _ao.update_spend(db, now)
+            for line in _ao.run_lifecycle(db, now=now):
+                act({"ts": now, "action": "objective-lifecycle", "line": line},
+                    line)
+            if spend_res.get("updated"):
+                top = ", ".join(
+                    f"{u['id']} ${u['spent_today']:.2f}"
+                    for u in spend_res["updated"][:3])
+                act({"ts": now, "action": "objective-spend", "detail": top},
+                    f"objetivos: gasto hoy {top}")
+        except Exception:
+            pass  # observability/inventory never breaks the supply tick
+
     # ── Gate P2 (13-sep): backlog-guard — actúa con backlog bajo, no solo idle ──
     # backlog_total = running + ready_con_assignee. Mínimo operativo: 3.
     BACKLOG_MIN = 3
@@ -374,8 +422,27 @@ def run(hermes_home=None, execute: bool = False, now=None,
 
     # ── Step 1: assign a profile to a ready task with no assignee ──
     # (fix the silent stop: ready-without-assignee is claimed by nobody)
+    # MEDIATOR 2026-09-14: budget gate — tasks tagged objective:OBJ-XX are
+    # only dispatched when the objective is active and has budget left.
+    # Unknown objective => retained (fail-safe §6). Table missing =>
+    # fail-open for UNTAGGED tasks; TAGGED tasks are also retained (fail-
+    # safe: without the inventory the budget promise cannot be honored).
+    _ao = _load_approved_objectives()
     for t in ready_tasks(db):
         if not (t.get("assignee") or "").strip():
+            m_obj = OBJECTIVE_TAG_RE.search(t.get("body") or "")
+            if m_obj:
+                if _ao is None:
+                    act({"ts": now, "action": "held-budget-table-missing",
+                         "task": t["id"]},
+                        f"retain: {t['id']} tiene objective tag pero approved_objectives no existe (fail-safe §6)")
+                    return decisions
+                allowed, reason = _ao.budget_check(db, m_obj.group(1).upper())
+                if not allowed:
+                    act({"ts": now, "action": "held-budget", "task": t["id"],
+                         "objective": m_obj.group(1), "reason": reason},
+                        f"retain: {t['id']} — {reason}")
+                    return decisions
             assignee = DEFAULT_ASSIGNEE
             if not execute:
                 act({"ts": now, "action": "assigned-ready", "task": t["id"],

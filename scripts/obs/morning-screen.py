@@ -564,6 +564,55 @@ def build_efficiency_screen(hermes_home=None) -> str:
     return "\n".join(out)
 
 
+def build_objectives_screen(hermes_home=None) -> str:
+    """OBJETIVOS APROBADOS (MEDIATOR 2026-09-14): inventory + spend + colors.
+
+    Reads the approved_objectives TABLE from the root kanban.db (sqlite3
+    stdlib, read-only). Fail-open: table missing -> the section does not
+    render (degraded mode is alarmed by the health-check, not here)."""
+    import sqlite3
+    base = hermes_home or Path.home() / ".hermes"
+    db = base / "kanban.db"
+    if not db.exists():
+        return ""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT id, name, status, budget_daily, spent_today, spent_total "
+            "FROM approved_objectives ORDER BY id").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return ""
+    if not rows:
+        return ""
+    dot = {"green": "[VERDE]", "yellow": "[AMBAR]", "orange": "[NARANJA]",
+           "red": "[ROJO]"}
+    lines = ["OBJETIVOS APROBADOS:"]
+    tot_spend = tot_budget = 0.0
+    for r in rows:
+        spent = r["spent_today"] or 0.0
+        budget = r["budget_daily"] or 0.0
+        tot_spend += spent
+        tot_budget += budget
+        pct = (spent / budget) if budget > 0 else 0.0
+        if budget <= 0:
+            color = dot["red"]
+        elif pct < 0.5:
+            color = dot["green"]
+        elif pct < 0.8:
+            color = dot["yellow"]
+        elif pct < 1.0:
+            color = dot["orange"]
+        else:
+            color = dot["red"]
+        name = (r["name"] or "")[:36]
+        lines.append(f"  {r['id']:<14} {r['status']:<9} "
+                     f"${spent:.2f}/${budget:.2f}   {color}  ({name})")
+    lines.append(f"  TOTAL:                  ${tot_spend:.2f}/${tot_budget:.2f}")
+    return "\n".join(lines)
+
+
 def build_approval_screen(hermes_home=None) -> str:
     """APPROVAL-READY (P5): triage tasks stamped [APPROVAL: pending].
 
@@ -622,6 +671,7 @@ def build_screen(hermes_home=None) -> str:
         build_forecast_screen(hermes_home),
         build_board_screen(hermes_home),
         build_efficiency_screen(hermes_home),
+        build_objectives_screen(hermes_home),
         build_approval_screen(hermes_home),
         build_alerts_screen(hermes_home),
         build_flight_report(hermes_home),

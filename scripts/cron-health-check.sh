@@ -52,6 +52,24 @@ NOW=$(date +%s)
 CHECKED=0; OK=0; DEAD=0; NEVER=0; ZOMBIE=0
 ACTIONS="["
 
+# ── approved_objectives inventory (MEDIATOR 2026-09-14) ─────────────────
+# Degraded-mode alarm: table missing or 0 active objectives disables the
+# autonomous supply source (Flujo A/B still work). Never aborts the check.
+AO_DB="${AO_KANBAN_DB:-$HERMES_HOME_DIR/kanban.db}"
+AO_ACTIVE=$(/usr/bin/python3.12 -c "
+import sqlite3, sys
+try:
+    c = sqlite3.connect('file:$AO_DB?mode=ro', uri=True)
+    print(c.execute(\"SELECT count(*) FROM approved_objectives WHERE status='active'\").fetchone()[0])
+except Exception as e:
+    print('ERR')
+" 2>/dev/null)
+if [ "$AO_ACTIVE" = "ERR" ]; then
+    echo "$(date -Iseconds) WARN: approved_objectives table missing or inaccessible — system in degraded mode" >> "$LOG"
+elif [ "$AO_ACTIVE" = "0" ]; then
+    echo "$(date -Iseconds) WARN: no active objectives — autonomous supply disabled (only Flujo A + Flujo B)" >> "$LOG"
+fi
+
 extract_last_ts() {
   # Último timestamp '[YYYY-MM-DD HH:MM:SS]' del log dado (epoch).
   # Fallback: si el fichero existe pero no contiene timestamp parseable

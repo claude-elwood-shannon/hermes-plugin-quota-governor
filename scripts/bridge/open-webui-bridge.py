@@ -29,6 +29,102 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 
 HERMES_HOME = os.path.expanduser("~/.hermes")
+
+# --- approved_objectives (MEDIATOR 2026-09-14) -------------------------------
+# kanban.db lives at the ROOT ~/.hermes (shared board); read for GET,
+# write for POST /update-objective. SQLite locks serialize both writers
+# (bridge + tick). env override for tests.
+_AO_DB = os.environ.get("AO_KANBAN_DB") or os.path.join(HERMES_HOME, "kanban.db")
+_AO_VALID_STATUSES = {"active", "achieved", "paused", "discarded"}
+
+
+def _ao_list(status=None):
+    import sqlite3
+    if not os.path.exists(_AO_DB):
+        return None
+    con = sqlite3.connect(f"file:{_AO_DB}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        if status:
+            rows = con.execute(
+                "SELECT * FROM approved_objectives WHERE status=? ORDER BY id",
+                (status,)).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM approved_objectives ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def _ao_upsert(data):
+    """POST /update-objective: INSERT or UPDATE of PROVIDED fields only.
+    Declared columns for the bridge: id/name/budget_daily/description/
+    status/success_criterion. Housekeeping (spent_*, exhausted_days) is
+    tick-owned and never wiped."""
+    import sqlite3
+    import time as _t
+    oid = (data.get("id") or "").strip()
+    name = (data.get("name") or "").strip()
+    budget = data.get("budget_daily")
+    if not oid or not name or not isinstance(budget, (int, float)) \
+            or isinstance(budget, bool):
+        return 400, {"error": "id, name and numeric budget_daily are required"}
+    status = (data.get("status") or "active").strip()
+    if status not in _AO_VALID_STATUSES:
+        return 400, {"error": f"invalid status {status!r} "
+                              f"(valid: {sorted(_AO_VALID_STATUSES)})"}
+    if not os.path.exists(_AO_DB):
+        return 500, {"error": "kanban.db not found"}
+    now = _t.time()
+    con = None
+    try:
+        con = sqlite3.connect(_AO_DB)
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS approved_objectives ("
+            "id TEXT PRIMARY KEY, name TEXT NOT NULL, budget_daily REAL "
+            "NOT NULL DEFAULT 0.0, description TEXT, status TEXT NOT NULL "
+            "DEFAULT 'active', success_criterion TEXT, spent_today REAL "
+            "DEFAULT 0.0, spent_total REAL DEFAULT 0.0, created_at REAL, "
+            "updated_at REAL, updated_by TEXT, exhausted_days INTEGER "
+            "DEFAULT 0, last_exhausted_day TEXT)")
+        row = con.execute("SELECT id FROM approved_objectives WHERE id=?",
+                          (oid,)).fetchone()
+        if row:
+            sets, vals = ["updated_at=?", "updated_by=?"], [now, "mediator"]
+            for f in ("name", "budget_daily", "description",
+                      "success_criterion", "status"):
+                if f in data and data[f] is not None:
+                    sets.append(f"{f}=?")
+                    vals.append(data[f])
+            vals.append(oid)
+            con.execute(f"UPDATE approved_objectives SET {', '.join(sets)} "
+                        "WHERE id=?", vals)
+            action = "updated"
+        else:
+            con.execute(
+                "INSERT INTO approved_objectives (id, name, budget_daily, "
+                "description, status, success_criterion, created_at, "
+                "updated_at, updated_by) VALUES (?,?,?,?,?,?,?,?,?)",
+                (oid, name, float(budget), data.get("description"), status,
+                 data.get("success_criterion"), now, now, "mediator"))
+            action = "created"
+        con.commit()
+        con.row_factory = sqlite3.Row
+        out = con.execute("SELECT * FROM approved_objectives WHERE id=?",
+                          (oid,)).fetchone()
+        con.close()
+        return 200, {"ok": True, "action": action,
+                     "objective": dict(out) if out else None}
+    except sqlite3.Error as exc:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return 500, {"error": str(exc)}
 # raíz del plugin repo: derivada del script (copia repo: <repo>/scripts/bridge/
 # -> <repo>). Adoptantes que corren una copia desplegada fuera del repo fijan
 # BRIDGE_PLUGIN_REPO (el wrapper del house la exporta).
@@ -100,6 +196,8 @@ OPENAPI_SPEC = {
         "/metrics": {"get": {"summary": "Get metrics history", "description": "Reads metrics-history.jsonl and filters by kind and time window.", "operationId": "get_metrics", "parameters": [{"name": "kind", "in": "query", "required": False, "schema": {"type": "string"}}, {"name": "days", "in": "query", "required": False, "schema": {"type": "integer", "default": 7}}], "responses": {"200": {"description": "Metrics history", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/approve-task": {"post": {"summary": "Atomically approve a triage task (move to ready + stamp approval)", "description": "Moves triage->todo (specify) then todo->ready (promote), then stamps an [APPROVAL: approved <ts>] comment. Reports moved/stamped booleans per step; non-transactional (a failed comment can be retried).", "operationId": "approve_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}, "note": {"type": "string", "description": "Optional approval note"}}, "required": ["task_id"]}}}}, "responses": {"200": {"description": "Approval result", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/verify-task": {"post": {"summary": "Verify task success criterion against evidence", "description": "Reads a completed task's body, extracts the declared success criterion, searches for evidence of fulfillment, and returns a verdict (PASS|FAIL|INCONCLUSIVE|NO_CRITERION|NOT_DONE).", "operationId": "verify_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}}}, "responses": {"200": {"description": "Verification result", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/objectives": {"get": {"summary": "Get approved objectives inventory", "description": "Returns all approved objectives with their status, budget, and spending. Filter by status with optional parameter.", "operationId": "get_objectives", "parameters": [{"name": "status", "in": "query", "required": False, "schema": {"type": "string"}}], "responses": {"200": {"description": "Objectives list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/update-objective": {"post": {"summary": "Create or update an approved objective", "description": "Inserts a new objective or updates an existing one. Used by mediator to manage the objectives inventory.", "operationId": "update_objective", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "budget_daily": {"type": "number"}, "description": {"type": "string"}, "success_criterion": {"type": "string"}, "status": {"type": "string", "default": "active"}}, "required": ["id", "name", "budget_daily"]}}}}, "responses": {"200": {"description": "Objective created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
     }
 }
 
@@ -530,6 +628,14 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_git_log(qs)
         elif path == "/metrics":
             self._handle_metrics(qs)
+        elif path == "/objectives":
+            status = (qs.get("status") or [None])[0]
+            rows = _ao_list(status)
+            if rows is None:
+                self._send_json({"error": "approved_objectives unavailable "
+                                          "(kanban.db missing or table absent)"}, 503)
+            else:
+                self._send_json({"objectives": rows, "count": len(rows)})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -647,6 +753,9 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_approve_task(self._read_body())
         elif path == "/verify-task":
             self._handle_verify_task(self._read_body())
+        elif path == "/update-objective":
+            code, resp = _ao_upsert(self._read_body())
+            self._send_json(resp, code)
         else:
             self._send_json({"error": "not found"}, 404)
 
