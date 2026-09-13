@@ -341,11 +341,21 @@ def run(hermes_home=None, execute: bool = False, now=None,
             "cola seca: STOP signal activo")
         return decisions
 
-    # ── Gate: idle board (live_workers == 0) ──
-    if live_workers is not None and live_workers > 0:
-        act({"ts": now, "action": "skipped", "reason": f"live_workers={live_workers}"},
-            f"cola viva: {live_workers} worker(s) en vuelo")
+    # ── Gate P2 (13-sep): backlog-guard — actúa con backlog bajo, no solo idle ──
+    # backlog_total = running + ready_con_assignee. Mínimo operativo: 3.
+    BACKLOG_MIN = 3
+    ready_all = ready_tasks(db)
+    ready_assigned_n = sum(1 for t in ready_all if (t.get("assignee") or "").strip())
+    backlog_total = (live_workers or 0) + ready_assigned_n
+    _log(ledger, {"ts": now, "action": "backlog-guard", "ready_assigned": ready_assigned_n,
+                  "live_workers": live_workers or 0, "backlog_total": backlog_total,
+                  "verdict": "OK" if backlog_total >= BACKLOG_MIN else "LOW"})
+    if backlog_total >= BACKLOG_MIN:
+        act({"ts": now, "action": "skipped", "reason": f"backlog OK ({backlog_total})"},
+            f"backlog OK (ready={ready_assigned_n}, running={live_workers or 0})")
         return decisions
+    # verdict LOW: el ledger ya registró el guard; la cascade continúa y su
+    # acción será la única línea de decisión del tick (contrato 1-linea).
 
     # ── Gate: free quota (session AND weekly < 80%) ──
     if session_pct is not None and session_pct >= QUOTA_THRESHOLD_PCT:

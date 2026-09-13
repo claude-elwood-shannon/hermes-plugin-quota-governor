@@ -128,11 +128,23 @@ class TestStopSignal(Base):
 
 class TestQuotaGates(Base):
     def test_live_workers_skips(self):
+        """P2: live_workers=1 con ready sin assignee -> backlog bajo (1<3),
+        la cascade ACTÚA asignando (ya no skip por tener workers en vuelo)."""
         _mk_db(self.db, [_ready(assignee=None)])
         out = self._run(live_workers=1)
         self.assertEqual(len(out), 1)
-        self.assertIn("en vuelo", out[0])
+        self.assertIn("asignado t_ready", out[0])
+        self.assertEqual(self.calls["assign"], [("t_ready", "pr-ollama")])
+
+    def test_backlog_ok_skips(self):
+        """P2: backlog_total >= 3 (1 running + 2 ready asignadas) -> skip."""
+        _mk_db(self.db, [_ready(assignee="pr-ollama"),
+                         _ready(assignee="pr-ollama")])
+        out = self._run(live_workers=1)
+        self.assertEqual(len(out), 1)
+        self.assertIn("backlog OK", out[0])
         self.assertEqual(self.calls["assign"], [])
+        self.assertEqual(self.calls["create"], [])
 
     def test_session_high_skips(self):
         _mk_db(self.db, [_ready(assignee=None)])
