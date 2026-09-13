@@ -35,6 +35,8 @@ CRONS=(
   # cada tick con el portal vivo (liveness file, patrón heartbeat).
   # Ruta real: el wrapper fija HERMES_HOME al perfil pr-ollama (pin documentado).
   "obs-serve|${HERMES_HOME_DIR}/profiles/pr-ollama/logs/obs-serve.heartbeat|300|480|bash ${HERMES_HOME_DIR}/scripts/obs-serve-cron.sh"
+  # P4: efficiency ratio (hourly; wrapper deja linea timestamped por tick).
+  "efficiency-ratio|${HERMES_HOME_DIR}/logs/efficiency-ratio.log|3600|5400|bash ${HERMES_HOME_DIR}/scripts/obs/efficiency-ratio-cron.sh"
 )
 
 mkdir -p "$(dirname "$LOG")"

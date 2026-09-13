@@ -66,6 +66,10 @@ def forecast_path(hermes_home=None) -> Path:
     return state_dir(hermes_home) / "forecast.json"
 
 
+def metrics_path(hermes_home=None) -> Path:
+    return state_dir(hermes_home) / "metrics-history.jsonl"
+
+
 # The shared board lives at the ROOT ~/.hermes/kanban.db, not under a profile
 # home. Same convention as trace.py's _source_homes: scan root + profile homes
 # and return the first that exists. Overridable via QUOTA_GOVERNOR_PROFILE_HOMES
@@ -468,6 +472,56 @@ def build_flight_report(hermes_home=None, now=None) -> str:
     return "\n".join(lines)
 
 
+def build_efficiency_screen(hermes_home=None) -> str:
+    """EFFICIENCY (P4): last efficiency_ratio line from metrics-history.
+
+    Zero computation here — the hourly efficiency-ratio cron does the math;
+    the screen just renders the latest entry. Empty when no entry exists
+    yet (the section simply does not appear until the first cron tick)."""
+    latest = None
+    try:
+        for row in _read_jsonl(metrics_path(hermes_home)):
+            if row.get("kind") == "efficiency_ratio":
+                latest = row
+    except OSError:
+        return ""
+    if not latest:
+        return ""
+
+    dot = {"EXCELENTE": "[EXCELENTE]", "OK": "[OK]", "BAJO": "[BAJO]",
+           "CRITICO": "[CRITICO]", "SIN GASTO": "[SIN GASTO]",
+           "N/A": "[N/A]"}
+
+    def line(label, e, prefix=""):
+        tasks = e.get("tareas_verificadas")
+        usd = e.get("gasto_usd")
+        ratio = e.get("ratio")
+        verd = dot.get(e.get("veredicto") or "N/A", "")
+        ratio_s = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "N/A"
+        usd_s = f"${usd:.2f}" if isinstance(usd, (int, float)) else "-"
+        base = e.get("base_mode")
+        base_s = "" if base in ("strict", None) else f" (base {base})"
+        return (f"  {prefix}Tareas verificadas: {tasks} | Gasto: {usd_s} | "
+                f"Ratio: {ratio_s} {verd}{base_s}")
+
+    out = ["EFFICIENCY (autodesarrollo + autorremediacion)"]
+    out.append(line("24h", latest))
+    r7 = latest.get("ratio_7d")
+    if r7 is not None or latest.get("tareas_verificadas_7d"):
+        v7 = latest.get("tareas_verificadas_7d")
+        u7 = latest.get("gasto_usd_7d")
+        verd7 = dot.get(latest.get("veredicto_7d") or "N/A", "")
+        r7_s = f"{r7:.2f}" if isinstance(r7, (int, float)) else "N/A"
+        u7_s = f"${u7:.2f}" if isinstance(u7, (int, float)) else "-"
+        base7 = latest.get("base_mode_7d")
+        base7_s = "" if base7 in ("strict", None) else f" (base {base7})"
+        out.append(f"  7d: {v7} tareas | {u7_s} | Ratio: {r7_s} "
+                   f"{verd7}{base7_s}")
+    if latest.get("verifier") == "limited":
+        out.append("  [verificador limitado: tick_body_parts no disponible]")
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -478,6 +532,7 @@ def build_screen(hermes_home=None) -> str:
         build_trace_screen(hermes_home),
         build_forecast_screen(hermes_home),
         build_board_screen(hermes_home),
+        build_efficiency_screen(hermes_home),
         build_alerts_screen(hermes_home),
         build_flight_report(hermes_home),
     ]

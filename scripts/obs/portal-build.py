@@ -724,6 +724,11 @@ def page_index(data: dict, query: dict = None) -> str:
     unatt_pct = (unatt / total * 100.0) if total > 0 else 0.0
     gap_cls = "gap" if unatt_pct > ms.UNATTRIBUTED_SPEND_PCT else ""
     last = data["metrics"][-1] if data["metrics"] else {}
+    eff = None
+    for row in reversed(data["metrics"]):
+        if row.get("kind") == "efficiency_ratio":
+            eff = row
+            break
     n_alarms = len(data["alarm_lines"])
     out = ['<section class="kpis">']
     out.append(_kpi(
@@ -745,6 +750,21 @@ def page_index(data: dict, query: dict = None) -> str:
         out.append(_kpi("Saldo NanoGPT",
                         _usd2(bal) if bal is not None else "n/d",
                         _badge(od._LEVEL_BADGE.get(str(lvl), "mut"), lvl)))
+    if eff:
+        er_ratio = eff.get("ratio")
+        er_s = f"{er_ratio:.2f}" if isinstance(er_ratio, (int, float)) \
+            else "n/d"
+        verd = str(eff.get("veredicto") or "N/A")
+        verd_cls = {"EXCELENTE": "acc", "OK": "", "BAJO": "warn",
+                    "CRITICO": "gap", "SIN GASTO": "mut"}.get(verd, "mut")
+        base = eff.get("base_mode")
+        base_s = "" if base in ("strict", None) else f" · base {base}"
+        out.append(_kpi(
+            "Efficiency 24h", er_s,
+            f'{eff.get("tareas_verificadas", "?")} verif. · '
+            f'{_esc(_usd2(eff.get("gasto_usd"))) if isinstance(eff.get("gasto_usd"), (int, float)) else "-"}'
+            f' <span class="badge {verd_cls}">{_esc(verd)}</span>'
+            f'{_esc(base_s)}'))
     out.append(_kpi("Done 24h", str(len(board["done24"])),
                     ", ".join(r["id"] for r in board["done24"][:4])
                     + ("…" if len(board["done24"]) > 4 else "")))
