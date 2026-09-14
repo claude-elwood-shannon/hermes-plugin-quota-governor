@@ -593,9 +593,13 @@ def build_flight_report(hermes_home=None, now=None) -> str:
 
     # Group by objective: tag header `objective:OBJ-NN` in the body (the
     # OBJ-08 convention). Untagged closures group under 'sin etiqueta'.
+    # MEDIATOR t_4fa0a4b5: the id namespace now includes the approved_
+    # objectives TABLE ids (OBJ-AUTODEV, OBJ-CODEQUALITY, ...), so the
+    # regex covers `OBJ-` ids AND `OBJ-<word>` table ids.
     by_obj = {}
     for r in rows:
-        m = re.search(r"objective:(OBJ-\d+)", r["body"] or "")
+        m = re.search(r"objective:\s*(OBJ-[A-Za-z0-9._-]+)",
+                      r["body"] or "")
         obj = m.group(1) if m else "sin etiqueta"
         by_obj.setdefault(obj, []).append(r)
 

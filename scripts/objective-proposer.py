@@ -194,7 +194,8 @@ def get_active_objectives() -> Dict[str, Dict[str, Any]]:
     objectives: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         body = row["body"] or ""
-        for match in re.finditer(r"objective:(OBJ-\d+)", body, re.IGNORECASE):
+        # MEDIATOR t_4fa0a4b5: ids include approved_objectives TABLE ids.
+        for match in re.finditer(r"objective:\s*(OBJ-[A-Za-z0-9._-]+)", body, re.IGNORECASE):
             obj_id = match.group(1).upper()
             if obj_id not in objectives:
                 objectives[obj_id] = {
@@ -220,7 +221,8 @@ def get_completed_objectives_info() -> Dict[str, Dict[str, Any]]:
     obj_info: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         body = row["body"] or ""
-        for match in re.finditer(r"objective:(OBJ-\d+)", body, re.IGNORECASE):
+        # MEDIATOR t_4fa0a4b5: ids include approved_objectives TABLE ids.
+        for match in re.finditer(r"objective:\s*(OBJ-[A-Za-z0-9._-]+)", body, re.IGNORECASE):
             obj_id = match.group(1).upper()
             if obj_id not in obj_info:
                 obj_info[obj_id] = {

@@ -285,7 +285,9 @@ DEFAULT_GIT_REPO = PLUGIN_REPO
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running",
                   "blocked", "review", "done", "archived"}
 TASK_ID_RE = re.compile(r"^t_[0-9a-f]{8}$")
-OBJ_RE = re.compile(r"OBJ-\d+", re.I)
+# MEDIATOR t_4fa0a4b5: objective ids include approved_objectives TABLE ids
+# (OBJ-AUTODEV, OBJ-CODEQUALITY, OBJ-0N legacy, ...).
+OBJ_RE = re.compile(r"OBJ-[A-Za-z0-9._-]+", re.I)
 
 CRITERION_RE = re.compile(
     r"(?im)^[#*\s]*\**(?:criterio de (?:é|e)xito|success criterion|"

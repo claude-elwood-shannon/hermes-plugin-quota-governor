@@ -97,9 +97,59 @@ def metrics_path() -> Path:
 WINDOWS = {"24h": 86400, "7d": 7 * 86400}
 
 # Standing-budget objectives (the only ones the standing budget pays for).
-BUDGET_OBJECTIVES = {"AUTODEV", "AUTOREPAIR"}
-OBJECTIVE_RE = re.compile(
-    r"\bobjective\s*:\s*(AUTODEV|AUTOREPAIR)\b", re.I)
+# MEDIATOR t_4fa0a4b5 (Sep 2026): the budget moved from the legacy
+# AUTODEV/AUTOREPAIR namespace to the approved_objectives TABLE
+# (~/.hermes/kanban.db).  A task counts when its objective tag names a
+# table row — legacy names stay valid (they seeded the table).  The table
+# is read once per compute(); missing/unreadable table degrades to the
+# legacy pair (fail-open, same spirit as §6's fail-open for untagged).
+LEGACY_BUDGET_OBJECTIVES = {"AUTODEV", "AUTOREPAIR"}
+_objectives_cache: dict = {}
+
+
+def budget_objectives(db_path: Path) -> set:
+    """Objective ids the standing budget pays for: approved_objectives
+    rows (any status — spend before achievement still counts) plus the
+    legacy AUTODEV/AUTOREPAIR names."""
+    if "ids" in _objectives_cache:
+        return _objectives_cache["ids"]
+    ids = set(LEGACY_BUDGET_OBJECTIVES)
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            for (oid,) in con.execute(
+                    "SELECT id FROM approved_objectives"):
+                if oid:
+                    ids.add(str(oid).upper())
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass  # table missing / no db — legacy pair only (fail-open)
+    _objectives_cache["ids"] = ids
+    return ids
+
+
+_OBJECTIVES_RES_CACHE: dict = {}
+
+
+def _objective_res(db_path: Path):
+    """(BUDGET_OBJECTIVES_set, OBJECTIVE_RE) cached per compute() call —
+    the regex alternation must cover every table id, not only the legacy
+    pair, or objective:OBJ-CODEQUALITY spend is invisible to the ratio."""
+    ids = budget_objectives(db_path)
+    cached = _OBJECTIVES_RES_CACHE.get(frozenset(ids))
+    if cached is not None:
+        return cached
+    if ids == LEGACY_BUDGET_OBJECTIVES:
+        regex = re.compile(
+            r"\bobjective\s*:\s*(AUTODEV|AUTOREPAIR)\b", re.I)
+    else:
+        alt = "|".join(re.escape(i) for i in sorted(ids))
+        regex = re.compile(
+            r"\bobjective\s*:\s*(" + alt + r")\b", re.I)
+    pair = (ids, regex)
+    _OBJECTIVES_RES_CACHE[frozenset(ids)] = pair
+    return pair
 
 SUCCESS_TAG_RE = re.compile(r"(?i)^\s*success\s*[:\-]\s*(.+?)\s*$")
 SUCCESS_PROSE_RE = re.compile(
@@ -171,8 +221,11 @@ def _load_tick_body_parts():
 # Task-side verification
 # ---------------------------------------------------------------------------
 
-def is_budget_task(body: str) -> bool:
-    return bool(OBJECTIVE_RE.search(body or ""))
+def is_budget_task(body: str, db_path: Path | None = None) -> bool:
+    """Body carries a budget-objective tag (table-driven; legacy names
+    always included)."""
+    target = db_path if db_path is not None else kanban_db_path()
+    return bool(_objective_res(target)[1].search(body or ""))
 
 
 def declared_criterion(body: str):
@@ -250,7 +303,7 @@ def verified_done_tasks(db_path: Path, window_s: int, now: float,
     verified, budget = [], []
     for r in rows:
         body = r["body"] or ""
-        if not is_budget_task(body):
+        if not is_budget_task(body, db_path):
             continue
         budget.append(r["id"])
         output_text = collect_output_text(db_path, r["id"], r["result"],
@@ -297,8 +350,9 @@ def read_trace(path: Path):
 
 
 def objective_of_row(row: dict, db_path: Path, body_objective: dict) -> str:
+    budget_ids, objective_re = _objective_res(db_path)
     obj = (row.get("objective") or "").strip()
-    if obj and obj.upper() in BUDGET_OBJECTIVES:
+    if obj and obj.upper() in budget_ids:
         return obj.upper()
     cid = row.get("consumer_id") or ""
     if TASK_ID_RE.fullmatch(cid):
@@ -311,7 +365,7 @@ def objective_of_row(row: dict, db_path: Path, body_objective: dict) -> str:
                 body_objective[cid] = (row_[0] or "") if row_ else ""
             except sqlite3.Error:
                 body_objective[cid] = ""
-        m = OBJECTIVE_RE.search(body_objective[cid])
+        m = objective_re.search(body_objective[cid])
         if m:
             return str(m.group(1)).upper()
     return obj or "unattributed"
@@ -322,6 +376,7 @@ def window_spend(rows, window_s: int, now: float, db_path: Path):
     cutoff = now - window_s
     strict = total = 0.0
     cache: dict = {}
+    budget_ids, _ = _objective_res(db_path)
     for r in rows:
         ts = r.get("ts_epoch_utc")
         usd = r.get("costUsd")
@@ -331,7 +386,7 @@ def window_spend(rows, window_s: int, now: float, db_path: Path):
             continue
         total += usd
         obj = objective_of_row(r, db_path, cache)
-        if obj in BUDGET_OBJECTIVES:
+        if obj in budget_ids:
             strict += usd
     return strict, total
 

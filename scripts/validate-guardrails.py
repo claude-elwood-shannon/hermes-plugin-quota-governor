@@ -200,8 +200,10 @@ def check_max_active_objectives(kanban_db: str) -> GuardrailResult:
     active_objectives = set()
     for row in rows:
         body = row["body"] or ""
-        # Extract objective:OBJ-N tags
-        for match in re.finditer(r"objective:(OBJ-\d+)", body, re.IGNORECASE):
+        # Extract objective:OBJ-x tags — MEDIATOR t_4fa0a4b5: ids include
+        # approved_objectives TABLE ids (OBJ-AUTODEV, ...), not only OBJ-0N.
+        for match in re.finditer(r"objective:\s*(OBJ-[A-Za-z0-9._-]+)",
+                                 body, re.IGNORECASE):
             active_objectives.add(match.group(1).upper())
 
     if len(active_objectives) >= MAX_ACTIVE_OBJECTIVES:

@@ -1613,6 +1613,67 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
     return summary
 
 
+# ---------------------------------------------------------------------------
+# OBJETIVOS APROBADOS snapshot (MEDIATOR t_4fa0a4b5, Sep 2026)
+# ---------------------------------------------------------------------------
+# The autonomous task creator's task SOURCE is the approved_objectives TABLE
+# in kanban.db (single source of truth; scripts/approved_objectives.py owns
+# the schema).  The context carries a read-only snapshot of the ACTIVE rows
+# so the creator can (a) pick an objective with real work, and (b) apply the
+# budget gate (spent_today < budget_daily) WITHOUT a second DB connection.
+# Missing table -> "objectives": [] (the prompt tells the creator to read
+# the table itself with sqlite3, or go [SILENT]).
+#
+# By design the gate is OBSERVER here: a table with zero active objectives
+# does NOT flip wakeAgent (the creator enforces the per-tick [SILENT]
+# decision) — this mirrors privacy_summary.  The DISPATCH-side enforcement
+# lives in approved_objectives.budget_check (§6), which the tick applies.
+# ---------------------------------------------------------------------------
+
+def compute_objectives_snapshot(kanban_db_path=None, warnings=None):
+    """Read-only snapshot of active approved_objectives rows.
+
+    Returns a list of dicts (id, name, status, budget_daily, spent_today,
+    description, success_criterion) sorted by id, ACTIVE rows only — the
+    creator must never seed work under a non-active objective.  Errors are
+    non-fatal (empty list + warning); the creator's prompt documents the
+    self-serve sqlite3 fallback.
+    """
+    if warnings is None:
+        warnings = []
+    if kanban_db_path is None:
+        kanban_db_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not kanban_db_path:
+        kanban_db_path = os.path.expanduser("~/.hermes/kanban.db")
+    if not os.path.isfile(kanban_db_path):
+        return []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{kanban_db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, name, status, budget_daily, spent_today, "
+            "description, success_criterion FROM approved_objectives "
+            "WHERE status = 'active' ORDER BY id"
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        warnings.append(f"objectives: kanban.db read failed: {exc}")
+        return []
+    out = []
+    for row in rows:
+        out.append({
+            "id": row["id"],
+            "name": row["name"],
+            "status": row["status"],
+            "budget_daily": row["budget_daily"] or 0.0,
+            "spent_today": row["spent_today"] or 0.0,
+            "description": row["description"],
+            "success_criterion": row["success_criterion"],
+        })
+    return out
+
+
 def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
     """Deterministic G3 zombie guard (OBJ-21, t_e793b2b9, Sep 2026).
 
@@ -1965,6 +2026,13 @@ def main():
             f"{worst['age_source']}) — creator silenced (G3 deterministic)"
         )
 
+    # --- OBJETIVOS APROBADOS snapshot (MEDIATOR t_4fa0a4b5) ---
+    # Active approved_objectives rows, computed once and wired into BOTH
+    # output branches (wakeAgent true/false) so the context always carries
+    # the creator's task source.  Observer only — dispatch-side budget
+    # enforcement lives in approved_objectives.budget_check (§6).
+    objectives_snapshot = compute_objectives_snapshot(warnings=warnings)
+
     if recommended is not None:
         recommended_profile = validate_recommended_profile(
             recommended["profile"], existing_profiles, warnings,
@@ -2020,6 +2088,7 @@ def main():
                 "privacy_level": privacy_level or "none",
                 "privacy_summary": privacy_summary,
                 "zombie_check": zombie_check,
+                "objectives": objectives_snapshot,
                 "valid_profiles": valid_profiles,
                 "warning": "; ".join(warnings) if warnings else "all providers exhausted",
                 "burn_warnings": load_burn_warnings(),
@@ -2094,6 +2163,9 @@ def main():
             # OBJ-21: always present.  Reaches this branch only when
             # has_zombie is False (a zombie forces the early return above).
             "zombie_check": zombie_check,
+            # MEDIATOR t_4fa0a4b5: active approved_objectives rows — the
+            # creator's task source + per-objective budget gate input.
+            "objectives": objectives_snapshot,
             "valid_profiles": valid_profiles,
             "warning": warning,
             "burn_warnings": load_burn_warnings(),
