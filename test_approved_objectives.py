@@ -169,6 +169,8 @@ class TestLifecycle(Harness):
 
     def test_11_achieved_with_evidence_except_perpetual(self):
         # OBJ-VLLM criterion: script + >=10 ok entries + skill
+        (self.root / "scripts").mkdir(exist_ok=True)
+        (self.root / "scripts/vllm-invoke.py").write_text("x")
         for i in range(10):
             (self.root / "logs").mkdir(exist_ok=True)
             with open(self.root / "logs/vllm-invoke.jsonl", "a") as fh:

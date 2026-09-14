@@ -159,14 +159,16 @@ def _connect(db_path: Path):
 
 
 def ready_tasks(db_path: Path) -> list:
-    """All ready tasks (id, title, assignee)."""
+    """All ready tasks (id, title, assignee, body). body is needed by the
+    budget gate (objective:OBJ-xx tag lives in the body)."""
     if not db_path.exists():
         return []
     try:
         con = _connect(db_path)
         try:
             rows = con.execute(
-                "SELECT id, title, assignee FROM tasks WHERE status='ready'"
+                "SELECT id, title, assignee, body FROM tasks "
+                "WHERE status='ready'"
             ).fetchall()
         finally:
             con.close()
@@ -386,9 +388,11 @@ def run(hermes_home=None, execute: bool = False, now=None,
             if spend_res.get("updated"):
                 top = ", ".join(
                     f"{u['id']} ${u['spent_today']:.2f}"
-                    for u in spend_res["updated"][:3])
-                act({"ts": now, "action": "objective-spend", "detail": top},
-                    f"objetivos: gasto hoy {top}")
+                    for u in spend_res["updated"][:3]
+                    if (u.get("spent_today") or 0.0) > 0)
+                if top:
+                    act({"ts": now, "action": "objective-spend", "detail": top},
+                        f"objetivos: gasto hoy {top}")
         except Exception:
             pass  # observability/inventory never breaks the supply tick
 
@@ -396,7 +400,9 @@ def run(hermes_home=None, execute: bool = False, now=None,
     # backlog_total = running + ready_con_assignee. Mínimo operativo: 3.
     BACKLOG_MIN = 3
     ready_all = ready_tasks(db)
-    ready_assigned_n = sum(1 for t in ready_all if (t.get("assignee") or "").strip())
+    ready_unassigned = [t for t in ready_all
+                        if not (t.get("assignee") or "").strip()]
+    ready_assigned_n = len(ready_all) - len(ready_unassigned)
     backlog_total = (live_workers or 0) + ready_assigned_n
     _log(ledger, {"ts": now, "action": "backlog-guard", "ready_assigned": ready_assigned_n,
                   "live_workers": live_workers or 0, "backlog_total": backlog_total,
@@ -408,55 +414,101 @@ def run(hermes_home=None, execute: bool = False, now=None,
     # verdict LOW: el ledger ya registró el guard; la cascade continúa y su
     # acción será la única línea de decisión del tick (contrato 1-linea).
 
-    # ── Gate: free quota (session AND weekly < 80%) ──
-    if session_pct is not None and session_pct >= QUOTA_THRESHOLD_PCT:
-        act({"ts": now, "action": "skipped",
-             "reason": f"session {session_pct:.1f}% >= {QUOTA_THRESHOLD_PCT:.0f}%"},
-            f"cola seca: sesion al {session_pct:.1f}% (umbral {QUOTA_THRESHOLD_PCT:.0f}%)")
-        return decisions
-    if weekly_pct is not None and weekly_pct >= QUOTA_THRESHOLD_PCT:
+    # ── MEDIATOR 14-sep: bifurcación ruta A / ruta B en el gate de cuota ──
+    # Ruta A (objetivo aprobado con balance): tarea con tag objective:OBJ-XX
+    #   + objetivo active con presupuesto libre -> se despacha CONTRA BALANCE
+    #   aunque la cuota gratis esté agotada (session/weekly >= 80%). El
+    #   presupuesto se verifica aquí EN CADA dispatch (restricción del
+    #   mandato: por dispatch, no una vez al día).
+    # Ruta B (todo lo demás): exige cuota libre (comportamiento previo).
+    # Por tarea: unknown objective -> Ruta B (§6: se trata como sin tag);
+    # exhausted/paused -> retain; tabla missing/inaccesible -> fail-safe
+    # Ruta B (sin congelar la cola).
+    quota_free = not (
+        (session_pct is not None and session_pct >= QUOTA_THRESHOLD_PCT)
+        or (weekly_pct is not None and weekly_pct >= QUOTA_THRESHOLD_PCT))
+    _ao = _load_approved_objectives()
+    route_a: dict = {}   # task_id -> objective id (presupuesto ya verificado)
+    table_ok = _ao is not None and _ao.table_exists(db)
+    for t in ready_unassigned:
+        m_obj = OBJECTIVE_TAG_RE.search(t.get("body") or "")
+        if not m_obj or quota_free:
+            continue  # sin tag, o cuota libre (step-1 re-verifica): Ruta B
+        if not table_ok:
+            continue  # fail-safe §6: sin inventario no hay balance que gastar
+        try:
+            allowed, reason = _ao.budget_check(db, m_obj.group(1).upper())  # type: ignore[union-attr]
+        except Exception:
+            continue  # inventario inaccesible: fail-safe, Ruta B
+        if allowed:
+            route_a[t["id"]] = m_obj.group(1).upper()
+        elif "unknown objective" not in (reason or ""):
+            act({"ts": now, "action": "held-budget", "task": t["id"],
+                 "objective": m_obj.group(1), "reason": reason},
+                f"retain: {t['id']} — {reason}")
+            return decisions
+
+    # ── Gate: free quota (session AND weekly < 80%) — Ruta B (por defecto) ──
+    # Con la cola en Ruta A el gate de cuota gratis no aplica: el gasto sale
+    # del balance del objetivo aprobado, no de la cuota gratis.
+    if not quota_free and not route_a:
+        if session_pct is not None and session_pct >= QUOTA_THRESHOLD_PCT:
+            act({"ts": now, "action": "skipped",
+                 "reason": f"session {session_pct:.1f}% >= {QUOTA_THRESHOLD_PCT:.0f}%"},
+                f"cola seca: sesion al {session_pct:.1f}% (umbral {QUOTA_THRESHOLD_PCT:.0f}%)")
+            return decisions
         act({"ts": now, "action": "skipped",
              "reason": f"weekly {weekly_pct:.1f}% >= {QUOTA_THRESHOLD_PCT:.0f}%"},
             f"cola seca: weekly al {weekly_pct:.1f}% (umbral {QUOTA_THRESHOLD_PCT:.0f}%)")
         return decisions
+    _s_pct = f"{session_pct:.1f}" if session_pct is not None else "n/d"
+    _w_pct = f"{weekly_pct:.1f}" if weekly_pct is not None else "n/d"
 
     # ── Step 1: assign a profile to a ready task with no assignee ──
     # (fix the silent stop: ready-without-assignee is claimed by nobody)
     # MEDIATOR 2026-09-14: budget gate — tasks tagged objective:OBJ-XX are
     # only dispatched when the objective is active and has budget left.
-    # Unknown objective => retained (fail-safe §6). Table missing =>
-    # fail-open for UNTAGGED tasks; TAGGED tasks are also retained (fail-
-    # safe: without the inventory the budget promise cannot be honored).
-    _ao = _load_approved_objectives()
-    for t in ready_tasks(db):
-        if not (t.get("assignee") or "").strip():
-            m_obj = OBJECTIVE_TAG_RE.search(t.get("body") or "")
-            if m_obj:
-                if _ao is None:
-                    act({"ts": now, "action": "held-budget-table-missing",
-                         "task": t["id"]},
-                        f"retain: {t['id']} tiene objective tag pero approved_objectives no existe (fail-safe §6)")
-                    return decisions
-                allowed, reason = _ao.budget_check(db, m_obj.group(1).upper())
-                if not allowed:
-                    act({"ts": now, "action": "held-budget", "task": t["id"],
-                         "objective": m_obj.group(1), "reason": reason},
-                        f"retain: {t['id']} — {reason}")
-                    return decisions
-            assignee = DEFAULT_ASSIGNEE
-            if not execute:
-                act({"ts": now, "action": "assigned-ready", "task": t["id"],
-                     "assignee": assignee, "title": t["title"][:TITLE_LOG_CHARS]},
-                    f"cola viva: asignado {t['id']} -> {assignee}")
+    # Unknown objective => treated as untagged (Ruta B, §6). Exhausted or
+    # paused objective => retained. Sin cuota libre solo se despachan las
+    # tareas de la ruta A (presupuesto ya verificado arriba); las tareas
+    # sin tag quedan para un tick con cuota libre.
+    for t in ready_unassigned:
+        if not quota_free and t["id"] not in route_a:
+            continue  # Ruta B sin cuota libre: no despachable este tick
+        m_obj = OBJECTIVE_TAG_RE.search(t.get("body") or "")
+        if m_obj and t["id"] not in route_a:
+            if _ao is None:
+                act({"ts": now, "action": "held-budget-table-missing",
+                     "task": t["id"]},
+                    f"retain: {t['id']} tiene objective tag pero approved_objectives no existe (fail-safe §6)")
                 return decisions
-            if assign_task(t["id"], assignee):
-                act({"ts": now, "action": "assigned-ready", "task": t["id"],
-                     "assignee": assignee, "title": t["title"][:TITLE_LOG_CHARS]},
-                    f"cola viva: asignado {t['id']} ({t['title'][:TITLE_LOG_CHARS_SHORT]}) -> {assignee}")
+            allowed, reason = _ao.budget_check(db, m_obj.group(1).upper())
+            if not allowed and "unknown objective" not in (reason or ""):
+                act({"ts": now, "action": "held-budget", "task": t["id"],
+                     "objective": m_obj.group(1), "reason": reason},
+                    f"retain: {t['id']} — {reason}")
                 return decisions
-            act({"ts": now, "action": "assign-failed", "task": t["id"]},
-                f"cola seca: fallo al asignar {t['id']}")
+            # unknown objective aqui => Ruta B (sin tag) y hay cuota libre
+        assignee = DEFAULT_ASSIGNEE
+        nota = ""
+        if t["id"] in route_a:
+            nota = (f" [ruta A: {route_a[t['id']]} contra balance, "
+                    f"cuota {_s_pct}%/{_w_pct}%]")
+        if not execute:
+            act({"ts": now, "action": "assigned-ready", "task": t["id"],
+                 "assignee": assignee, "title": t["title"][:TITLE_LOG_CHARS],
+                 "route": "A" if t["id"] in route_a else "B"},
+                f"cola viva: asignado {t['id']} -> {assignee}{nota}")
             return decisions
+        if assign_task(t["id"], assignee):
+            act({"ts": now, "action": "assigned-ready", "task": t["id"],
+                 "assignee": assignee, "title": t["title"][:TITLE_LOG_CHARS],
+                 "route": "A" if t["id"] in route_a else "B"},
+                f"cola viva: asignado {t['id']} ({t['title'][:TITLE_LOG_CHARS_SHORT]}) -> {assignee}{nota}")
+            return decisions
+        act({"ts": now, "action": "assign-failed", "task": t["id"]},
+            f"cola seca: fallo al asignar {t['id']}")
+        return decisions
 
     # ── Step 2: if ready tasks WITH assignee exist, the queue is alive ──
     # (the dispatcher claims them within ~60s — no new work needed)
