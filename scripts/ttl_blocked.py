@@ -16,13 +16,25 @@ Autorremediaciones deterministas (sin intervención humana, en orden):
      el campo lo generó el propio sistema -> re-spawn limpio: unblock.
   R2 model_override inválido/envenenado (no existe en la oferta del perfil
      o pin muerto conocido): limpiar override, reasignar el pin del gate y
-     unblock.
+     unblock. La remediación SE VERIFICA releyendo el override en la DB:
+     si sigue igual, la acción no se produce (p.ej. binario ausente) y la
+     tarea se registra como fallida, nunca como remediada.
   R3 dependencia resuelta: bloqueo por padre y el padre ya está done ->
      unblock (queda ready).
   R4 crash loop (gave_up >=3 con el mismo error): NO autorremediable ->
      triage directo con historial adjunto.
   R5 resto: sin reparación determinista -> triage (comentario "no-clasificable"
      si además no hay causa identificada).
+  R6 retry-loop (14-sep, mandato del mediador): NO reintentar la misma
+     autorremediación en bucle. Dos detectores, ambos leen task_comments
+     (sobreviven unblocks; los eventos blocked se re-crean en cada ciclo):
+     (a) huella del motivo: cada intento graba fp=sha1(reason)[:8] y su
+         resultado. Si una remediación VERIFICADA ok va seguida de un
+         re-bloqueo con la MISMA causa (misma fp) -> triage inmediato: la
+         causa no era la remediable. Si la misma R falla >= 2 veces con la
+         misma fp -> triage (sin tercera espera).
+     (b) contador por remedio: la misma R1-R3 intentada >= 2 veces y la
+         tarea sigue blocked con remedio pendiente -> triage.
 
 Exclusiones (el TTL NUNCA toca):
   - Tareas con [human-gate] en title+header del body (puerta de aprobación
@@ -33,14 +45,30 @@ Exclusiones (el TTL NUNCA toca):
 Idempotencia: una tarea ya en triage nunca se "re-mueve"; el comentario de
 triage se escribe una sola vez (guard por task id en el propio movimiento).
 
+Veracidad del log: el resultado refleja lo VERIFICADO, no lo intentado.
+Si la CLI mutadora muere (binario ausente, PATH, permisos), la acción se
+registra como "action-failed" — jamás como remediated/triaged; en dry-run
+los veredictos son "dry-*" y ninguna mutación ocurre. Lección del bucle
+t_32a71a49 (14-sep): 34 ciclos de "REMEDIATED" sin una sola mutación real
+porque HERMES_BIN no resolvía en el PATH de cron y el except tragaba todo.
+
+Nota de enrutado a triage: el canal oficial es unblock -> block SIN kind;
+los blocks sin kind comparan iguales entre sí y unblock_task PRESERVA
+block_kind/block_recurrences, así que la segunda vuelta alcanza
+BLOCK_RECURRENCE_LIMIT (=2) y el core aterriza la tarea en triage con el
+evento 'block_loop_detected'. El kind='needs_input' usado el 13-sep NO
+servía para eso (el recuento solo suma cuando el kind entrante == previo).
+
 Exit codes: 0 siempre (el watchdog no debe romperse por esto).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -53,7 +81,11 @@ TTL_REMEDIATE_S = 15 * 60     # 5-15 min: autorremediación
 TTL_TRIAGE_S = 30 * 60        # >30 min: no debe existir -> triage forzado
 CRASH_LOOP_MIN = 3            # gave_up >= 3 con mismo error -> triage directo
 TRIAGE_MARK = "[TTL-BLOCKED]"
-HERMES_BIN = os.environ.get("HERMES_BIN", "hermes")
+R6_MARK = "R6-RETRY-LOOP"     # prefijo del contador de reintentos en comments
+R6_MAX_ATTEMPTS = 2           # misma R fallida >= 2 veces con misma fp -> triage
+_HERMES_DEFAULT = shutil.which("hermes") or "hermes"
+HERMES_BIN = os.environ.get("HERMES_BIN") or _HERMES_DEFAULT
+PLUGIN_DIR = os.environ.get("PLUGIN_DIR", "/data/git/hermes-plugin-quota-governor")
 
 # Overrides muertos conocidos (historia 12-sep): modelo no existe en el host
 DEAD_OVERRIDES = {"gpt-oss:20b", "glm-5.2"}  # glm-5.2 prohibido para workers (caro)
@@ -172,8 +204,6 @@ def parent_status(db_path: Path, parent_id: str) -> str | None:
         row = con.execute("SELECT status FROM tasks WHERE id=?",
                           (parent_id,)).fetchone()
         return row["status"] if row else None
-    except sqlite3.Error:
-        return None
     finally:
         con.close()
 
@@ -200,15 +230,96 @@ DEFAULT_OFFER: dict[str, set[str]] = {
 }
 
 
-def _route_to_triage(task_id: str, comment: str) -> None:
+# ── R6: memoria de reintentos (task_comments sobreviven unblocks) ──────────
+def reason_fp(reason: str) -> str:
+    """Huella corta del motivo de bloqueo (estable entre ciclos)."""
+    return hashlib.sha1((reason or "").encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def record_remediation_attempt(db_path: Path, task_id: str, remedy: str,
+                               reason: str, ok: bool) -> None:
+    """Deja huella duradera del intento: remedio + fp del motivo + resultado.
+    Llamar SOLO con execute=True (un dry-run no debe inflar el contador)."""
+    outcome = "ok" if ok else "failed"
+    _cli("comment", task_id,
+         f"{R6_MARK} {remedy} attempt fp={reason_fp(reason)} {outcome}")
+
+
+def r6_escalation(db_path: Path, task_id: str, current_reason: str) -> str | None:
+    """Detecta bucle: None = seguir el flujo normal; str = motivo de triage.
+    (a) fp actual con intento 'ok' previo: la remediación se verificó y la
+        tarea volvió a bloquearse con la MISMA causa -> no es remediable.
+    (b) fp actual con >= R6_MAX_ATTEMPTS intentos 'failed': no insistir."""
+    fp = reason_fp(current_reason)
+    con = _connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT body FROM task_comments WHERE task_id=? AND body LIKE ?",
+            (task_id, f"{R6_MARK} %attempt fp={fp} %")).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    n_ok = n_failed = 0
+    last_remedy = "R?"
+    for r in rows:
+        parts = (r["body"] or "").split()
+        # "R6-RETRY-LOOP <remedy> attempt fp=<fp> <ok|failed>"
+        if len(parts) >= 5:
+            last_remedy = parts[1]
+            if parts[-1] == "ok":
+                n_ok += 1
+            elif parts[-1] == "failed":
+                n_failed += 1
+    if n_ok >= 1:
+        return (f"re-bloqueo con la misma causa tras remediación {last_remedy} "
+                f"verificada ok — la causa no era la remediable (fp={fp})")
+    if n_failed >= R6_MAX_ATTEMPTS:
+        return (f"remediación {last_remedy} falló {n_failed}x con la misma causa "
+                f"(fp={fp}) — no reintentar en bucle")
+    return None
+
+
+def remediation_attempt_count(db_path: Path, task_id: str, remedy: str) -> int:
+    con = _connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=? AND body LIKE ?",
+            (task_id, f"{R6_MARK} {remedy} attempt%")).fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
+
+
+def _route_to_triage(task_id: str, comment: str, db_path: Path) -> tuple[bool, str]:
     """Canal CLI OFICIAL a triage: (la tarea ya está blocked) -> unblock ->
-    block(same kind) -> triage. El segundo block del mismo kind dispara el
-    unblock-loop detector del CLI y la tarea aterriza en triage con audit
-    trail. Verificado en vivo 13-sep (t_45ff9da2, t_61fed817)."""
-    _cli("comment", task_id, comment)
-    _cli("unblock", task_id, "TTL-BLOCKED ciclo 1 (doble-block hacia triage)")
-    _cli("block", "--kind", "needs_input", task_id,
-         "[TTL-BLOCKED] re-block: ruteo a triage (unblock-loop break)")
+    block SIN kind -> la misma causa genérica cuenta recurrencia y al llegar
+    a BLOCK_RECURRENCE_LIMIT (=2) el propio core aterriza la tarea en triage
+    con el evento 'block_loop_detected'. Un task con contador a 0 necesita
+    DOS vueltas del watchdog (recurrences 1 y 2): la primera devuelve False
+    y el veredicto es honesto ('route incomplete'), la segunda completa.
+    Verifica el aterrizaje REAL en la DB antes de decir triaged."""
+    c1 = _cli("comment", task_id, comment)
+    c2 = _cli("unblock", task_id,
+              "--reason", "TTL-BLOCKED ciclo (doble-block hacia triage)")
+    c3 = _cli("block", task_id,
+              "[TTL-BLOCKED] re-block: ruteo a triage (unblock-loop break)")
+    if _cli_failed(c2) or _cli_failed(c3):
+        return False, _first_err(c2, c3)
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT status FROM tasks WHERE id=?",
+                          (task_id,)).fetchone()
+        status = row["status"] if row else "?"
+    except sqlite3.Error:
+        status = "?"
+    finally:
+        con.close()
+    if status == "triage":
+        return True, ""
+    return False, f"ruta incompleta: status={status} (recurrences=1; la 2a vuelta completa)"
 
 
 def triage_comment(minutes: int, cls: str, root_cause: str,
@@ -226,12 +337,53 @@ class TtlResult:
     __slots__ = ("action", "task_id", "detail")
 
     def __init__(self, action: str, task_id: str, detail: str = ""):
-        self.action = action        # classify|unblock|remediated|triaged|skipped
+        self.action = action        # classify|remediated|failed|triaged|dry-*|skipped
         self.task_id = task_id
         self.detail = detail
 
     def line(self, ts: str) -> str:
         return f"{ts} TTL-{self.action.upper()} {self.task_id}: {self.detail}"
+
+
+def _cli_failed(proc: subprocess.CompletedProcess) -> bool:
+    return proc.returncode != 0
+
+
+def _first_err(*procs: subprocess.CompletedProcess) -> str:
+    for p in procs:
+        if p.returncode != 0:
+            return (p.stderr or p.stdout or f"rc={p.returncode}").strip()[:140]
+    return ""
+
+
+def _override_in_db(db_path: Path, task_id: str) -> str:
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT model_override FROM tasks WHERE id=?",
+                          (task_id,)).fetchone()
+        return (row["model_override"] or "") if row else ""
+    finally:
+        con.close()
+
+
+def _apply_override_and_unblock(db_path: Path, task_id: str, old: str) -> tuple[bool, str]:
+    """R2: set-model al pin del gate + unblock. VERIFICA la persistencia
+    releyendo la DB. Devuelve (ok, err)."""
+    setr = _cli("set-model", task_id, "deepseek-v4-flash", "--provider", "ollama-cloud")
+    if _cli_failed(setr):
+        return False, f"set-model rc={setr.returncode}: {_first_err(setr)}"
+    unp = _cli("unblock", task_id, "--reason",
+               "TTL-BLOCKED R2: model_override envenenado limpiado y reasignado")
+    if _cli_failed(unp):
+        return False, f"unblock rc={unp.returncode}: {_first_err(unp)}"
+    now = _override_in_db(db_path, task_id)
+    if now == old:
+        # La DB sigue igual pese a rc=0: persistencia no verificada.
+        return False, "set-model rc=0 pero el override sigue igual en la DB"
+    _cli("comment", task_id,
+         f"{TRIAGE_MARK} autorremediación R2 verificada: override '{old}' -> "
+         f"deepseek-v4-flash (persistencia comprobada en DB)")
+    return True, ""
 
 
 def process_blocked(db_path: Path, task_id: str, model_override: str,
@@ -243,6 +395,9 @@ def process_blocked(db_path: Path, task_id: str, model_override: str,
     minutes = int(age_s // 60)
     reason = blocked_reason(db_path, task_id)
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+    def dry(action: str, detail: str) -> TtlResult:
+        return TtlResult(f"dry-{action}", task_id, f"{minutes}m — {detail}")
 
     # Puerta humana explícita: nunca se toca.
     if has_human_gate(title, body):
@@ -269,42 +424,100 @@ def process_blocked(db_path: Path, task_id: str, model_override: str,
     if loop:
         why = f"crash loop {CRASH_LOOP_MIN}x con el mismo error"
         if execute:
-            _route_to_triage(task_id, triage_comment(
+            done, err = _route_to_triage(task_id, triage_comment(
                 minutes, "permanente", (loop or "")[:120],
                 "no", "crash loop no es autorremediable",
-                why + f": {(loop or '')[:160]}"))
-        return TtlResult("triaged", task_id, f"{minutes}m — {why}")
+                why + f": {(loop or '')[:160]}"), db_path)
+            if done:
+                return TtlResult("triaged", task_id, f"{minutes}m — {why}")
+            return TtlResult("retrying", task_id,
+                             f"{minutes}m — {why} | ruta a triage: {err}")
+        return dry("triage", why)
+
+    # ── R6 (leído antes de remediar: solo consultas) ──
+    esc = r6_escalation(db_path, task_id, reason or model_override)
+    if esc:
+        if execute:
+            done, err = _route_to_triage(task_id, triage_comment(
+                minutes, "permanente", (reason or model_override or "")[:120],
+                "R1-R3", "sin efecto persistente sobre la causa",
+                f"retry loop: {esc}"), db_path)
+            if done:
+                return TtlResult("triaged", task_id, f"{minutes}m — retry loop: {esc}")
+            return TtlResult("retrying", task_id,
+                             f"{minutes}m — retry loop: {esc} | ruta a triage: {err}")
+        return dry("triage", f"retry loop: {esc}")
 
     # ── Autorremediación determinista (desde los 5 min: R1-R3 son seguras) ──
-    # R2: override envenenado.
+    pending_remedies = []
     if model_override and not valid_override_for(provider, model_override, DEFAULT_OFFER):
-        if execute:
-            _cli("set-model", task_id, "deepseek-v4-flash", "--provider", "ollama-cloud")
-            _cli("comment", task_id,
-                 f"{TRIAGE_MARK} autorremediación R2: override '{model_override}' "
-                 f"envenenado -> reasignado deepseek-v4-flash (pin gate)")
-            _cli("unblock", task_id,
-                 "TTL-BLOCKED R2: model_override envenenado limpiado y reasignado")
-        return TtlResult("remediated", task_id,
-                         f"{minutes}m — R2 override '{model_override}' -> pin gate")
-
-    # R1: campo que el propio sistema podía generar.
+        pending_remedies.append("R2")
     if reason and SELF_GENERABLE_RE.search(reason):
-        if execute:
-            _cli("comment", task_id,
-                 f"{TRIAGE_MARK} autorremediación R1: '{reason[:80]}' es un campo "
-                 f"generable por el sistema -> desbloqueada sin intervención humana")
-            _cli("unblock", task_id, "TTL-BLOCKED R1: campo auto-generable resuelto por el sistema")
-        return TtlResult("remediated", task_id, f"{minutes}m — R1 {reason[:60]}")
-
-    # R3: dependencia ya resuelta.
+        pending_remedies.append("R1")
     deps = dependency_ids(db_path, task_id)
     resolved = [d for d in deps if parent_status(db_path, d) == "done"]
     if deps and len(resolved) == len(deps):
-        if execute:
+        pending_remedies.append("R3")
+
+    # R6(b): contador por remedio — la misma R >= 2 veces y sigue pendiente.
+    for remedy in pending_remedies:
+        attempts = remediation_attempt_count(db_path, task_id, remedy)
+        if attempts >= R6_MAX_ATTEMPTS:
+            why = (f"retry loop: {remedy} intentada {attempts}x y la tarea sigue "
+                   f"blocked con remedio pendiente — escalado a triage")
+            if execute:
+                done, err = _route_to_triage(task_id, triage_comment(
+                    minutes, "permanente", (reason or model_override or "")[:120],
+                    f"{remedy} x{attempts}", "sin efecto persistente", why), db_path)
+                if done:
+                    return TtlResult("triaged", task_id, f"{minutes}m — {why}")
+                return TtlResult("retrying", task_id,
+                                 f"{minutes}m — {why} | ruta a triage: {err}")
+            return dry("triage", why)
+
+    # R2: override envenenado — con verificación de persistencia.
+    if "R2" in pending_remedies:
+        if not execute:
+            return dry("remediate",
+                       f"R2 pendiente: set-model deepseek-v4-flash + unblock + verify")
+        ok, err = _apply_override_and_unblock(db_path, task_id, model_override)
+        record_remediation_attempt(db_path, task_id, "R2", reason, ok=ok)
+        if not ok:
+            return TtlResult("failed", task_id,
+                             f"{minutes}m — R2 action-failed: {err}")
+        return TtlResult("remediated", task_id,
+                         f"{minutes}m — R2 override '{model_override}' -> pin gate (verificado)")
+
+    # R1: campo que el propio sistema podía generar.
+    if "R1" in pending_remedies:
+        if not execute:
+            return dry("remediate", f"R1 pendiente: unblock ({reason[:50]})")
+        unp = _cli("unblock", task_id, "--reason",
+                   "TTL-BLOCKED R1: campo auto-generable resuelto por el sistema")
+        ok = not _cli_failed(unp)
+        record_remediation_attempt(db_path, task_id, "R1", reason, ok=ok)
+        if ok:
+            _cli("comment", task_id,
+                 f"{TRIAGE_MARK} autorremediación R1: '{reason[:80]}' es un campo "
+                 f"generable por el sistema -> desbloqueada sin intervención humana")
+        else:
+            return TtlResult("failed", task_id,
+                             f"{minutes}m — R1 action-failed: {_first_err(unp)}")
+        return TtlResult("remediated", task_id, f"{minutes}m — R1 {reason[:60]}")
+
+    # R3: dependencia ya resuelta.
+    if "R3" in pending_remedies:
+        if not execute:
+            return dry("remediate", f"R3 pendiente: unblock (deps {deps} done)")
+        unp = _cli("unblock", task_id, "--reason", "TTL-BLOCKED R3: dependencia resuelta")
+        ok = not _cli_failed(unp)
+        record_remediation_attempt(db_path, task_id, "R3", reason, ok=ok)
+        if ok:
             _cli("comment", task_id,
                  f"{TRIAGE_MARK} autorremediación R3: dependencias {deps} ya done -> desbloqueada")
-            _cli("unblock", task_id, "TTL-BLOCKED R3: dependencia resuelta")
+        else:
+            return TtlResult("failed", task_id,
+                             f"{minutes}m — R3 action-failed: {_first_err(unp)}")
         return TtlResult("remediated", task_id, f"{minutes}m — R3 deps {deps} done")
 
     # 15-30m o >30m sin reparación determinista -> triage.
@@ -312,11 +525,15 @@ def process_blocked(db_path: Path, task_id: str, model_override: str,
         cls = "no-clasificable" if not reason else "permanente"
         why = "TTL 30m agotado sin resolución ni reparación determinista"
         if execute:
-            _route_to_triage(task_id, triage_comment(
+            done, err = _route_to_triage(task_id, triage_comment(
                 minutes, cls, (reason or "(sin razon registrada)")[:120],
                 "sí" if age_s >= TTL_REMEDIATE_S else "no",
-                "sin reparación determinista disponible", why))
-        return TtlResult("triaged", task_id, f"{minutes}m — {cls} -> triage")
+                "sin reparación determinista disponible", why), db_path)
+            if done:
+                return TtlResult("triaged", task_id, f"{minutes}m — {cls} -> triage")
+            return TtlResult("retrying", task_id,
+                             f"{minutes}m — {cls} -> triage | ruta: {err}")
+        return dry("triage", f"{cls} -> triage")
 
     return TtlResult("classify", task_id,
                      f"{minutes}m — sin reparación determinista aún (ventana 5-15m)")
