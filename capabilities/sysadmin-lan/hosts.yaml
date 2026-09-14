@@ -36,6 +36,7 @@ hosts:
     ssh_key: ~/.ssh/id_ed25519
     permissions:
       - read_status          # docker ps, docker compose ps, free, df, ss, journalctl
+      - read_files           # cat/ls/tail/grep read-only (inspeccion del arbol compose)
       - restart_containers   # docker restart / docker compose restart
       - manage_compose       # docker compose up -d / stop / pull (services existentes)
       - edit_compose_files   # escribir SOLO en ~/git/docker-compose/**
