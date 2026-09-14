@@ -47,6 +47,12 @@ CRASH_LOOP_MIN = 3              # >= 3 crashes in 24h -> alert
 BURN_ETA90_H = 1.0              # eta_90 < 1h -> board-off alert
 BURN_COLCHON_H = 2.0            # eta_90 < reset - 2h -> reduce-workers alert
 
+# GPU ml-host alerts (t_27e6f8f8 2c)
+GPU_TEMP_CRITICAL_C = 80        # temp > 80C -> GPU TEMP CRITICAL
+GPU_VRAM_NEAR_LIMIT_PCT = 90    # vram > 90% -> GPU VRAM NEAR LIMIT
+GPU_IDLE_HOURS = 24             # 0 ok rounds in 24h -> GPU IDLE
+GPU_CACHE_MAX_AGE_S = 2 * 3600  # cache older than this = no live view
+
 
 def get_hermes_home() -> Path:
     val = os.environ.get("HERMES_HOME", "").strip()
@@ -315,6 +321,45 @@ def _supply_ratio_daily(hermes_home=None) -> str:
         return "n/d"
 
 
+_supply_ratio_cache: dict | None = None
+
+
+def cola_viva_log_path(hermes_home=None) -> Path:
+    return state_dir(hermes_home) / "cola-viva.jsonl"
+
+
+def _read_backlog_guard(hermes_home=None, now=None) -> tuple:
+    """P2 desired=3: latest backlog-guard reading from the cola-viva ledger.
+    Returns (backlog_total, verdict) or (None, None) if absent/unreadable —
+    fail open like every reader (stale data >no number, never a fake 3)."""
+    for home in _candidate_homes(hermes_home):
+        p = home / "quota-governor" / "cola-viva.jsonl"
+        if not p.exists():
+            continue
+        latest = None
+        try:
+            with open(p, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if e.get("action") == "backlog-guard":
+                        try:
+                            e["_ts"] = float(e.get("ts") or 0)
+                        except (TypeError, ValueError):
+                            e["_ts"] = 0.0
+                        latest = e
+        except OSError:
+            continue
+        if latest is not None:
+            return latest.get("backlog_total"), latest
+    return None, None
+
+
 def build_board_screen(hermes_home=None) -> str:
     """Board state: counts by status + active tasks + done in last 24h."""
     db = kanban_db_path(hermes_home)
@@ -348,6 +393,12 @@ def build_board_screen(hermes_home=None) -> str:
     total = sum(counts.values())
     status_s = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     lines.append(f"  total {total} | {status_s}")
+    # P2 desired=3: última lectura del backlog-guard (cola-viva ledger)
+    bl_total, bl_entry = _read_backlog_guard(hermes_home)
+    if bl_total is not None:
+        verdict = (bl_entry or {}).get("verdict") or "n/d"
+        lines.append(f"  backlog-guard: total={bl_total} min=3 [{verdict}]"
+                     f" | desired=3")
     # supply_ratio diario (OBJ-29): último bucket diario del metrics-history.
     lines.append(f"  supply_ratio diario: {_supply_ratio_daily(hermes_home)}")
     if done24:
@@ -370,9 +421,62 @@ def build_board_screen(hermes_home=None) -> str:
     return "\n".join(lines)
 
 
+def _gpu_cache_raw(hermes_home=None, now=None):
+    """Fresh (<GPU_CACHE_MAX_AGE_S) gpu-health.json dict, else None."""
+    now = time.time() if now is None else float(now)
+    path = state_dir(hermes_home) / "obs" / "gpu-health.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or now - (raw.get("ts") or 0) > \
+            GPU_CACHE_MAX_AGE_S:
+        return None
+    return raw
+
+
+def gpu_alerts(hermes_home=None, now=None) -> list:
+    """GPU ml-host alerts, cache-only (t_27e6f8f8 2c).
+
+    Pure function of the gpu-health.json cache that portal-build's
+    read_gpu_health() refreshes every build (2-min TTL, cron-fed). Never
+    probes SSH/HTTP from here — the morning screen must stay deterministic,
+    hermetic for tests, and fast; a stale cache (>GPU_CACHE_MAX_AGE_S) is
+    treated as no live view (watchdog pattern: no fake ok, no fake alarm).
+    """
+    now = time.time() if now is None else float(now)
+    raw = _gpu_cache_raw(hermes_home, now)
+    if raw is None:
+        return []
+
+    alerts = []
+    temp = raw.get("temp_c")
+    if isinstance(temp, (int, float)) and temp > GPU_TEMP_CRITICAL_C:
+        alerts.append(f"GPU TEMP CRITICAL: {temp}C (>{GPU_TEMP_CRITICAL_C}C) ml-host")
+
+    used, total = raw.get("mem_used_mib"), raw.get("mem_total_mib")
+    if isinstance(used, (int, float)) and isinstance(total, (int, float)) \
+            and total > 0:
+        pct = used / total * 100.0
+        if pct > GPU_VRAM_NEAR_LIMIT_PCT:
+            alerts.append(f"GPU VRAM NEAR LIMIT: {pct:.0f}% "
+                          f"({int(used)}/{int(total)} MiB)")
+
+    if raw.get("vllm_active") is False:
+        alerts.append("vLLM SERVICE DOWN: /v1/models sin respuesta en ml-host")
+
+    rounds = raw.get("recent_rounds") or []
+    today = [r for r in rounds if isinstance(r, dict)
+             and now - (r.get("ts") or 0) <= GPU_IDLE_HOURS * 3600]
+    if raw.get("vllm_active") and today and not any(
+            (r.get("status") == "ok") for r in today):
+        alerts.append(f"GPU IDLE: 0 rondas ok en {GPU_IDLE_HOURS}h")
+    return alerts
+
+
 def build_alerts_screen(hermes_home=None) -> str:
     """F2 alerts — ONLY when there is an anomaly. Else 'sin incidencias'."""
-    alerts = []
+    alerts = gpu_alerts(hermes_home)
 
     # 1. unattributed > 20% of spend
     rows = _read_jsonl(trace_path(hermes_home))
@@ -430,8 +534,12 @@ def build_alerts_screen(hermes_home=None) -> str:
             alerts.append(f"burn {name}: eta_90={eta90:.1f}h < margen reset "
                           f"({reset_h:.1f}h) -> reducir workers")
 
+    # GPU ml-host alerts (t_27e6f8f8 2c): fresh gpu-health.json cache counts
+    # as a source; stale/absent cache does not (watchdog pattern).
+    gpu_cache = _gpu_cache_raw(hermes_home)
+
     # No sources at all -> stay silent (watchdog pattern), don't claim 'ok'.
-    if not (has_trace or has_board or has_forecast):
+    if not (has_trace or has_board or has_forecast or gpu_cache is not None):
         return ""
 
     if not alerts:
