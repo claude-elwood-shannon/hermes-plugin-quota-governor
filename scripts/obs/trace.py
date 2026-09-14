@@ -74,6 +74,7 @@ import datetime as dt
 import gzip
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -230,9 +231,18 @@ def parse_objective(body: str) -> str:
     Returns the tag (e.g. 'OBJ-27') or 'unattributed' when absent. The
     stamp is the enforcement point (OBJ-28 design §1.3): the rollup reads
     this field, never re-parses ad-hoc.
+
+    MEDIATOR t_4fa0a4b5: also accepts the tag inside a `[tags: ...]`
+    header line (the format the autonomous task creator emits) and any
+    objective id in the approved_objectives namespace (OBJ-AUTODEV,
+    OBJ-CODEQUALITY, ... — not only OBJ-0N). Ids live in both variants:
+    bare header (`objective:OBJ-x | cost:tiny`) and inline
+    (`[tags: objective:OBJ-x | ...]`).
     """
     if not body:
         return "unattributed"
+    tag_re = re.compile(
+        r"objective:\s*(OBJ-[A-Za-z0-9._-]+)", re.I)
     for line in body.splitlines()[:8]:
         line = line.strip()
         if line.startswith("objective:"):
@@ -242,6 +252,10 @@ def parse_objective(body: str) -> str:
             tag = tag.split("|")[0].split(",")[0].strip()
             if tag:
                 return tag
+        # Inline-tag variant: '[tags: objective:OBJ-x | cost:tiny]'
+        m = tag_re.search(line)
+        if m:
+            return m.group(1)
     return "unattributed"
 
 
