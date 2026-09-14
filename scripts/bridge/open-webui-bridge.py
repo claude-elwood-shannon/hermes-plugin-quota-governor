@@ -14,6 +14,18 @@ v1.3.0 — fusión de dos tareas mediador sobre la misma base v1.2.0:
     CLI actual) — ahora triage->todo vía `specify`, todo/blocked->ready vía
     `promote`; otros pares se rechazan.
 
+v1.4.0 — t_6c5233a8 (MEDIATOR 2026-09-14): 4 endpoints GET de monitorización
+    de backups, SOLO LECTURA (nunca ejecutan backup/restore/prune):
+      GET /backup/snapshots — lista de snapshots restic
+      GET /backup/stats     — tamaño/nº ficheros del repositorio
+      GET /backup/log       — últimas N líneas de backup.log (?lines=)
+      GET /backup/health    — snapshot fresco (<3h), log sin ERROR (24h),
+                              cron presente, tamaño del repo
+    Seguridad: stderr de restic NUNCA entra en respuestas ni logs (puede
+    ecoar configuración del repo); filtro final _backup_redact sobre todo
+    payload /backup/* (sin endpoint S3, bucket ni credenciales); timeout
+    restic 30s; credenciales por env del subprocess, nunca argv.
+
 Restricciones: solo stdlib + hermes CLI + git CLI. Timeout 15s en subprocess
 (única excepción deliberada: `kanban specify`, que lanza el LLM especificador
 auxiliar con ventana propia de 120s — se le da 150s). Path traversal bloqueado.
@@ -125,6 +137,116 @@ def _ao_upsert(data):
             except Exception:
                 pass
         return 500, {"error": str(exc)}
+
+
+# --------------------------------------------------- /backup/* (t_6c5233a8)
+
+# Env del subprocess restic: credenciales SOLO por entorno del hijo, nunca
+# argv (los argv del proceso son visibles en /proc/<pid>/cmdline). El env
+# file (~/.config/restic-hermes/env, chmod 600) exporta las claves S3,
+# RESTIC_PASSWORD y RESTIC_REPOSITORY — la URL del endpoint S3 vive ahí y
+# no en scripts versionados (el repo GitHub es público).
+_RESTIC_ENV_FILE = os.path.join(os.path.expanduser("~"), ".config",
+                                "restic-hermes", "env")
+_RESTIC_TIMEOUT = 30  # spec: comandos restic pueden tardar por red/S3
+_BACKUP_LOG = os.path.join(HERMES_HOME, "logs", "backup.log")
+_BACKUP_REJECT = ("restic_password", "aws_secret", "aws_access",
+                  "s3:", "dream.io", "dreamhost")
+_BACKUP_REPO_SIZE_LIMIT_MB = 100  # umbral de health (spec del mediador)
+_BACKUP_MAX_SNAPSHOTS = 50        # cap de lista en /backup/snapshots
+
+
+def _restic_env():
+    """Carga el env file privado y devuelve dict puro para el subprocess.
+
+    El bridge corre con env -i limpio (wrapper §12): las credenciales no
+    existen en su entorno y hay que leerlas del fichero. Devuelve None si
+    falta el fichero o no define RESTIC_REPOSITORY.
+    """
+    if not os.path.isfile(_RESTIC_ENV_FILE):
+        return None
+    env = {"PATH": "/usr/bin:/bin", "HOME": os.path.expanduser("~")}
+    try:
+        with open(_RESTIC_ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("export "):
+                    continue
+                key, _, val = line[len("export "):].partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key:
+                    env[key] = val
+    except OSError:
+        return None
+    if not env.get("RESTIC_REPOSITORY"):
+        return None
+    return env
+
+
+def _run_restic(args):
+    """restic --json -> (datos | None, detail). El stderr de restic NUNCA
+    se devuelve ni se loguea (puede ecoar configuración del repo); en
+    fallo, detail describe la causa sin contenido del stderr."""
+    env = _restic_env()
+    if env is None:
+        return None, "restic environment not available"
+    try:
+        r = subprocess.run(["restic", *args], capture_output=True,
+                           text=True, timeout=_RESTIC_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return None, f"restic timed out after {_RESTIC_TIMEOUT}s"
+    except FileNotFoundError:
+        return None, "restic binary not found"
+    except Exception as e:
+        return None, f"restic execution error: {type(e).__name__}"
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, f"restic exited with code {r.returncode}"
+    try:
+        return json.loads(r.stdout), None
+    except json.JSONDecodeError:
+        return None, "restic returned invalid JSON"
+
+
+def _backup_redact(data):
+    """Filtro final de TODO payload /backup/*: elimina recursivamente claves
+    sensibles y reemplaza cualquier substring de configuración del repo en
+    strings (defensa en profundidad; el stderr de restic jamás entra)."""
+    def clean_str(s):
+        low = s.lower()
+        if any(tok in low for tok in _BACKUP_REJECT):
+            return "[REDACTED]"
+        return s
+
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if str(k).lower() in _BACKUP_REJECT:
+                continue
+            out[k] = _backup_redact(v)
+        return out
+    if isinstance(data, list):
+        return [_backup_redact(v) for v in data]
+    if isinstance(data, str):
+        return clean_str(data)
+    return data
+
+
+def _backup_parse_ts(v):
+    """Parsea timestamps ISO8601 de restic ('...Z' u offset '+02:00',
+    fracción de 9 dígitos) a epoch seconds. A diferencia de _parse_ts,
+    maneja offsets no-Z (restic 0.16 emite +02:00) -> si no, el health
+    vería age=None y last_snapshot_fresh=False siempre."""
+    if not isinstance(v, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(
+            v.strip().replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
 # raíz del plugin repo: derivada del script (copia repo: <repo>/scripts/bridge/
 # -> <repo>). Adoptantes que corren una copia desplegada fuera del repo fijan
 # BRIDGE_PLUGIN_REPO (el wrapper del house la exporta).
@@ -173,7 +295,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.3.0",
+    "info": {"title": "Hermes Bridge", "version": "1.4.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -198,6 +320,11 @@ OPENAPI_SPEC = {
         "/verify-task": {"post": {"summary": "Verify task success criterion against evidence", "description": "Reads a completed task's body, extracts the declared success criterion, searches for evidence of fulfillment, and returns a verdict (PASS|FAIL|INCONCLUSIVE|NO_CRITERION|NOT_DONE).", "operationId": "verify_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}}}, "responses": {"200": {"description": "Verification result", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/objectives": {"get": {"summary": "Get approved objectives inventory", "description": "Returns all approved objectives with their status, budget, and spending. Filter by status with optional parameter.", "operationId": "get_objectives", "parameters": [{"name": "status", "in": "query", "required": False, "schema": {"type": "string"}}], "responses": {"200": {"description": "Objectives list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/update-objective": {"post": {"summary": "Create or update an approved objective", "description": "Inserts a new objective or updates an existing one. Used by mediator to manage the objectives inventory.", "operationId": "update_objective", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "budget_daily": {"type": "number"}, "description": {"type": "string"}, "success_criterion": {"type": "string"}, "status": {"type": "string", "default": "active"}}, "required": ["id", "name", "budget_daily"]}}}}, "responses": {"200": {"description": "Objective created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_6c5233a8: backup monitoring (read-only) ----
+        "/backup/snapshots": {"get": {"summary": "Get recent backup snapshots", "description": "Returns recent restic snapshots. Does not expose credentials or repository URL.", "operationId": "get_backup_snapshots", "responses": {"200": {"description": "Snapshots list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/backup/stats": {"get": {"summary": "Get backup repository stats", "description": "Returns restic repo size and file count. Does not expose credentials.", "operationId": "get_backup_stats", "responses": {"200": {"description": "Repo stats", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/backup/log": {"get": {"summary": "Get backup log", "description": "Returns last N lines of backup.log", "operationId": "get_backup_log", "parameters": [{"name": "lines", "in": "query", "required": False, "schema": {"type": "integer", "default": 30}}], "responses": {"200": {"description": "Backup log", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/backup/health": {"get": {"summary": "Check backup system health", "description": "Verifies last snapshot age, log errors, cron presence, and repo size.", "operationId": "get_backup_health", "responses": {"200": {"description": "Health status", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
     }
 }
 
@@ -511,7 +638,7 @@ def _verify_logic(task):
 # ------------------------------------------------------------------- server
 
 class HermesBridge(BaseHTTPRequestHandler):
-    server_version = "HermesBridge/1.3"
+    server_version = "HermesBridge/1.4"
 
     def _send_json(self, data, code=200):
         self.send_response(code)
@@ -620,6 +747,14 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._send_json({"log": self._read_log("logs/cron-health-check.log", 5)})
         elif path == "/efficiency":
             self._send_json({"log": self._read_log("logs/efficiency-ratio.log", 3)})
+        elif path == "/backup/snapshots":
+            self._handle_backup_snapshots()
+        elif path == "/backup/stats":
+            self._handle_backup_stats()
+        elif path == "/backup/log":
+            self._handle_backup_log(qs)
+        elif path == "/backup/health":
+            self._handle_backup_health()
         elif path == "/task":
             self._handle_get_task(qs)
         elif path == "/tasks":
@@ -724,6 +859,116 @@ class HermesBridge(BaseHTTPRequestHandler):
         rows.sort(key=lambda o: _parse_ts(o.get("ts")) or 0)
         self._send_json({"metrics": rows, "count": len(rows),
                          "kind": kind, "days": days})
+
+    # ---- v1.4 GET: backup monitoring (t_6c5233a8, SOLO LECTURA) ----
+    # Nunca ejecutan backup/restore/prune; stderr de restic jamás entra
+    # en las respuestas; todo payload pasa por _backup_redact.
+
+    def _handle_backup_snapshots(self):
+        snaps, err = _run_restic(["snapshots", "--json"])
+        if err:
+            return self._send_json({"error": "restic snapshots unavailable",
+                                    "detail": err}, 503)
+        if not isinstance(snaps, list):
+            return self._send_json({"error": "restic snapshots unavailable",
+                                    "detail": "unexpected restic output"}, 503)
+        snaps = [s for s in snaps if isinstance(s, dict)]
+        snaps.sort(key=lambda s: _backup_parse_ts(s.get("time")) or 0)
+        last = snaps[-1] if snaps else None
+        payload = {"snapshots": snaps[-_BACKUP_MAX_SNAPSHOTS:],
+                   "count": len(snaps),
+                   "last_time": (last or {}).get("time")}
+        self._send_json(_backup_redact(payload))
+
+    def _handle_backup_stats(self):
+        stats, err = _run_restic(["stats", "--json"])
+        if err or not isinstance(stats, dict):
+            return self._send_json({"error": "restic stats unavailable",
+                                    "detail": err or "unexpected restic output"}, 503)
+        payload = {"stats": stats,
+                   "total_size": stats.get("total_size"),
+                   "total_files": stats.get("total_file_count")}
+        self._send_json(_backup_redact(payload))
+
+    def _handle_backup_log(self, qs):
+        try:
+            lines = int((qs.get("lines") or ["30"])[0])
+        except Exception:
+            lines = 30
+        lines = max(1, min(lines, 500))
+        self._send_json(_backup_redact(
+            {"log": self._read_log("logs/backup.log", lines),
+             "lines": lines}))
+
+    def _handle_backup_health(self):
+        checks = {}
+        # 1. ¿último snapshot en las últimas 3h?
+        snaps, err = _run_restic(["snapshots", "--json"])
+        last_time, age = None, None
+        if not err and isinstance(snaps, list):
+            best_ts = None
+            for s in snaps:
+                if not isinstance(s, dict):
+                    continue
+                ts = _backup_parse_ts(s.get("time"))
+                if ts is not None and (best_ts is None or ts > best_ts):
+                    best_ts, last_time = ts, s.get("time")
+            if best_ts is not None:
+                age = round((time.time() - best_ts) / 3600.0, 2)
+        checks["last_snapshot_fresh"] = bool(
+            age is not None and age <= 3.0)
+        # 2. ¿log sin ERROR en las últimas 24h? (ERROR bajo cabecera datada)
+        cutoff = time.time() - 24 * 3600
+        log_errors = 0
+        header_ts = None
+        try:
+            with open(_BACKUP_LOG, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = re.match(
+                        r"=== Backup (?:started|completed): "
+                        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                    if m:
+                        try:
+                            from datetime import datetime
+                            header_ts = datetime.strptime(
+                                m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+                        except Exception:
+                            pass
+                        continue
+                    if "ERROR" in line and header_ts is not None \
+                            and header_ts >= cutoff:
+                        log_errors += 1
+        except OSError:
+            pass
+        checks["log_clean_24h"] = (log_errors == 0)
+        # 3. ¿cron presente en crontab?
+        cron_present = False
+        try:
+            r = subprocess.run(["crontab", "-l"], capture_output=True,
+                               text=True, timeout=10)
+            cron_present = (r.returncode == 0
+                            and "hermes-backup" in (r.stdout or ""))
+        except Exception:
+            pass
+        checks["cron_present"] = cron_present
+        # 4. ¿repo < límite? (raw-data: lo que el bucket almacena de verdad;
+        # dominado por state.db — el umbral de 100MB de la spec es antiguo)
+        stats, err2 = _run_restic(["stats", "--mode", "raw-data", "--json"])
+        repo_mb = None
+        if isinstance(stats, dict) \
+                and isinstance(stats.get("total_size"), (int, float)):
+            repo_mb = round(stats["total_size"] / (1024 * 1024), 1)
+        checks["repo_size_ok"] = bool(
+            repo_mb is not None and repo_mb < _BACKUP_REPO_SIZE_LIMIT_MB)
+        payload = {"healthy": all(checks.values()),
+                   "checks": checks,
+                   "last_snapshot": last_time,
+                   "last_snapshot_age_hours": age,
+                   "log_errors": log_errors,
+                   "cron_present": cron_present,
+                   "repo_size_mb": repo_mb,
+                   "repo_size_limit_mb": _BACKUP_REPO_SIZE_LIMIT_MB}
+        self._send_json(_backup_redact(payload))
 
     def do_POST(self):
         path = self.path.partition("?")[0]
@@ -889,7 +1134,7 @@ class HermesBridge(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Hermes Bridge API v1.3 on http://0.0.0.0:{PORT}")
+    print(f"Hermes Bridge API v1.4 on http://0.0.0.0:{PORT}")
     HTTPServer(("0.0.0.0", PORT), HermesBridge).serve_forever()
 
 
