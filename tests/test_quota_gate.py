@@ -33,7 +33,12 @@ _SPEC = importlib.util.spec_from_file_location(
     os.path.join(_SCRIPT_DIR, "quota-gate.py"),
 )
 qg = importlib.util.module_from_spec(_SPEC)
-sys.modules["quota_gate"] = qg
+# Sin registro en sys.modules["quota_gate"]: la copia raiz test_quota_gate.py
+# es la DUENA de esa clave (sus 134 patch("quota_gate.X") resuelven contra
+# sys.modules). Si esta copia la registrara (se colecciona la ultima), los
+# patch de la raiz mutarian ESTA instancia y las funciones de la raiz
+# consultarian el endpoint real (26 fallos en tanda completa, t_a8a4418c).
+# Este fichero usa el handle local `qg`, inmune a la colision.
 _SPEC.loader.exec_module(qg)
 
 
