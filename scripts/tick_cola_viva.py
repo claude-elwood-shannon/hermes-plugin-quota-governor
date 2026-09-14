@@ -37,6 +37,9 @@ run = _real.run
 main = _real.main
 build_successor = _real.build_successor
 successor_pattern = _real.successor_pattern
+successor_signature = _real.successor_signature
+successor_chain_open = _real.successor_chain_open
+_successor_stamp = _real._successor_stamp
 TITLE_MAX_CHARS = _real.TITLE_MAX_CHARS
 
 # Importaciones posteriores resuelven contra el modulo REAL: `import
@@ -50,5 +53,8 @@ __all__ = [
     "main",
     "build_successor",
     "successor_pattern",
+    "successor_signature",
+    "successor_chain_open",
+    "_successor_stamp",
     "TITLE_MAX_CHARS",
 ]

@@ -31,6 +31,9 @@ from scripts.tick_cola_viva import (  # noqa: E402
     build_successor,
     run,
     successor_pattern,
+    successor_signature,
+    successor_chain_open,
+    _successor_stamp,
     TITLE_MAX_CHARS,
 )
 
@@ -187,6 +190,104 @@ def test_build_successor_caps_title_and_carries_tags():
     assert len(title) <= TITLE_MAX_CHARS
     assert "tX" in title
     assert "clase:C" in body
+
+
+# ---------------------------------------------- P5 dedup (MEDIATOR 14-sep):
+# la cadena recursiva "Sucesor estructural de Sucesor estructural de ..."
+# muere con la firma (raiz+patron) y el tope de profundidad.
+
+
+def test_p5_signature_deterministic_per_root_and_pattern():
+    a = successor_signature("tABC123", "docs")
+    b = successor_signature("tABC123", "docs")
+    c = successor_signature("tXYZ789", "docs")
+    d = successor_signature("tABC123", "test")
+    assert a == b and len(a) == 16
+    assert a != c and a != d  # cambia la raiz o el patron -> cambia la firma
+
+
+def test_p5_stamp_in_body_and_inheritance():
+    root = {"id": "tR", "title": "Tarea raiz", "body": "clase:C"}
+    sig = successor_signature("tR", "docs")
+    title, body = build_successor(root, sig=sig, depth=1)
+    assert f"successor-sig:{sig}" in body
+    assert "successor-depth:1" in body
+    # hijo de un sucesor estampado: hereda firma, sube profundidad
+    child_parent = {"id": "tS1", "title": title, "body": body}
+    depth, inherited = _successor_stamp(child_parent, "")
+    assert inherited and depth == 2
+    # padre legacy (pre-estampa, titulo Sucesor...): depth 1, sin herencia
+    legacy = {"id": "tL", "title": "Sucesor estructural de tX: docs de Y",
+              "body": "clase:C"}
+    depth2, inherited2 = _successor_stamp(legacy, "")
+    assert not inherited2 and depth2 == 1
+
+
+def test_p5_chain_open_detects_any_non_archived_task(tmp_path):
+    db = tmp_path / "kanban.db"
+    con = create_db(db)
+    insert_task(con, "tD", "Sucesor estructural de tR: docs de X", "done",
+                completed_at=1.0,
+                body=f"successor-sig:{'a' * 16} | successor-depth:1")
+    con.commit()
+    con.close()
+    assert successor_chain_open(db, "a" * 16)
+    # archivada ya no bloquea (salio del board)
+    con = sqlite3.connect(str(db))
+    con.execute("UPDATE tasks SET status='archived' WHERE id='tD'")
+    con.commit()
+    con.close()
+    assert not successor_chain_open(db, "a" * 16)
+
+
+def test_p5_dedup_blocks_successor_of_existing_chain(tmp_path, hermetic_world):
+    """Una cadena ya estampada en el board (running) corta el step 3:
+    dedup en vez de un nuevo 'Sucesor estructural de ...'."""
+    now = 2000000000.0
+    p_title, p_body = "Caso de prueba: clase:C", "objective:OBJ-30\nclase:C\n"
+    # la firma se computa EXACTAMENTE como lo hace el tick (raiz + patron)
+    sig = successor_signature("tX", successor_pattern(p_title, p_body))
+    db = create_db(hermetic_world / "kanban.db")
+    insert_task(db, "tX", p_title, "done",
+                completed_at=now - 3600, body=p_body)
+    insert_task(db, "tCHILD", "Sucesor estructural de tX: test/hardening de Caso",
+                "running", body=f"successor-sig:{sig} | successor-depth:1")
+    db.close()
+    decisions = run(hermes_home=hermetic_world, execute=False, now=now)
+    assert any("dedup P5" in d for d in decisions), decisions
+    assert not any("created-successor" in d for d in decisions)
+
+
+def test_p5_legacy_successor_parent_gets_depth_cap(tmp_path, hermetic_world):
+    """Padre legacy 'Sucesor estructural de ...' sin estampa: su hijo
+    naceria con depth 1 pero el PADRO-PADRE ya es sucesor -> el hijo queda
+    a depth 1 y el siguiente de la cadena (hijo de hijo) queda capped.
+    Aqui verificamos el corte del antepenultimo eslabon: un padre con
+    estampa depth:1 -> hijo depth:2 > MAX -> retenido."""
+    now = 2000000000.0
+    sig = successor_signature("tR", "docs")
+    db = create_db(hermetic_world / "kanban.db")
+    insert_task(db, "tS1", "Sucesor estructural de tR: docs de R", "done",
+                completed_at=now - 3600,
+                body=f"objective:OBJ-30\nclase:C\nsuccessor-sig:{sig} | "
+                     f"successor-depth:1")
+    db.close()
+    decisions = run(hermes_home=hermetic_world, execute=False, now=now)
+    # la linea de decision (no la entrada del ledger) nombra el tope
+    assert any("tope de profundidad" in d for d in decisions), decisions
+    assert not any("sucesor estructural de tS1" in d for d in decisions)
+
+
+def test_p5_first_successor_still_created(tmp_path, hermetic_world):
+    """El dedup no debe matar la cola viva: un done clase:C sin sucesor
+    sigue generando su primer sucesor, ahora con estampa."""
+    now = 2000000000.0
+    db = create_db(hermetic_world / "kanban.db")
+    insert_task(db, "tX", "Caso de prueba: clase:C", "done",
+                completed_at=now - 3600, body="objective:OBJ-30\nclase:C\n")
+    db.close()
+    decisions = run(hermes_home=hermetic_world, execute=False, now=now)
+    assert any("sucesor estructural de tX" in d for d in decisions), decisions
 
 
 # ------------------------------------------------------- hueco OBJ-44 (tarea

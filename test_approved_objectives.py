@@ -57,12 +57,13 @@ class TestInventory(Harness):
         self.assertTrue(ao.ensure_table(self.db))
         rows = ao.list_objectives(self.db)
         self.assertEqual([r["id"] for r in rows],
-                         ["OBJ-AUTODEV", "OBJ-METRICS", "OBJ-VLLM"])
+                         ["OBJ-AUTODEV", "OBJ-CODEQUALITY", "OBJ-METRICS",
+                          "OBJ-VLLM"])
         self.assertTrue(all(r["status"] == "active" for r in rows))
-        self.assertEqual(sum(r["budget_daily"] for r in rows), 4.50)
+        self.assertEqual(sum(r["budget_daily"] for r in rows), 5.00)
         # idempotent
         self.assertTrue(ao.ensure_table(self.db))
-        self.assertEqual(len(ao.list_objectives(self.db)), 3)
+        self.assertEqual(len(ao.list_objectives(self.db)), 4)
 
     def test_4_5_bridge_upsert_create_and_update(self):
         res = ao.upsert_objective(self.db, {
@@ -76,7 +77,7 @@ class TestInventory(Harness):
         obj = ao.get_objective(self.db, "OBJ-NEW")
         self.assertEqual(obj["budget_daily"], 0.75)
         self.assertEqual(obj["updated_by"], "mediator")
-        self.assertEqual(len(ao.list_objectives(self.db)), 4)  # no duplicate
+        self.assertEqual(len(ao.list_objectives(self.db)), 5)  # no duplicate
 
     def test_upsert_rejects_bad_input(self):
         self.assertFalse(ao.upsert_objective(self.db, {"id": "X"}).get("ok"))

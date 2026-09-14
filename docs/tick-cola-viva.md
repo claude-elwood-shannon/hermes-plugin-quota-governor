@@ -49,6 +49,26 @@ A parent with an open (non-archived) successor referencing it is skipped,
 so the same successor is never created twice. The ledger
 (`~/.hermes/quota-governor/cola-viva.jsonl`) records every decision.
 
+## P5 dedup: successor chain signature (MEDIATOR 14-sep)
+
+Step 3 stamps every successor it creates with
+`successor-sig:<sha1[:16]>` (signature of root task + structural pattern,
+inherited by the whole chain) and `successor-depth:N`. Before creating a
+successor the tick checks two gates:
+
+1. **Signature dedup** — if the signature already exists on ANY
+   non-archived board task (open or done), the chain already produced its
+   work and no successor is created (`successor-dedup` in the ledger).
+2. **Depth cap** — a stamped successor never generates another successor
+   (`SUCCESSOR_MAX_DEPTH=1`): a child of a stamped parent is retained
+   (`successor-depth-capped`). Legacy successors (pre-stamp, successor
+   title) count as depth 1, so the old recursive
+   "Sucesor estructural de Sucesor estructural de ..." chains die at the
+   first pass.
+
+Archived tasks fall out of the dedup: their signature becomes eligible
+again (deliberate — the board forgets what the user archived).
+
 ## Observability
 
 One line per decision on the tick's stdout (which the cron layer logs):

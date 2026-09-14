@@ -55,6 +55,13 @@ SEED_OBJECTIVES = (
      "Hardening, tests, docs, refactor, observabilidad, fix de bugs detectados",
      "active",
      "Objetivo perpetuo de mejora continua — no se marca achieved"),
+    ("OBJ-CODEQUALITY", "Calidad de código y buenas prácticas", 0.50,
+     "Refactor de anti-patrones, extracción de utilidades comunes, "
+     "type hints, docstrings, eliminación de código duplicado, coding standards",
+     "active",
+     "Todos los scripts pasan py_compile, funciones críticas <50 líneas, "
+     "lógica compartida extraída a módulo común, type hints y docstrings "
+     "en funciones públicas, docs/coding-standards.md existe"),
     ("OBJ-VLLM", "vLLM híbrido como herramienta", 1.00,
      "vllm-invoke, skills, hints, integración con workers cloud",
      "active",

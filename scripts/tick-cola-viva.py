@@ -10,10 +10,15 @@ with LEGITIMATE work — never filler.
 Cascade (max 1 action per tick, idempotent):
   1. Assign a profile to the first ready task with no assignee (fix the
      silent stop: ready-without-assignee is claimed by nobody).
-  2. Else if ready tasks WITH assignee exist, the queue is alive (the
-     dispatcher claims them within ~60s) — log and skip, no new work.
-  3. Create ONE structural class-C successor of the most recent done
-     task (<24h, body 'clase:C') that has no open successor yet
+  2. Else if ready tasks WITH assignee exist and the refill pool is dry,
+     the queue is alive (the dispatcher claims them within ~60s) — log
+     and skip, no new work. P2 desired=3: with refillable pool left
+     (class-C done <24h without successor) the cascade keeps refilling
+     up to the minimum backlog.
+  3. Create structural class-C successors of the most recent done
+     tasks (<24h, body 'clase:C') that have no open successor yet,
+     UNTIL the backlog (ready_assigned + running) >= 3 — pool-bounded,
+     never filler
      (pattern: docs of the undocumented, test of the new, hardening of the
      fragile). assignee pr-ollama, cost tiny/small.
   3.5 (OBJ-39) Successors from closed bodies: closed multi-part tasks
@@ -44,6 +49,7 @@ Exit codes: 0 always (the tick must never break on this).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -76,6 +82,20 @@ CLASE_C_RE = re.compile(r"\bclase\s*:\s*C\b(-\w+)?", re.I)  # C y C-estructural 
 # objective:OBJ-xx tag anywhere in the body (MEDIATOR budget gate, §6).
 OBJECTIVE_TAG_RE = re.compile(
     r"\bobjective\s*:\s*(OBJ-[A-Za-z0-9._-]+)", re.I)
+
+# P5 dedup (MEDIATOR 14-sep): firma de cadena de sucesores. El step 3
+# estampa en el body del sucesor `successor-sig:<sha1[:16]>` (raíz+patrón,
+# heredada por toda la cadena) y `successor-depth:N`. Con ambas piezas el
+# tick corta la cadena recursiva "Sucesor estructural de Sucesor
+# estructural de ...": (a) no crea un sucesor si su firma ya existe en el
+# board (abierta o hecha, no archivada), y (b) un sucesor nunca genera
+# otro sucesor (tope de profundidad). Los sucesores legados (pre-estampa,
+# título 'Sucesor estructural de ...') cuentan con profundidad 1: la
+# cadena vieja muere en la primera pasada.
+SUCCESSOR_SIG_RE = re.compile(r"\bsuccessor-sig:([0-9a-f]{16})\b")
+SUCCESSOR_DEPTH_RE = re.compile(r"\bsuccessor-depth:(\d+)\b", re.I)
+SUCCESSOR_LEGACY_TITLE_RE = re.compile(r"^Sucesor estructural de \S+", re.I)
+SUCCESSOR_MAX_DEPTH = 1
 
 
 def _load_approved_objectives():
@@ -217,6 +237,70 @@ def has_open_successor(db_path: Path, parent_id: str) -> bool:
     return bool(rows)
 
 
+# ---------------------------------------------------------------------------
+# P5 dedup: firma de cadena de sucesores (MEDIATOR 14-sep)
+# ---------------------------------------------------------------------------
+
+def successor_signature(root_id: str, pattern: str) -> str:
+    """sha1[:16] of (root_id, pattern) — the P5 paste-§8 signature scheme
+    applied to the successor chain: the whole chain of successors born of
+    a root task under one structural pattern shares ONE signature, so a
+    'Sucesor de Sucesor de ...' can never re-enter the board."""
+    raw = f"{root_id}|{pattern}".strip().lower()
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _successor_stamp(parent: dict, sig: str) -> tuple[int, bool]:
+    """(depth, inherited) for the child of `parent`: inherited signature
+    if the parent carries one, else the parent IS the root. Depth = parent
+    depth + 1; legacy parents (pre-stamp, successor-titled) count as
+    depth 1 so the old recursive chain dies at the first pass."""
+    m_sig = SUCCESSOR_SIG_RE.search(parent.get("body") or "")
+    if m_sig:
+        m_depth = SUCCESSOR_DEPTH_RE.search(parent.get("body") or "")
+        depth = (int(m_depth.group(1)) + 1) if m_depth else SUCCESSOR_MAX_DEPTH + 1
+        return depth, True
+    if SUCCESSOR_LEGACY_TITLE_RE.match(parent.get("title") or ""):
+        return 1, False
+    return 1, False
+
+
+def successor_chain_open(db_path: Path, sig: str,
+                         exclude_task_id: str | None = None) -> bool:
+    """True if ANY non-archived task in the board already carries this
+    successor signature (open or done — done counts: the chain already
+    produced its work; only archived falls out of the board)."""
+    if not db_path.exists():
+        return False
+    try:
+        con = _connect(db_path)
+        try:
+            q = ("SELECT id FROM tasks WHERE status != 'archived' "
+                 "AND body LIKE ?")
+            args: list = [f"%successor-sig:{sig}%"]
+            if exclude_task_id:
+                q += " AND id != ?"
+                args.append(exclude_task_id)
+            rows = con.execute(q, args).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return bool(rows)
+
+
+def refillable(db_path: Path, now: float | None = None) -> bool:
+    """P2 desired=3 (MEDIATOR t_acf726e6): True if the backlog-guard's
+    refill depth has legitimate work left — a class-C done task <24h with
+    no open successor (the same pool step 3 draws from). When False, the
+    step-2 'queue alive' shortcut stands and the drought verdict (step 4)
+    stays honest: dry means dry, no filler (pitfall 24g-c)."""
+    for parent in recent_clase_c_done(db_path, now=now):
+        if not has_open_successor(db_path, parent["id"]):
+            return True
+    return False
+
+
 def header_of(body: str) -> str:
     lines = []
     for line in (body or "").splitlines():
@@ -251,16 +335,23 @@ def successor_pattern(title: str, body: str) -> str:
     return "test/hardening"
 
 
-def build_successor(parent: dict) -> tuple:
-    """Return (title, body) for a structural class-C successor of parent."""
+def build_successor(parent: dict, sig: str | None = None,
+                    depth: int | None = None) -> tuple:
+    """Return (title, body) for a structural class-C successor of parent.
+    sig/depth: P5 dedup stamps written into the body so the whole chain
+    (root + pattern) shares one signature and the depth is explicit."""
     pattern = successor_pattern(parent["title"], parent.get("body", ""))
     base = (parent["title"] or "").strip()
     title = f"Sucesor estructural de {parent['id']}: {pattern} de {base}"[:TITLE_MAX_CHARS]
+    stamp = ""
+    if sig:
+        stamp = (f"\nsuccessor-sig:{sig} | successor-depth:{depth or 1}")
     body = (
         f"objective:OBJ-30 | cost:tiny | privacy:low | clase:C\n\n"
         f"Sucesor estructural de {parent['id']} ({base}) — OBJ-30b cola viva: "
         f"{pattern} de lo cerrado recientemente.\n"
         f"Generado por tick-cola-viva.py (cola vacia + cuota libre)."
+        f"{stamp}"
     )
     return title, body
 
@@ -407,10 +498,12 @@ def run(hermes_home=None, execute: bool = False, now=None,
     _log(ledger, {"ts": now, "action": "backlog-guard", "ready_assigned": ready_assigned_n,
                   "live_workers": live_workers or 0, "backlog_total": backlog_total,
                   "verdict": "OK" if backlog_total >= BACKLOG_MIN else "LOW"})
-    if backlog_total >= BACKLOG_MIN:
+    if backlog_total >= BACKLOG_MIN and not refillable(db, now=now):
         act({"ts": now, "action": "skipped", "reason": f"backlog OK ({backlog_total})"},
             f"backlog OK (ready={ready_assigned_n}, running={live_workers or 0})")
         return decisions
+    # backlog OK pero refillable (P2 desired=3): la cascade cae al paso 3 y
+    # rellena hasta el mínimo (ready_assigned + running >= 3).
     # verdict LOW: el ledger ya registró el guard; la cascade continúa y su
     # acción será la única línea de decisión del tick (contrato 1-linea).
 
@@ -522,10 +615,33 @@ def run(hermes_home=None, execute: bool = False, now=None,
 
     # ── Step 3: create ONE structural class-C successor of the most recent
     # done task (<24h, clase:C) that has no open successor yet ──
+    # P5 dedup (MEDIATOR 14-sep): la cadena recursiva "Sucesor de Sucesor
+    # de ..." muere aqui. Dos puertas antes de crear:
+    #   (a) firma: si la firma (raiz+patron) ya existe en el board
+    #       (abierta o hecha), la cadena ya cubrio su trabajo — no re-entra;
+    #   (b) profundidad: un sucesor no genera otro sucesor (tope
+    #       SUCCESSOR_MAX_DEPTH); legacy sin estampa cuenta como depth 1.
     for parent in recent_clase_c_done(db, now=now):
         if has_open_successor(db, parent["id"]):
             continue
-        title, body = build_successor(parent)
+        pattern = successor_pattern(parent["title"], parent.get("body", ""))
+        m_sig = SUCCESSOR_SIG_RE.search(parent.get("body") or "")
+        depth, inherited = _successor_stamp(parent, "")
+        if inherited and depth > SUCCESSOR_MAX_DEPTH:
+            act({"ts": now, "action": "successor-depth-capped", "parent": parent["id"],
+                 "depth": depth},
+                f"cola viva: sucesor de {parent['id']} retenido — tope de "
+                f"profundidad ({depth} > {SUCCESSOR_MAX_DEPTH}), sin cadena recursiva")
+            return decisions
+        sig = (m_sig.group(1) if (inherited and m_sig)
+               else successor_signature(parent["id"], pattern))
+        if successor_chain_open(db, sig, exclude_task_id=parent["id"]):
+            act({"ts": now, "action": "successor-dedup", "parent": parent["id"],
+                 "sig": sig},
+                f"cola viva: dedup P5 — firma {sig} ya existe en el board, "
+                f"sin nuevo sucesor de {parent['id']}")
+            return decisions
+        title, body = build_successor(parent, sig=sig, depth=depth)
         assignee = parent.get("assignee") or DEFAULT_ASSIGNEE
         if not execute:
             act({"ts": now, "action": "created-successor", "parent": parent["id"],
