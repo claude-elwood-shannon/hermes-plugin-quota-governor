@@ -45,6 +45,12 @@ Script sin modificar: el diff de `a97c424` toca solo
 ## Estado de publicación
 
 - Commit `a97c424` en rama local `workers`, sobre `origin/main`.
-- La rama `workers` **no existe en origin** (verificado con
-  `git ls-remote --heads`): el push es manual por convención del usuario
-  (`git push origin workers`, repo vía Tor).
+- **Publicado** (re-verificado 2026-09-14 ~19:50): `git ls-remote` muestra
+  `refs/heads/workers` en origin y `origin/workers` apunta a `7c47ae9`,
+  que contiene tanto `a97c424` como esta ficha (`d6200ee`). El push
+  lo ejecutó el usuario manualmente (convención: push siempre manual,
+  repo vía Tor).
+- Suite en el estado commiteado (re-verificación 2026-09-14 ~19:50):
+  `tests/test_tick_cola_viva.py` 19 passed; resto de `tests/` 66 passed;
+  raíz (`test_quota_planner.py` + `test_tick_cola_viva.py`) 43 passed.
+  0 fallos en las tres tandas.
