@@ -298,6 +298,73 @@ class TestCompose(Base):
         self.assertEqual(screen.build_screen(hermes_home=self.home()), "")
 
 
+class TestObjectivesScreen(Base):
+    """MEDIATOR 14-sep (t_7626791f): gasto contra balance separado de la
+    cuota gratis (test 9 del mandato)."""
+
+    def _seed_objectives(self, autodev_spent=1.20, metrics_spent=0.0,
+                         vllm_status=None):
+        db = Path(self.tmp) / "kanban.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS approved_objectives ("
+            "id TEXT PRIMARY KEY, name TEXT NOT NULL, budget_daily REAL"
+            " NOT NULL DEFAULT 0.0, description TEXT, status TEXT NOT NULL"
+            " DEFAULT 'active', success_criterion TEXT, spent_today REAL"
+            " DEFAULT 0.0, spent_total REAL DEFAULT 0.0, created_at REAL,"
+            " updated_at REAL, updated_by TEXT, exhausted_days INTEGER"
+            " DEFAULT 0, last_exhausted_day TEXT)")
+        con.execute("INSERT INTO approved_objectives (id, name, budget_daily,"
+                    " status, spent_today) VALUES"
+                    " ('OBJ-AUTODEV','Autodesarrollo',3.0,'active',?),"
+                    " ('OBJ-METRICS','Metricas',0.5,'active',?),"
+                    " ('OBJ-VLLM','vLLM',1.0,?,0.0)",
+                    (autodev_spent, metrics_spent,
+                     vllm_status or "achieved"))
+        con.commit()
+        con.close()
+
+    def _seed_quota_tick(self, session_pct, weekly_pct):
+        _write_jsonl(Path(self.tmp) / "quota-governor"
+                     / "observations.jsonl", [{
+            "timestamp": "2026-09-14T01:09:38+00:00",
+            "event": "quota_tick",
+            "decision": {"action": "run", "max_workers": 1,
+                         "reason": "weekly high (85%)"},
+            "quota": {"ollama_session_pct": session_pct,
+                      "ollama_weekly_pct": weekly_pct},
+        }])
+
+    def test_renders_balance_spend_and_colors(self):
+        self._seed_objectives()
+        out = screen.build_objectives_screen(hermes_home=self.home())
+        self.assertIn("OBJETIVOS APROBADOS", out)
+        self.assertIn("OBJ-AUTODEV", out)
+        self.assertIn("$1.20/$3.00", out)
+        self.assertIn("TOTAL:                  $1.20/$4.50", out)
+
+    def test_balance_spend_shown_separate_from_free_quota(self):
+        self._seed_objectives()
+        self._seed_quota_tick(60.0, 85.1)
+        out = screen.build_objectives_screen(hermes_home=self.home())
+        self.assertIn("TOTAL:                  $1.20/$4.50", out)
+        self.assertIn("Cuota gratis:", out)
+        self.assertIn("sesion 60.0%", out)
+        self.assertIn("semanal 85.1%", out)
+        self.assertIn("(agotada)", out)
+
+    def test_free_quota_line_absent_without_observations(self):
+        self._seed_objectives()
+        out = screen.build_objectives_screen(hermes_home=self.home())
+        self.assertNotIn("Cuota gratis:", out)
+
+    def test_free_quota_libre_under_threshold(self):
+        self._seed_objectives()
+        self._seed_quota_tick(32.1, 54.7)
+        out = screen.build_objectives_screen(hermes_home=self.home())
+        self.assertIn("(libre)", out)
+
+
 class TestFlightReport(Base):
     # Injected `now` per the same pitfall as the board fixture: a Monday
     # computed from the live clock expires when the test runs on another day.

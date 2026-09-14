@@ -564,14 +564,63 @@ def build_efficiency_screen(hermes_home=None) -> str:
     return "\n".join(out)
 
 
+def _free_quota_line(hermes_home=None) -> str:
+    """'Cuota gratis: ...' line from the last quota_tick observation.
+
+    Source: observations.jsonl (the tick appends its decision + quota
+    percentages there). Renders the session/weekly percentages and whether
+    the free quota is exhausted (>= 80%, the tick's dispatch threshold).
+    Empty string when no observation exists (section stays as before)."""
+    path = state_dir(hermes_home) / "observations.jsonl"
+    last = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("event") == "quota_tick":
+                    last = row
+    except OSError:
+        return ""
+    if not last:
+        return ""
+    q = last.get("quota", {}) if isinstance(last.get("quota"), dict) else {}
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    spf = _f(q.get("ollama_session_pct"))
+    wpf = _f(q.get("ollama_weekly_pct"))
+    if spf is None and wpf is None:
+        return ""
+    parts = []
+    if spf is not None:
+        parts.append(f"sesion {spf:.1f}%")
+    if wpf is not None:
+        parts.append(f"semanal {wpf:.1f}%")
+    worst = max([p for p in (spf, wpf) if p is not None], default=0.0)
+    estado = "agotada" if worst >= 80.0 else "libre"
+    return f"  Cuota gratis:            {', '.join(parts)} ({estado})"
+
+
 def build_objectives_screen(hermes_home=None) -> str:
     """OBJETIVOS APROBADOS (MEDIATOR 2026-09-14): inventory + spend + colors.
 
     Reads the approved_objectives TABLE from the root kanban.db (sqlite3
     stdlib, read-only). Fail-open: table missing -> the section does not
-    render (degraded mode is alarmed by the health-check, not here)."""
+    render (degraded mode is alarmed by the health-check, not here).
+    t_7626791f: gasto contra balance (ruta A) shown separately from the
+    free-quota state (last quota_tick observation)."""
     import sqlite3
-    base = hermes_home or Path.home() / ".hermes"
+    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
     db = base / "kanban.db"
     if not db.exists():
         return ""
@@ -610,6 +659,9 @@ def build_objectives_screen(hermes_home=None) -> str:
         lines.append(f"  {r['id']:<14} {r['status']:<9} "
                      f"${spent:.2f}/${budget:.2f}   {color}  ({name})")
     lines.append(f"  TOTAL:                  ${tot_spend:.2f}/${tot_budget:.2f}")
+    fq = _free_quota_line(hermes_home)
+    if fq:
+        lines.append(fq)
     return "\n".join(lines)
 
 
@@ -638,7 +690,17 @@ def build_approval_screen(hermes_home=None) -> str:
                 continue
     if gate is None:
         return ""
-    pend = gate.fetch_pending(gate.kanban_db_path())
+    # Hermetic resolution (t_7626791f): respect the caller's hermes_home —
+    # without this the section read the HOST board from inside tests and
+    # broke build_screen's 'empty when every source missing' contract.
+    # Missing db -> watchdog pattern, stay silent like the other sections.
+    if hermes_home:
+        db = Path(hermes_home) / "kanban.db"
+        if not db.exists():
+            return ""
+    else:
+        db = gate.kanban_db_path()
+    pend = gate.fetch_pending(db)
     if not pend:
         return "APPROVAL-READY (pendientes de tu ok)\n  sin iniciativas pendientes de aprobacion"
     lines = ["APPROVAL-READY (pendientes de tu ok):"]

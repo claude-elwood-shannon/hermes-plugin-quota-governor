@@ -66,9 +66,10 @@ def _mk_db(path, tasks, done=None):
     con.close()
 
 
-def _ready(id="t_ready", assignee=None, title="OBJ-27: tarea lista"):
+def _ready(id="t_ready", assignee=None, title="OBJ-27: tarea lista",
+           body="objective:OBJ-27"):
     return {"id": id, "title": title, "status": "ready",
-            "assignee": assignee, "body": "objective:OBJ-27"}
+            "assignee": assignee, "body": body}
 
 
 class Base(unittest.TestCase):
@@ -77,6 +78,17 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.addCleanup(os.environ.pop, "HERMES_HOME", None)
         self.addCleanup(os.environ.pop, "HERMES_KANBAN_DB", None)
+        # Repo-root env leaks (e.g. BRIDGE_PLUGIN_REPO set by sibling test
+        # files under pytest) make the objective-lifecycle checkers see the
+        # HOST repo/logs -> OBJ-VLLM 'achieved' fires inside fixtures. And
+        # approved_objectives hermes_root() falls back to the real
+        # Path.home()/.hermes when AO_HERMES_ROOT is merely ABSENT — the
+        # fixture must PIN it to the tmp world, not just pop strays.
+        for var in ("BRIDGE_PLUGIN_REPO", "AO_HERMES_ROOT", "AO_KANBAN_DB",
+                    "AO_TRACE"):
+            self.addCleanup(os.environ.pop, var, None)
+            os.environ.pop(var, None)
+        os.environ["AO_HERMES_ROOT"] = self.tmp
         os.environ.pop("HERMES_KANBAN_DB", None)
         os.environ["HERMES_HOME"] = self.tmp
         self.db = str(Path(self.tmp) / "kanban.db")
@@ -250,6 +262,123 @@ class TestDryRun(Base):
         self.assertIn("DRY:", out[0])
         self.assertEqual(self.calls["assign"], [])
         self.assertEqual(self.calls["create"], [])
+
+
+class TestObjectiveBalanceRoute(Base):
+    """MEDIATOR 14-sep (t_7626791f): ruta A — objetivos aprobados se
+    despachan CONTRA BALANCE aunque la cuota gratis esté agotada.
+
+    Seeds are trace-level (the tick's housekeeping recomputes spent_today
+    from the trace; a direct table seed would be wiped before the fork)."""
+
+    def _seed_objectives(self, spent=0.0, status="active", budget=3.0):
+        ao_spec = importlib.util.spec_from_file_location(
+            "approved_objectives_fx",
+            Path(__file__).resolve().parent / "scripts" / "approved_objectives.py")
+        ao = importlib.util.module_from_spec(ao_spec)
+        ao_spec.loader.exec_module(ao)
+        ao.ensure_table(self.db)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE approved_objectives SET status=?, budget_daily=? "
+                    "WHERE id='OBJ-AUTODEV'", (status, budget))
+        con.commit(); con.close()
+        if spent > 0:
+            day0 = ao.day_start_epoch_cest(ao.cest_day_of(NOW))
+            obs = Path(self.tmp) / "profiles/pr-ollama/quota-governor/obs"
+            obs.mkdir(parents=True, exist_ok=True)
+            with open(obs / "trace.jsonl", "w") as fh:
+                fh.write(json.dumps({"ts_epoch_utc": day0 + 3600,
+                                     "objective": "OBJ-AUTODEV",
+                                     "costUsd": spent}) + "\n")
+
+    def test_1_tagged_task_dispatches_against_balance_at_85pct(self):
+        self._seed_objectives()
+        _mk_db(self.db, [_ready(body="objective:OBJ-AUTODEV | cost:small")])
+        out = self._run(weekly_pct=85.0)
+        self.assertEqual(len(out), 1)
+        self.assertIn("asignado t_ready", out[0])
+        self.assertIn("ruta A: OBJ-AUTODEV", out[0])
+        self.assertIn("85.0%", out[0])
+        self.assertEqual(self.calls["assign"], [("t_ready", "pr-ollama")])
+
+    def test_2_exhausted_budget_retains(self):
+        self._seed_objectives(spent=3.0)
+        _mk_db(self.db, [_ready(body="objective:OBJ-AUTODEV")])
+        out = self._run(weekly_pct=85.0)
+        self.assertTrue(any("retain: t_ready" in l for l in out), out)
+        self.assertTrue(any("budget exhausted" in l for l in out), out)
+        self.assertEqual(self.calls["assign"], [])
+
+    def test_3_paused_objective_retains(self):
+        self._seed_objectives(spent=3.0, status="paused")
+        _mk_db(self.db, [_ready(body="objective:OBJ-AUTODEV")])
+        out = self._run(weekly_pct=85.0)
+        self.assertTrue(any("retain: t_ready" in l for l in out), out)
+        self.assertTrue(any("not active" in l for l in out), out)
+        self.assertEqual(self.calls["assign"], [])
+
+    def test_4_unknown_objective_is_route_b(self):
+        self._seed_objectives()
+        _mk_db(self.db, [_ready(body="objective:OBJ-GHOST")])
+        out = self._run(weekly_pct=85.0)
+        self.assertEqual(len(out), 1)
+        self.assertIn("weekly al 85.0%", out[0])
+        self.assertEqual(self.calls["assign"], [])
+        # con cuota libre el desconocido se despacha (Ruta B, sin tag)
+        out2 = self._run(weekly_pct=50.0)
+        self.assertIn("asignado t_ready", out2[0])
+        self.assertEqual(self.calls["assign"], [("t_ready", "pr-ollama")])
+
+    def test_5_untagged_task_at_85pct_not_dispatched(self):
+        self._seed_objectives()
+        _mk_db(self.db, [_ready(body="sin tag de objetivo")])
+        out = self._run(weekly_pct=85.0)
+        self.assertEqual(len(out), 1)
+        self.assertIn("weekly al 85.0%", out[0])
+        self.assertEqual(self.calls["assign"], [])
+
+    def test_6_untagged_task_at_50pct_dispatched_with_free_quota(self):
+        self._seed_objectives()
+        _mk_db(self.db, [_ready(body="sin tag de objetivo")])
+        out = self._run(weekly_pct=50.0)
+        self.assertEqual(len(out), 1)
+        self.assertIn("asignado t_ready", out[0])
+        self.assertNotIn("ruta A", out[0])
+        self.assertEqual(self.calls["assign"], [("t_ready", "pr-ollama")])
+
+    def test_7_direccion_stop_blocks_balance_route_too(self):
+        self._seed_objectives()
+        _mk_db(self.db, [_ready(body="objective:OBJ-AUTODEV")])
+        stop = cv.stop_file_path(self.home())
+        stop.parent.mkdir(parents=True, exist_ok=True)
+        stop.write_text("DIRECCION-STOP test fixture")
+        out = self._run(weekly_pct=85.0)
+        self.assertEqual(len(out), 1)
+        self.assertIn("STOP", out[0])
+        self.assertEqual(self.calls["assign"], [])
+
+    def test_8_table_inaccessible_fail_safe_to_route_b(self):
+        # 'missing' is not a reachable state (the tick's housekeeping
+        # auto-creates the table on every pass) — the fail-safe the mandate
+        # names is the INACCESSIBLE inventory (loader returns None):
+        # tagged task must then fall to Route B (no dispatch at 85%).
+        self._seed_objectives()
+        _mk_db(self.db, [_ready(body="objective:OBJ-AUTODEV")])
+        saved = cv._load_approved_objectives
+        cv._load_approved_objectives = lambda: None
+        try:
+            out = self._run(weekly_pct=85.0)
+        finally:
+            cv._load_approved_objectives = saved
+        self.assertTrue(any("weekly al 85.0%" in l for l in out), out)
+        self.assertEqual(self.calls["assign"], [])
+
+    def test_10_spend_line_after_balance_dispatch_trace(self):
+        self._seed_objectives(spent=1.20)
+        _mk_db(self.db, [])
+        out = self._run(weekly_pct=85.0)
+        self.assertTrue(any("gasto hoy OBJ-AUTODEV $1.20" in l for l in out),
+                        out)
 
 
 class TestPortability(unittest.TestCase):
