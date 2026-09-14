@@ -1,0 +1,20 @@
+name: self-governance
+description: "Envoltura estructural de la gobernanza existente (kanban, quota, crons, observability, supply, objetivos) — sin cambios de comportamiento"
+version: 1.0.0
+objective: null
+
+permissions:
+  ssh: false
+  ssh_hosts: []
+  system_paths: []
+  reversible_actions: []
+  irreversible_actions: []
+
+triggers:
+  - objective: OBJ-AUTODEV
+  - objective: OBJ-METRICS
+  - objective: OBJ-CODEQUALITY
+  - objective: OBJ-VLLM
+  - objective: OBJ-SYSADMIN
+
+scope_note: "Los componentes reales viven en sus sitios de siempre (quota_governor.py, quota_planner.py, providers.py, concurrency_guard.py, health_checks.py, scripts/quota-governor-tick.sh, scripts/bridge/, scripts/obs/, tests/). Esta capacidad NO los mueve ni los reexporta; solo declara el alcance de gobernanza y sus triggers. Cualquier operacion SSH queda fuera de esta capacidad (ssh: false) y debe pasar por sysadmin-lan."

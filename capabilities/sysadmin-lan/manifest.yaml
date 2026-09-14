@@ -1,0 +1,19 @@
+name: sysadmin-lan
+description: Gestion sysadmin de hosts en la LAN
+version: 1.0.0
+objective: OBJ-SYSADMIN
+
+permissions:
+  ssh: true
+  ssh_hosts: [gpu-host]          # solo hosts del inventario
+  system_paths: [/etc/systemd, /var/log]
+  reversible_actions: [restart, reload, enable, disable, start, stop]
+  irreversible_actions: []       # nada irreversible sin approval humano
+
+triggers:
+  - task_body_contains: "[capability: sysadmin-lan]"
+  - task_title_contains: "gpu-host"
+  - task_title_contains: "ml-host"
+  - objective: OBJ-SYSADMIN
+
+hosts_file: hosts.yaml

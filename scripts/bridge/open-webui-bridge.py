@@ -14,6 +14,19 @@ v1.3.0 — fusión de dos tareas mediador sobre la misma base v1.2.0:
     CLI actual) — ahora triage->todo vía `specify`, todo/blocked->ready vía
     `promote`; otros pares se rechazan.
 
+v1.5.0 — t_2c9322f1 (MEDIATOR 2026-09-14): capacidades modulares, SOLO
+    LECTURA. El plugin se extiende mediante capabilities/<name>/ (manifest.yaml
+    subset-YAML + skill.md + hosts.yaml). Endpoints:
+      GET /capabilities                    — inventario de capacidades
+      GET /capabilities/<name>/hosts       — inventario de hosts (si hay)
+      GET /capabilities/<name>/status      — probe SSH por host (best-effort)
+    Cero dependencias: manifests parseados con capabilities/_miniyaml.py
+    (fuente única, también usada por el guard de la capacidad). El probe SSH
+    reutiliza el mecanismo /gpu/health generalizado (_ssh_run); cualquier
+    fallo degrada a null/false, jamás bloquea el event loop. La ruta de
+    capabilities/ se resuelve como PLUGIN_REPO (BRIDGE_PLUGIN_REPO o relativa
+    al script), misma convención que /git-log.
+
 v1.4.0 — t_6c5233a8 (MEDIATOR 2026-09-14): 4 endpoints GET de monitorización
     de backups, SOLO LECTURA (nunca ejecutan backup/restore/prune):
       GET /backup/snapshots — lista de snapshots restic
@@ -36,6 +49,7 @@ import os
 import posixpath
 import re
 import subprocess
+import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
@@ -295,7 +309,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.4.0",
+    "info": {"title": "Hermes Bridge", "version": "1.5.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -327,6 +341,10 @@ OPENAPI_SPEC = {
         "/backup/health": {"get": {"summary": "Check backup system health", "description": "Verifies last snapshot age, log errors, cron presence, and repo size.", "operationId": "get_backup_health", "responses": {"200": {"description": "Health status", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_27e6f8f8 2b: GPU ml-host health (SSH probe, cacheless) ----
         "/gpu/health": {"get": {"summary": "GPU ml-host health snapshot", "description": "Probes ml-host (192.168.1.32) over SSH + vLLM HTTP API and returns temperature, VRAM, utilization, active model, service state and today's rounds. Zero dependencies (stdlib only); SSH is best-effort, every failure degrades to null/false.", "operationId": "get_gpu_health", "responses": {"200": {"description": "GPU health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_2c9322f1 v1.5: capacidades modulares (SOLO LECTURA) ----
+        "/capabilities": {"get": {"summary": "List installed modular capabilities", "description": "Returns the capability inventory read from capabilities/*/manifest.yaml in the plugin repo (subset-YAML, zero dependencies). Read-only.", "operationId": "list_capabilities", "responses": {"200": {"description": "Capabilities list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/capabilities/{name}/hosts": {"get": {"summary": "Host inventory of a capability", "description": "Returns the hosts declared in the capability's hosts.yaml (id, ip, ssh_user, permissions, deny). Read-only; 404 if the capability does not exist.", "operationId": "get_capability_hosts", "parameters": [{"name": "name", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "Host inventory", "content": {"application/json": {"schema": {"type": "object"}}}}, "404": {"description": "Capability not found"}, "503": {"description": "hosts_file unreadable"}}}},
+        "/capabilities/{name}/status": {"get": {"summary": "Live SSH status of capability hosts", "description": "Probes each host in the capability inventory over SSH (reachable, vllm service state, GPU snapshot). Best-effort: every SSH failure degrades to null/false. Only hosts declared in the inventory are ever probed.", "operationId": "get_capability_status", "parameters": [{"name": "name", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-host status", "content": {"application/json": {"schema": {"type": "object"}}}}, "404": {"description": "Capability not found"}, "503": {"description": "hosts_file unreadable"}}}},
     }
 }
 
@@ -578,17 +596,22 @@ _GPU_HOST = "hermesuser@192.168.1.32"
 _GPU_API = "http://192.168.1.32:8000"
 _GPU_ROUNDS = "/data/ml/data/hermes/logs/rounds.jsonl"
 
-def _ssh_gpu(cmd, timeout=12):
+def _ssh_run(dest, cmd, timeout=12):
+    """SSH best-effort a `dest` (user@host). Devuelve stdout o "" ante
+    cualquier fallo — nunca lanza (patrón /gpu/health)."""
     try:
         r = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=5",
              "-o", "StrictHostKeyChecking=accept-new",
              "-o", "BatchMode=yes",
-             _GPU_HOST, cmd],
+             dest, cmd],
             capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip() if r.returncode == 0 else ""
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return ""
+
+def _ssh_gpu(cmd, timeout=12):
+    return _ssh_run(_GPU_HOST, cmd, timeout=timeout)
 
 def _http_json(url, timeout=5):
     try:
@@ -679,6 +702,139 @@ def _gpu_health_snapshot():
 _GPU_HEALTH = _gpu_health_snapshot
 
 
+# ------------- v1.5 (t_2c9322f1): capacidades modulares — SOLO LECTURA ----
+# Inventario desde capabilities/ (PLUGIN_REPO/capabilities). Parseo subset-
+# YAML con la fuente única capabilities/_miniyaml.py (cero deps). El probe
+# SSH reutiliza _ssh_run; SOLO sondea hosts del inventario de la capacidad
+# pedida (jamás un dest libre del caller). Fallos → best-effort (null/false).
+
+def _capabilities_root():
+    return os.path.join(PLUGIN_REPO, "capabilities")
+
+
+def _cap_miniyaml():
+    """Carga capabilities/_miniyaml.py por ruta (sin depender de CWD ni de
+    sys.path; importlib está en stdlib)."""
+    import importlib.util
+    p = os.path.join(_capabilities_root(), "_miniyaml.py")
+    spec = importlib.util.spec_from_file_location("_miniyaml", p)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"no se puede cargar {p}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_CAP_MANIFEST_CACHE = {"ts": 0.0, "caps": None, "errors": []}
+
+
+def _load_capabilities(force=False):
+    """Lista de {name, dir, manifest} desde capabilities/*/manifest.yaml.
+    Cache 60 s (lecturas frecuentes del portal). Errores por-capacidad se
+    saltan (capacidad rota ≠ bridge roto) y quedan en `load_errors`."""
+    now = time.time()
+    if (not force and _CAP_MANIFEST_CACHE["caps"] is not None
+            and now - _CAP_MANIFEST_CACHE["ts"] < 60):
+        return _CAP_MANIFEST_CACHE["caps"]
+    root = _capabilities_root()
+    caps, load_errors = [], []
+    if os.path.isdir(root):
+        _miniyaml = _cap_miniyaml()
+        for name in sorted(os.listdir(root)):
+            mpath = os.path.join(root, name, "manifest.yaml")
+            if not os.path.isfile(mpath):
+                continue
+            try:
+                manifest = _miniyaml.load(mpath)
+                if isinstance(manifest, dict) and manifest.get("name"):
+                    caps.append({"name": manifest["name"],
+                                 "dir": name,
+                                 "manifest": manifest})
+            except Exception as e:
+                load_errors.append(f"{name}: {e}")
+    _CAP_MANIFEST_CACHE["caps"] = caps
+    _CAP_MANIFEST_CACHE["errors"] = load_errors
+    _CAP_MANIFEST_CACHE["ts"] = now
+    return caps
+
+
+def _capability_payload(cap):
+    m = cap["manifest"]
+    return {"name": cap["name"], "dir": cap["dir"],
+            "description": m.get("description"),
+            "version": m.get("version"), "objective": m.get("objective"),
+            "permissions": m.get("permissions"),
+            "triggers": m.get("triggers")}
+
+
+def _cap_find(name):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name or ""):
+        return None
+    name_l = (name or "").lower()
+    for cap in _load_capabilities():
+        if cap["dir"].lower() == name_l:
+            return cap
+    return None
+
+
+def _cap_hosts(cap):
+    """Lista de hosts del inventario de la capacidad (o None si no declara
+    hosts_file). Best-effort: error de parseo → (None, error)."""
+    m = cap["manifest"]
+    hosts_file = m.get("hosts_file")
+    if not hosts_file:
+        return None, None
+    hpath = os.path.join(cap["dir"], hosts_file)
+    full = _safe_join(_capabilities_root(), hpath)
+    if not full:
+        return None, "hosts_file fuera de capabilities/"
+    try:
+        _miniyaml = _cap_miniyaml()
+        inv = _miniyaml.load(full)
+    except Exception as e:
+        return None, f"hosts_file ilegible: {e}"
+    hosts = inv.get("hosts") if isinstance(inv, dict) else None
+    if not isinstance(hosts, list):
+        return None, "hosts.yaml sin lista 'hosts'"
+    out = []
+    for h in hosts:
+        if isinstance(h, dict) and h.get("id"):
+            out.append({"id": h.get("id"), "ip": h.get("ip"),
+                        "name": h.get("name"), "role": h.get("role"),
+                        "ssh_user": h.get("ssh_user"),
+                        "ssh_key": h.get("ssh_key"),
+                        "permissions": h.get("permissions"),
+                        "deny": h.get("deny")})
+    return out, None
+
+
+def _cap_status(cap):
+    """Probe SSH por host del inventario (best-effort, sin cache)."""
+    hosts, err = _cap_hosts(cap)
+    if err:
+        return {"capability": cap["name"], "error": err, "hosts": None}
+    probed = []
+    for h in hosts or []:
+        dest = f"{h.get('ssh_user', 'root')}@{h['ip']}"
+        probed.append({
+            "id": h.get("id"), "ip": h.get("ip"), "name": h.get("name"),
+            "reachable": bool(_ssh_run(dest, "echo ok", timeout=8)),
+            "vllm_service": _ssh_run(
+                dest, "systemctl --user is-active vllm 2>/dev/null",
+                timeout=8) or None,
+            "vllm_rounds_timer": _ssh_run(
+                dest,
+                "systemctl --user is-active vllm-rounds.timer 2>/dev/null",
+                timeout=8) or None,
+            "gpu": _ssh_run(
+                dest,
+                "nvidia-smi --query-gpu=temperature.gpu,memory.used,"
+                "memory.total,utilization.gpu --format=csv,noheader,nounits",
+                timeout=10) or None,
+        })
+    return {"capability": cap["name"], "hosts": probed}
+
+
 def _verify_logic(task):
     status = (task.get("status") or "").lower()
     if status != "done":
@@ -750,7 +906,7 @@ def _verify_logic(task):
 # ------------------------------------------------------------------- server
 
 class HermesBridge(BaseHTTPRequestHandler):
-    server_version = "HermesBridge/1.4"
+    server_version = "HermesBridge/1.5"
 
     def _send_json(self, data, code=200):
         self.send_response(code)
@@ -869,6 +1025,39 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_backup_health()
         elif path == "/gpu/health":
             self._send_json(_GPU_HEALTH())
+        elif path == "/capabilities":
+            caps = _load_capabilities()
+            self._send_json({
+                "capabilities": [_capability_payload(c) for c in caps],
+                "count": len(caps),
+                "load_errors": _CAP_MANIFEST_CACHE["errors"]})
+        elif path.startswith("/capabilities/"):
+            m = re.fullmatch(r"/capabilities/([a-z0-9][a-z0-9_-]*)"
+                             r"(/hosts|/status)?", path)
+            if not m:
+                self._send_json({"error": "invalid capability path"}, 404)
+            else:
+                cap = _cap_find(m.group(1))
+                if cap is None:
+                    self._send_json(
+                        {"error": "capability not found",
+                         "capability": m.group(1)}, 404)
+                elif m.group(2) == "/hosts":
+                    hosts, err = _cap_hosts(cap)
+                    if err:
+                        self._send_json({"error": err}, 503)
+                    elif hosts is None:
+                        self._send_json(
+                            {"capability": cap["name"], "hosts": [],
+                             "note": "capability declares no hosts_file"})
+                    else:
+                        self._send_json({"capability": cap["name"],
+                                         "hosts": hosts,
+                                         "count": len(hosts)})
+                elif m.group(2) == "/status":
+                    self._send_json(_cap_status(cap))
+                else:
+                    self._send_json(_capability_payload(cap))
         elif path == "/task":
             self._handle_get_task(qs)
         elif path == "/tasks":

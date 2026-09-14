@@ -1,0 +1,23 @@
+# Inventario de hosts de la capacidad sysadmin-lan (SINGLE SOURCE OF TRUTH).
+# Solo gpu-host por decision del mediador: no anadir hosts sin nueva tarea.
+# ssh_user verificado por sondeo real el 2026-09-14 (el body del mediador
+# decia "user", pero el acceso SSH que funciona es hermesuser).
+hosts:
+  - id: gpu-host
+    ip: 192.168.1.32
+    name: ml-host
+    role: vLLM inference server (4060 Ti 16GB)
+    ssh_user: hermesuser
+    ssh_key: ~/.ssh/id_ed25519
+    permissions:
+      - read_status          # nvidia-smi, systemctl status, journalctl, free, df, ps
+      - restart_services     # systemctl --user restart/stop/start vllm, vllm-rounds
+      - manage_models        # huggingface-cli download, vllm serve, cambiar modelo
+      - manage_packages      # pip install/show/uninstall ... vllm (nunca apt)
+      - read_files           # cat, head, tail, grep, ls, find, stat (read-only)
+      - edit_vllm_config     # escribir SOLO configs de vLLM (/data/ml, no /etc)
+    deny:
+      - edit_credentials     # nunca SSH keys, authorized_keys, .env, tokens
+      - change_network       # no iptables, networkd, nmcli, sysctl -w
+      - system_packages      # no apt install/dpkg/snap
+      - delete_data          # no rm, dd, mkfs, shred, truncate
