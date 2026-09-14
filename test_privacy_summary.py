@@ -561,9 +561,16 @@ class TestRoutingUnchanged(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_confidential_excludes_all_cloud_in_capabilities(self):
-        """PRIVACY_CAPABILITIES['confidential'] must only contain custom."""
+        """PRIVACY_CAPABILITIES['confidential'] = cloud-less providers only.
+
+        Updated for OBJ-40 (user-approved, commit 4fb7b7d): vllm-local
+        (pr-vllm, self-hosted vLLM on the LAN) qualifies for confidential
+        because its inference NEVER leaves the host/LAN — it is not a
+        cloud provider. Mirrors test_privacy_routing.py Test 7, which
+        already pins confidential == {'custom', 'vllm-local'}.
+        """
         self.assertEqual(
-            PRIVACY_CAPABILITIES["confidential"], {"custom"}
+            PRIVACY_CAPABILITIES["confidential"], {"custom", "vllm-local"}
         )
 
     def test_active_statuses_cover_pending_work(self):

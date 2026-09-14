@@ -30,8 +30,15 @@ CAPTURE = os.environ.get(
 
 if not os.path.exists(CAPTURE):
     # deployed hermes-agent checkout (not part of this repo); skip on CI
-    print("SKIP: deployed nanogpt_pricing_capture.py not found (fresh clone / CI)")
-    raise SystemExit(1 if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1" else 0)
+    _skip_msg = "SKIP: deployed nanogpt_pricing_capture.py not found (fresh clone / CI)"
+    print(_skip_msg)
+    # host verify runs want this loud; CI wants green
+    if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1":
+        raise SystemExit(1)
+    if "pytest" in sys.modules:  # collected by pytest -> skip module cleanly
+        import pytest
+        pytest.skip(_skip_msg, allow_module_level=True)
+    raise SystemExit(0)  # direct run on fresh clone: green no-op
 
 _spec = importlib.util.spec_from_file_location("nanogpt_balance_ledger", SCRIPT)
 ledger = importlib.util.module_from_spec(_spec)

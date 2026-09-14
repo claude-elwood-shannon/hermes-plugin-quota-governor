@@ -180,11 +180,22 @@ class TestIsSensitive(unittest.TestCase):
 # ── Tests: find_misrouted_sensitive_tasks ────────────────────────────────────
 
 class TestFindMisroutedSensitiveTasks(unittest.TestCase):
+    """Routing rule since OBJ-43-FIX (commit 1d71b1b, Sep 12 2026):
+
+    a sensitive task is MISROUTED only when its assignee's provider cannot
+    handle sensitive data. SENSITIVE_CAPABLE_PROFILES = {pr-ollama,
+    pr-nanogpt, pr-vllm} mirrors quota-gate.py
+    PRIVACY_CAPABILITIES["sensitive"]. Fixtures therefore misroute to
+    profiles WITHOUT sensitive capability (pr-opencode, pr-openrouter);
+    misrouting to pr-ollama is no longer a defect — pr-ollama is capable
+    (zero-retention ollama-cloud), and stealing its cards was the OBJ-43
+    bug this rule removed.
+    """
 
     def test_finds_misrouted_high_task(self):
-        """Task with privacy:high assigned to wrong profile → found."""
+        """Task with privacy:high on a capability-less profile → found."""
         db = _make_kanban_db([
-            {"id": "t_001", "body": "privacy:high\ntask body", "assignee": "pr-ollama", "status": "todo"}
+            {"id": "t_001", "body": "privacy:high\ntask body", "assignee": "pr-opencode", "status": "todo"}
         ])
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
@@ -192,13 +203,25 @@ class TestFindMisroutedSensitiveTasks(unittest.TestCase):
         conn.close()
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], "t_001")  # task_id
-        self.assertEqual(result[0][2], "pr-ollama")  # current assignee
+        self.assertEqual(result[0][2], "pr-opencode")  # current assignee
         self.assertEqual(result[0][3], "high")  # privacy value
 
     def test_skips_correctly_assigned(self):
-        """Task with privacy:high already on correct profile → not found."""
+        """Sensitive task on a CAPABLE profile (pr-nanogpt) → not flagged."""
         db = _make_kanban_db([
             {"id": "t_002", "body": "privacy:high", "assignee": "pr-nanogpt", "status": "todo"}
+        ])
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        result = find_misrouted_sensitive_tasks(conn, "pr-nanogpt")
+        conn.close()
+        self.assertEqual(result, [])
+
+    def test_skips_capable_profile_pr_vllm(self):
+        """OBJ-43-FIX regression: pr-vllm (vllm-local, inference never leaves
+        the host) is sensitive-capable — its cards must NOT be stolen."""
+        db = _make_kanban_db([
+            {"id": "t_002b", "body": "privacy:high", "assignee": "pr-vllm", "status": "ready"},
         ])
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
@@ -261,20 +284,23 @@ class TestFindMisroutedSensitiveTasks(unittest.TestCase):
 
     def test_finds_multiple_misrouted(self):
         db = _make_kanban_db([
-            {"id": "t_008", "body": "privacy:high", "assignee": "pr-ollama", "status": "todo"},
-            {"id": "t_009", "body": "privacy:sensitive", "assignee": "pr-ollama", "status": "ready"},
-            {"id": "t_010", "body": "privacy:low", "assignee": "pr-ollama", "status": "triage"},
+            {"id": "t_008", "body": "privacy:high", "assignee": "pr-opencode", "status": "todo"},
+            {"id": "t_009", "body": "privacy:sensitive", "assignee": "pr-openrouter", "status": "ready"},
+            # capable profiles are NOT misroutes even when assigned "wrong":
+            # pr-vllm handles sensitive (OBJ-40/OBJ-43-FIX), low is public
+            {"id": "t_010", "body": "privacy:high", "assignee": "pr-vllm", "status": "triage"},
+            {"id": "t_011", "body": "privacy:low", "assignee": "pr-ollama", "status": "triage"},
         ])
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
         result = find_misrouted_sensitive_tasks(conn, "pr-nanogpt")
         conn.close()
-        self.assertEqual(len(result), 2)  # high + sensitive, not low
+        self.assertEqual(len(result), 2)  # opencode + openrouter; vllm capable, low public
 
     def test_includes_status_in_result(self):
         """Result tuple includes the task status."""
         db = _make_kanban_db([
-            {"id": "t_011", "body": "privacy:medium", "assignee": "pr-ollama", "status": "triage"}
+            {"id": "t_012", "body": "privacy:medium", "assignee": "pr-openrouter", "status": "triage"}
         ])
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row

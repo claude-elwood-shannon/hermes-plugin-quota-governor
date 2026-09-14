@@ -39,13 +39,18 @@ from datetime import datetime, timezone
 SCRIPT_PATH = os.path.expanduser("~/.hermes/scripts/diagnose-crash.py")
 
 if not os.path.exists(SCRIPT_PATH):
-    skip = (
+    _skip_msg = (
         "SKIP: deployed diagnose-crash.py not found (fresh clone / CI) — "
         "nothing to test on this machine"
     )
-    print(skip)
+    print(_skip_msg)
     # host verify runs want this loud; CI wants green
-    raise SystemExit(1 if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1" else 0)
+    if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1":
+        raise SystemExit(1)
+    if "pytest" in sys.modules:  # collected by pytest -> skip module cleanly
+        import pytest
+        pytest.skip(_skip_msg, allow_module_level=True)
+    raise SystemExit(0)  # direct run on fresh clone: green no-op
 
 # Import with filename-based module
 import importlib.util
@@ -723,7 +728,11 @@ class TestSystemicCrashDetectionV12(unittest.TestCase):
             with patch("diagnose_crash.WORKER_LOGS_DIR", logdir):
                 with patch("diagnose_crash.DIAGNOSES_FILE", diag_file):
                     with patch("diagnose_crash.create_diagnostic_task") as m:
-                        with contextlib.redirect_stdout(captured):
+                        # main() calls argparse.parse_args(); under pytest
+                        # sys.argv carries pytest's own flags — pin the
+                        # argv the script would see when run bare.
+                        with patch("sys.argv", ["diagnose-crash.py"]), \
+                                contextlib.redirect_stdout(captured):
                             diagnose_crash.main()
         self.assertEqual(m.call_count, 0)  # NO diagnostic task created
         self.assertFalse(os.path.exists(diag_file))  # nothing recorded
@@ -753,7 +762,11 @@ class TestSystemicCrashDetectionV12(unittest.TestCase):
                         "diagnose_crash.create_diagnostic_task",
                         return_value="t_diag_new",
                     ) as m:
-                        with contextlib.redirect_stdout(captured):
+                        # main() calls argparse.parse_args(); under pytest
+                        # sys.argv carries pytest's own flags — pin the
+                        # argv the script would see when run bare.
+                        with patch("sys.argv", ["diagnose-crash.py"]), \
+                                contextlib.redirect_stdout(captured):
                             diagnose_crash.main()
         self.assertEqual(m.call_count, 1)
         out = captured.getvalue()

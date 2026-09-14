@@ -28,9 +28,16 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PLUGIN_DIR)
 
 # Isolate HERMES_HOME and kanban DB
+# pytest collection safety: this mutation MUST NOT run under pytest. The
+# wrapper test (below) re-runs the whole check set in a SUBPROCESS where
+# HERMES_HOME / HERMES_KANBAN_DB / HOME are (re)isolated; mutating them in
+# the pytest process would leak into sibling files collected later in the
+# same interpreter (importlib mode). Under pytest the skip check below
+# still uses the real VERIFY_TASK_SCRIPT path resolved from the true HOME.
 TEST_HOME = tempfile.mkdtemp(prefix="qg-verify-hook-test-")
-os.environ["HERMES_HOME"] = TEST_HOME
-os.environ["HERMES_KANBAN_DB"] = os.path.join(TEST_HOME, "kanban.db")
+if "pytest" not in sys.modules:
+    os.environ["HERMES_HOME"] = TEST_HOME
+    os.environ["HERMES_KANBAN_DB"] = os.path.join(TEST_HOME, "kanban.db")
 
 # The verify-task.py SCRIPT lives in the real Hermes home; resolve it
 # BEFORE the HOME override below (expanduser would resolve to TEST_HOME).
@@ -40,13 +47,21 @@ VERIFY_TASK_SCRIPT = os.environ.get(
 
 if not os.path.exists(VERIFY_TASK_SCRIPT):
     # deployed script (not part of this repo); skip on CI / fresh clones
-    print("SKIP: deployed verify-task.py not found (fresh clone / CI)")
-    raise SystemExit(1 if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1" else 0)
+    _skip_msg = "SKIP: deployed verify-task.py not found (fresh clone / CI)"
+    print(_skip_msg)
+    # host verify runs want this loud; CI wants green
+    if os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1":
+        raise SystemExit(1)
+    if "pytest" in sys.modules:  # collected by pytest -> skip module cleanly
+        import pytest
+        pytest.skip(_skip_msg, allow_module_level=True)
+    raise SystemExit(0)  # direct run on fresh clone: green no-op
 
 # Also set the verifications file to the test home
 # verify-task.py uses ~/.hermes/quota-governor/verifications.jsonl
 # We need to override HOME to isolate
-os.environ["HOME"] = TEST_HOME
+if "pytest" not in sys.modules:
+    os.environ["HOME"] = TEST_HOME
 
 PASS = 0
 FAIL = 0
@@ -123,7 +138,7 @@ def setup_kanban_db_with_done_task(task_id, title, summary_text="", workspace_pa
 
 # ── Test 1: verify-task.py --task-id mode (VERIFIED) ────────────────────────
 
-def test_verify_single_task_verified():
+def check_verify_single_task_verified():
     """Test that --task-id mode verifies a done task and writes a record."""
     print("\n--- Test 1: verify-task.py --task-id (VERIFIED) ---")
 
@@ -191,7 +206,7 @@ def test_verify_single_task_verified():
 
 # ── Test 2: verify-task.py --task-id mode (PHANTOM) ─────────────────────────
 
-def test_verify_single_task_phantom():
+def check_verify_single_task_phantom():
     """Test that --task-id mode detects a phantom-done task."""
     print("\n--- Test 2: verify-task.py --task-id (PHANTOM) ---")
 
@@ -248,7 +263,7 @@ def test_verify_single_task_phantom():
 
 # ── Test 3: verify-task.py --task-id non-existent task ──────────────────────
 
-def test_verify_single_task_not_found():
+def check_verify_single_task_not_found():
     """Test that --task-id mode handles non-existent task gracefully."""
     print("\n--- Test 3: verify-task.py --task-id (not found) ---")
 
@@ -282,7 +297,7 @@ def test_verify_single_task_not_found():
 
 # ── Test 4: _spawn_verify_task spawns subprocess ────────────────────────────
 
-def test_spawn_verify_task():
+def check_spawn_verify_task():
     """Test that _spawn_verify_task spawns a subprocess."""
     print("\n--- Test 4: _spawn_verify_task spawns subprocess ---")
 
@@ -329,7 +344,7 @@ def test_spawn_verify_task():
 
 # ── Test 5: _spawn_verify_task with missing script ──────────────────────────
 
-def test_spawn_verify_task_missing_script():
+def check_spawn_verify_task_missing_script():
     """Test that _spawn_verify_task handles missing script gracefully."""
     print("\n--- Test 5: _spawn_verify_task (missing script) ---")
 
@@ -357,7 +372,7 @@ def test_spawn_verify_task_missing_script():
 
 # ── Test 6: Idempotency — --task-id always verifies ─────────────────────────
 
-def test_task_id_bypasses_idempotency():
+def check_task_id_bypasses_idempotency():
     """Test that --task-id mode verifies even if already in verifications.jsonl."""
     print("\n--- Test 6: --task-id bypasses idempotency ---")
 
@@ -412,17 +427,24 @@ def test_task_id_bypasses_idempotency():
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
+    """Run the 6 verify-hook checks. Returns 0/1 exit code.
+
+    pytest collection safety: mutates os.environ (HERMES_HOME,
+    HERMES_KANBAN_DB, HOME=TEST_HOME) at import time — the subprocess
+    wrapper keeps that out of the pytest interpreter collecting sibling
+    files. Direct invocation runs the checks in-process as before.
+    """
     print("=" * 70)
     print("OBJ-11 Phase 2: verify-task hook tests")
     print("=" * 70)
 
-    test_verify_single_task_verified()
-    test_verify_single_task_phantom()
-    test_verify_single_task_not_found()
-    test_spawn_verify_task()
-    test_spawn_verify_task_missing_script()
-    test_task_id_bypasses_idempotency()
+    check_verify_single_task_verified()
+    check_verify_single_task_phantom()
+    check_verify_single_task_not_found()
+    check_spawn_verify_task()
+    check_spawn_verify_task_missing_script()
+    check_task_id_bypasses_idempotency()
 
     print("\n" + "=" * 70)
     print(f"Results: {PASS} passed, {FAIL} failed")
@@ -430,5 +452,26 @@ if __name__ == "__main__":
 
     # Cleanup
     shutil.rmtree(TEST_HOME, ignore_errors=True)
+    return 0 if FAIL == 0 else 1
 
-    sys.exit(1 if FAIL > 0 else 0)
+
+# ── Tests: pytest wrapper (canonical batch) ─────────────────────────────────
+def test_full_suite():
+    """Run the 6 verify-hook checks; assert 0 failed."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    result = subprocess.run(
+        [sys.executable, os.path.join(repo, "test_verify_hook.py")],
+        capture_output=True, text=True, timeout=120,
+    )
+    print(result.stdout[-2000:] if result.stdout else "")
+    print(result.stderr[-2000:] if result.stderr else "")
+    assert result.returncode == 0, (
+        "self-run failed (rc=%d); see captured output above" % result.returncode
+    )
+    summary = [ln for ln in result.stdout.splitlines() if "passed," in ln]
+    assert summary, "summary line with 'passed,' not found in output"
+    assert "0 failed" in summary[-1], "unexpected: " + summary[-1]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
