@@ -14,6 +14,14 @@ v1.3.0 — fusión de dos tareas mediador sobre la misma base v1.2.0:
     CLI actual) — ahora triage->todo vía `specify`, todo/blocked->ready vía
     `promote`; otros pares se rechazan.
 
+v1.6.0 — t_74f5f315 (MEDIATOR 2026-09-14): métricas Prometheus.
+      GET /metrics-prometheus — texto Prometheus 0.0.4 (pull-only): tasks
+      por status, gasto/presupuesto por objetivo, cuota sesión/semana,
+      efficiency ratio, supply_ratio, cron health, GPU ml-host (cache 60s
+      para no golpear SSH/vLLM en cada scrape). Zero dependencies; toda
+      fuente de datos falla best-effort (métrica ausente ≠ endpoint roto).
+      El bridge no empuja nada a ningún servicio observability.
+
 v1.5.0 — t_2c9322f1 (MEDIATOR 2026-09-14): capacidades modulares, SOLO
     LECTURA. El plugin se extiende mediante capabilities/<name>/ (manifest.yaml
     subset-YAML + skill.md + hosts.yaml). Endpoints:
@@ -309,7 +317,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.5.0",
+    "info": {"title": "Hermes Bridge", "version": "1.6.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -341,6 +349,8 @@ OPENAPI_SPEC = {
         "/backup/health": {"get": {"summary": "Check backup system health", "description": "Verifies last snapshot age, log errors, cron presence, and repo size.", "operationId": "get_backup_health", "responses": {"200": {"description": "Health status", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_27e6f8f8 2b: GPU ml-host health (SSH probe, cacheless) ----
         "/gpu/health": {"get": {"summary": "GPU ml-host health snapshot", "description": "Probes ml-host (192.168.1.32) over SSH + vLLM HTTP API and returns temperature, VRAM, utilization, active model, service state and today's rounds. Zero dependencies (stdlib only); SSH is best-effort, every failure degrades to null/false.", "operationId": "get_gpu_health", "responses": {"200": {"description": "GPU health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_74f5f315 v1.6: métricas Prometheus (texto 0.0.4) ----
+        "/metrics-prometheus": {"get": {"summary": "Prometheus metrics", "description": "Returns bridge/board metrics as Prometheus text format 0.0.4 (pull-only): tasks by status, objective spend/budget, quotas, supply ratio, cron health, GPU ml-host. All sources best-effort; zero dependencies.", "operationId": "get_metrics_prometheus", "responses": {"200": {"description": "Prometheus exposition", "content": {"text/plain": {"schema": {"type": "string"}}}}}}},
         # ---- t_2c9322f1 v1.5: capacidades modulares (SOLO LECTURA) ----
         "/capabilities": {"get": {"summary": "List installed modular capabilities", "description": "Returns the capability inventory read from capabilities/*/manifest.yaml in the plugin repo (subset-YAML, zero dependencies). Read-only.", "operationId": "list_capabilities", "responses": {"200": {"description": "Capabilities list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/capabilities/{name}/hosts": {"get": {"summary": "Host inventory of a capability", "description": "Returns the hosts declared in the capability's hosts.yaml (id, ip, ssh_user, permissions, deny). Read-only; 404 if the capability does not exist.", "operationId": "get_capability_hosts", "parameters": [{"name": "name", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "Host inventory", "content": {"application/json": {"schema": {"type": "object"}}}}, "404": {"description": "Capability not found"}, "503": {"description": "hosts_file unreadable"}}}},
@@ -835,6 +845,219 @@ def _cap_status(cap):
     return {"capability": cap["name"], "hosts": probed}
 
 
+# ------------- v1.6 (t_74f5f315): métricas Prometheus (pull-only) -----------
+# GET /metrics-prometheus -> texto Prometheus 0.0.4. Fuentes, todas
+# best-effort (si una falla, su métrica simplemente no sale; el resto sí):
+#   * kanban.db read-only -> tasks por status + gasto/presupuesto por objetivo
+#   * metrics-history.jsonl (última entrada) -> cuota sesión/semana,
+#     supply_ratio, balance NanoGPT
+#   * cron-health-check.log (última línea) -> crons OK/DEAD/ZOMBIE/NEVER_RUN
+#   * _gpu_health_snapshot() (cache 60s) -> GPU ml-host
+# Zero dependencies; el endpoint SOLO lee: nunca empuja a ningún servicio.
+# El formato 0.0.4 exige escape de \" y \\ en label values (y \n) — se hace
+# en _pm_label. Números no finitos se emiten como NaN/+Inf/-Inf textuales.
+
+_METRICS_PROM_CACHE = {"ts": 0.0, "gpu": {}}
+_METRICS_PROM_GPU_TTL = 60.0  # s: /gpu/health hace SSH + HTTP; no por scrape
+
+
+def _pm_escape_label(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _pm_fmt_val(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if f != f:
+            return "NaN"
+        if f == float("inf"):
+            return "+Inf"
+        if f == float("-inf"):
+            return "-Inf"
+        if f == int(f) and abs(f) < 1e15:
+            return str(int(f))
+        return repr(f)
+    return str(v)
+
+
+def _pm_series(buf, name, mtype, help_txt, samples, emitted):
+    """Añade HELP/TYPE + samples a `buf` una sola vez por nombre de métrica.
+    samples: lista de (labels_dict | None, value)."""
+    if not samples or name in emitted:
+        return
+    emitted.add(name)
+    buf.append(f"# HELP {name} {help_txt}")
+    buf.append(f"# TYPE {name} {mtype}")
+    for labels, val in samples:
+        if labels:
+            lab = ",".join(
+                f'{k}="{_pm_escape_label(v)}"' for k, v in labels.items())
+            buf.append(f"{name}{{{lab}}} {_pm_fmt_val(val)}")
+        else:
+            buf.append(f"{name} {_pm_fmt_val(val)}")
+
+
+def _metrics_prom_tasks(buf, emitted):
+    """Tasks por status + gasto/presupuesto por objetivo (kanban.db RO)."""
+    import sqlite3
+    dbp = _AO_DB
+    if not os.path.exists(dbp):
+        return
+    try:
+        con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            counts = {}
+            for r in con.execute("SELECT status, COUNT(*) c FROM tasks "
+                                 "GROUP BY status"):
+                counts[(r["status"] or "none")] = r["c"]
+            _pm_series(buf, "hermes_tasks", "gauge",
+                       "Kanban tasks by status",
+                       [({"status": s}, c) for s, c in sorted(counts.items())],
+                       emitted)
+            # Spec Parte 3: gauges planos hermes_tasks_<status> (subset de
+            # status; un status sin filas no existe en la tabla).
+            for s in ("done", "running", "blocked", "triage", "ready"):
+                _pm_series(buf, f"hermes_tasks_{s}", "gauge",
+                           f"Kanban tasks in status '{s}'",
+                           [(None, counts[s])] if s in counts else [],
+                           emitted)
+            _pm_series(buf, "hermes_objective_spent_today", "gauge",
+                       "Spent today by objective",
+                       [({"objective": r["id"]}, r["spent_today"])
+                        for r in con.execute(
+                            "SELECT id, spent_today FROM approved_objectives "
+                            "ORDER BY id")
+                        if r["spent_today"] is not None],
+                       emitted)
+            _pm_series(buf, "hermes_objective_budget_daily", "gauge",
+                       "Daily budget by objective",
+                       [({"objective": r["id"]}, r["budget_daily"])
+                        for r in con.execute(
+                            "SELECT id, budget_daily FROM approved_objectives "
+                            "WHERE status='active' ORDER BY id")],
+                       emitted)
+        finally:
+            con.close()
+    except Exception:
+        pass
+
+
+def _metrics_prom_history(buf, emitted):
+    """Última entrada de metrics-history.jsonl -> cuotas, supply, balance."""
+    hist = _read_jsonl(METRICS_JSONL)
+    if not hist:
+        return
+    last = hist[-1]
+    pairs = [
+        ("hermes_quota_session_percent",
+         "Session quota percentage", last.get("ollama_session_pct")),
+        ("hermes_quota_weekly_percent",
+         "Weekly quota percentage", last.get("ollama_weekly_pct")),
+        ("hermes_quota_nanogpt_weekly_percent",
+         "NanoGPT weekly quota percentage", last.get("nanogpt_weekly_pct")),
+        ("hermes_quota_nanogpt_balance_usd",
+         "NanoGPT account balance in USD", last.get("nanogpt_balance_usd")),
+        ("hermes_quota_nanogpt_window_spent_usd",
+         "NanoGPT spend in current window in USD",
+         last.get("nanogpt_window_spent_usd")),
+        ("hermes_supply_ratio",
+         "Supply ratio (tasks created/closed in 24h)",
+         last.get("supply_ratio")),
+        ("hermes_suppliers_ok", "Providers OK count",
+         last.get("providers_ok")),
+    ]
+    for name, helptxt, val in pairs:
+        if val is None:
+            continue
+        _pm_series(buf, name, "gauge", helptxt, [(None, val)], emitted)
+
+
+def _metrics_prom_crons(buf, emitted):
+    """Última línea del log de cron-health-check -> crons OK/DEAD/..."""
+    logp = os.path.join(HERMES_HOME, "logs", "cron-health-check.log")
+    try:
+        with open(logp, encoding="utf-8", errors="replace") as f:
+            lines = [ln for ln in f if ln.strip()]
+        if not lines:
+            return
+        m = re.search(r"checked (\d+) — (\d+) OK, (\d+) DEAD, "
+                      r"(\d+) NEVER_RUN, (\d+) ZOMBIE", lines[-1])
+        if not m:
+            return
+        total, ok, dead, never, zombie = (int(m.group(i)) for i in range(1, 6))
+        vals = {"ok": ok, "dead": dead, "never_run": never, "zombie": zombie}
+        _pm_series(buf, "hermes_crons", "gauge",
+                   "Cron health by state (from cron-health-check)",
+                   [({"state": k}, v) for k, v in sorted(vals.items())],
+                   emitted)
+        _pm_series(buf, "hermes_crons_checked", "gauge",
+                   "Crons checked in last health check", [(None, total)],
+                   emitted)
+    except OSError:
+        pass
+
+
+def _metrics_prom_gpu(buf, emitted):
+    """GPU ml-host vía /gpu/health con cache 60s (SSH + HTTP costosos)."""
+    now = time.time()
+    if not _METRICS_PROM_CACHE["gpu"] or \
+            now - _METRICS_PROM_CACHE["ts"] > _METRICS_PROM_GPU_TTL:
+        try:
+            _METRICS_PROM_CACHE["gpu"] = _GPU_HEALTH() or {}
+        except Exception:
+            _METRICS_PROM_CACHE["gpu"] = {}
+        _METRICS_PROM_CACHE["ts"] = now
+    g = _METRICS_PROM_CACHE["gpu"]
+    if not isinstance(g, dict) or not g:
+        return
+    _pm_series(buf, "hermes_gpu_temp_c", "gauge",
+               "GPU temperature in Celsius (ml-host)",
+               [(None, g["temp_c"])] if isinstance(g.get("temp_c"),
+                                                   (int, float)) else [],
+               emitted)
+    _pm_series(buf, "hermes_gpu_vram_used_mib", "gauge",
+               "GPU VRAM used in MiB (ml-host)",
+               [(None, g["vram_used_mib"])]
+               if isinstance(g.get("vram_used_mib"), (int, float)) else [],
+               emitted)
+    _pm_series(buf, "hermes_gpu_vram_total_mib", "gauge",
+               "GPU VRAM total in MiB (ml-host)",
+               [(None, g["vram_total_mib"])]
+               if isinstance(g.get("vram_total_mib"), (int, float)) else [],
+               emitted)
+    _pm_series(buf, "hermes_gpu_util_percent", "gauge",
+               "GPU utilization percent (ml-host)",
+               [(None, g["util_pct"])]
+               if isinstance(g.get("util_pct"), (int, float)) else [],
+               emitted)
+    _pm_series(buf, "hermes_gpu_rounds_today", "gauge",
+               "vLLM rounds today (ml-host)",
+               [(None, g["rounds_today"])]
+               if isinstance(g.get("rounds_today"), int) else [],
+               emitted)
+    _pm_series(buf, "hermes_gpu_rounds_timer_active", "gauge",
+               "vLLM rounds timer active (ml-host; 1=active)",
+               [(None, 1 if g.get("rounds_timer") == "active" else 0)]
+               if g.get("rounds_timer") is not None else [],
+               emitted)
+
+
+def _metrics_prom_text():
+    buf, emitted = [], set()
+    _metrics_prom_tasks(buf, emitted)
+    _metrics_prom_history(buf, emitted)
+    _metrics_prom_crons(buf, emitted)
+    _metrics_prom_gpu(buf, emitted)
+    # El propio bridge, autoobservado (estilo process_*/up)
+    _pm_series(buf, "hermes_bridge_up", "gauge",
+               "Bridge reachable (always 1 when this line is served)",
+               [(None, 1)], emitted)
+    return "\n".join(buf) + "\n"
+
+
 def _verify_logic(task):
     status = (task.get("status") or "").lower()
     if status != "done":
@@ -906,7 +1129,7 @@ def _verify_logic(task):
 # ------------------------------------------------------------------- server
 
 class HermesBridge(BaseHTTPRequestHandler):
-    server_version = "HermesBridge/1.5"
+    server_version = "HermesBridge/1.6"
 
     def _send_json(self, data, code=200):
         self.send_response(code)
@@ -1066,6 +1289,15 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_git_log(qs)
         elif path == "/metrics":
             self._handle_metrics(qs)
+        elif path == "/metrics-prometheus":
+            # v1.6 (t_74f5f315): texto Prometheus 0.0.4, pull-only
+            body = _metrics_prom_text().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/objectives":
             status = (qs.get("status") or [None])[0]
             rows = _ao_list(status)
@@ -1437,7 +1669,7 @@ class HermesBridge(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Hermes Bridge API v1.4 on http://0.0.0.0:{PORT}")
+    print(f"Hermes Bridge API v1.6 on http://0.0.0.0:{PORT}")
     HTTPServer(("0.0.0.0", PORT), HermesBridge).serve_forever()
 
 
