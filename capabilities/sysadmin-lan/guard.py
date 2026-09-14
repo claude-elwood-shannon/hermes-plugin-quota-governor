@@ -83,9 +83,7 @@ _PERM_PATTERNS = [
         r"\bpstree\b|\bsensors\b|\blspci\b|\blsusb\b|\buname\b|"
         r"\bhostnamectl\b|\btimedatectl\b|\biostat\b|\bvmstat\b|"
         r"\bdocker\s+(ps|images|image\s+ls|info|version)\b|"
-        r"\bdocker\s+volume\s+ls\b|\bss\s+-tln\b|\bcat\s+/proc/sys/|"
-        # probes HTTP de lectura (health checks de servicios LAN)
-        r"\bcurl\s+(?:-[a-zA-Z]+\s+)*https?://")),
+        r"\bdocker\s+volume\s+ls\b|\bss\s+-tln\b|\bcat\s+/proc/sys/")),
     ("read_files", re.compile(
         r"(^|[;&|]|\$\(|`|\bsudo\s+|\bdoas\s+)\s*"
         r"(cat|head|tail|less|more|grep|egrep|fgrep|rg|ls|stat|wc|file|diff|"
@@ -155,6 +153,25 @@ def _edit_compose_ok(cmd):
         and not _COMPOSE_SYSTEM_RE.search(cmd)
 
 
+# curl como probe de LECTURA (health checks LAN, t_74f5f315): solo el tramo
+# del comando hasta el primer pipe/;/&; se excluye todo curl mutante
+# (POST/PUT/DELETE/PATCH, data, upload, form).
+_CURL_MUTATE_RE = re.compile(
+    r"(^|\s)(-d\b|--data\b|--data-raw\b|--data-binary\b|--data-urlencode\b|"
+    r"-T\b|--upload-file\b|--form\b|-F\b|"
+    r"-X\s*(POST|PUT|DELETE|PATCH)\b|--request\s+(POST|PUT|DELETE|PATCH)\b)")
+_CURL_SPLIT_RE = re.compile(r"[|;&`]|\$\(")
+
+
+def _curl_read_ok(cmd):
+    segs = _CURL_SPLIT_RE.split(cmd)
+    return any(
+        s.lstrip().startswith(("curl ", "curl")) and s.strip() != "curl"
+        and not _CURL_MUTATE_RE.search(s)
+        and re.search(r"https?://", s)
+        for s in segs)
+
+
 def check_command(cmd, permissions, deny):
     """Devuelve {'allowed', 'verdict', 'rule', 'reason'} para un comando
     REMOTO (sin el prefijo ssh). deny primero, luego permissions, luego
@@ -176,6 +193,10 @@ def check_command(cmd, permissions, deny):
         return {"allowed": True, "verdict": "allowed",
                 "rule": "edit_compose_files",
                 "reason": "write to compose surface (no system paths)"}
+    if "read_status" in permissions and _curl_read_ok(cmd):
+        return {"allowed": True, "verdict": "allowed",
+                "rule": "read_status",
+                "reason": "curl GET-style probe (no mutating flags)"}
     return {"allowed": False, "verdict": "blocked", "rule": None,
             "reason": "operation not permitted by sysadmin-lan manifest"}
 
