@@ -30,6 +30,78 @@ el stack recién arrancado y scrapeando; no son cifras de folleto.
   (vm.max_map_count del host es 65530 y no hay sudo para subirlo). NO usar
   `es.enforce.bootstrap.checks` — ese setting no existe y tumba el arranque.
 
+## ACTUALIZACIÓN t_9e457672 — OpenObserve + Grafana como arquitectura principal
+
+El mediador actualizó el diseño: OpenObserve es el backend unificado
+(métricas+logs+traces) y Grafana el frontend; Elasticsearch queda como
+aprendizaje legacy y Prometheus como scraper opcional con remote_write hacia
+OpenObserve. Convergencia aplicada SIN destruir el despliegue de t_74f5f315
+(backup previo en `backup_t_74f5f315_*` dentro del árbol compose).
+
+### Estado final (verificado en vivo 2026-09-14/15)
+
+| Pieza | Estado |
+|---|---|
+| OpenObserve :5080 | up; remote_write ingiriendo (12x HTTP 200/2min) |
+| Grafana :3000 | grafana:9.5.21; plugin `openobserve` cargado; 4 datasources; 7 dashboards |
+| Prometheus :9090 | up; scrapea bridge+vLLM y remote_write → OpenObserve (200) |
+| Elasticsearch :9200 | up (aprendizaje legacy; el backend principal es OpenObserve) |
+| Cadena E2E | Grafana → datasource OpenObserve → `hermes_bridge_up{instance="192.168.1.57:9120"}` con valor real |
+
+Datasources de Grafana: `prometheus` (default, dashboards de t_74f5f315),
+`prometheus-oo` (API PromQL de OpenObserve), `openobserve` (plugin) y
+`elasticsearch`. Dashboards nuevos: **OpenObserve Ingest**
+(`hermes-openobserve-ingest`) y **Bridge Prometheus (OpenObserve)**
+(`hermes-bridge-openobserve`), ambos consultando OpenObserve.
+
+### Hallazgos vivos (costaron depuración real — no repetir)
+
+1. **El plugin ID del catalogo NO existe**: `openobserve-openobserve-datasource`
+   da 404 en grafana.com (`GF_INSTALL_PLUGINS` habría fallado en silencio). El
+   plugin oficial (`openobserve/openobserve-grafana-plugin`, id `openobserve`)
+   NO está en el catálogo: se instala con el tarball S3 del propio proyecto
+   (`https://zincsearch-releases.s3.us-west-2.amazonaws.com/zo_gp/zo_gp.tar.gz`)
+   extraído en `./grafana/plugins/` y montado en `/var/lib/grafana/plugins`,
+   más `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=openobserve` (no firmado).
+2. **Versión de Grafana**: el plugin declara `grafanaDependency ^9.3.8` —
+   `grafana:latest` (12.x) no lo cargaría. Pinea `grafana/grafana:9.5.21` con
+   volumen NUEVO (`grafana_data_9_5`): Grafana no soporta downgrade de su DB
+   y reusar el volumen de 12.x rompe el arranque.
+3. **El plugin es frontend-only**: no trae backend, sus queries van por el
+   proxy HTTP de Grafana (`/api/datasources/proxy/...`) y usan SQL contra
+   `_search`. Los streams de MÉTRICAS no se exponen por SQL (solo por la API
+   PromQL en `/api/{org}/prometheus/api/v1/*`), de ahí el datasource
+   `prometheus-oo` para los paneles de métricas. `basicAuthPassword` de
+   provisioning va SIEMPRE bajo `secureJsonData` (top-level se ignora
+   silenciosamente → auth vacía → 401).
+4. **`--enable-feature=expand-env` NO expande `basic_auth.password`** del
+   remote_write (capturado en el wire con un sink: envía el literal
+   `${ZO_ROOT_USER_PASSWORD}` → 401). Solución aplicada: el password se
+   escribe a `/tmp/zo_pw` DENTRO del contenedor al arrancar (command compose
+   con `entrypoint: /bin/sh` — la imagen trae `ENTRYPOINT /bin/prometheus` y
+   un `command /bin/sh` le llega como argumento inválido) y se referencia con
+   `password_file`. El secreto vive SOLO en
+   `~/git/docker-compose/openobserve/.env` (chmod 600, symlink como
+   `.env` del proyecto observability; Grafana lo consume vía env en
+   provisioning).
+5. **remote_write a OpenObserve** (docs oficiales): URL
+   `http://<host>:5080/api/default/prometheus/api/v1/write` con basic auth;
+   verificado 401 sin auth / datos visibles por PromQL con auth.
+
+### Cómo se verifica
+
+```bash
+# ingesta (debe listar 200s recientes)
+ssh iinstances@192.168.1.23 'docker logs openobserve --since 2m | grep prometheus/api/v1/write | grep -c 200'
+# datos reales en el backend unificado
+curl -s -u admin@hermes.local:*** 'http://192.168.1.23:5080/api/default/prometheus/api/v1/query?query=hermes_bridge_up'
+# cadena completa Grafana → OpenObserve
+curl -s -u admin:admin -X POST http://192.168.1.23:3000/api/ds/query \
+  -H 'Content-Type: application/json' \
+  -d '{"queries":[{"refId":"A","datasource":{"type":"prometheus","uid":"prometheus-oo"},"expr":"hermes_bridge_up","instant":true}],"from":"now-15m","to":"now"}'
+```
+
+
 ## Comparación (tabla del mediador + medición propia)
 
 | Aspecto | Prometheus + Elasticsearch + Grafana | OpenObserve |
