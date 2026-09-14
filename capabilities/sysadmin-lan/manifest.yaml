@@ -5,7 +5,7 @@ objective: OBJ-SYSADMIN
 
 permissions:
   ssh: true
-  ssh_hosts: [gpu-host]          # solo hosts del inventario
+  ssh_hosts: [gpu-host, services-host]   # solo hosts del inventario
   system_paths: [/etc/systemd, /var/log]
   reversible_actions: [restart, reload, enable, disable, start, stop]
   irreversible_actions: []       # nada irreversible sin approval humano
@@ -14,6 +14,8 @@ triggers:
   - task_body_contains: "[capability: sysadmin-lan]"
   - task_title_contains: "gpu-host"
   - task_title_contains: "ml-host"
+  - task_title_contains: "services-host"
+  - task_title_contains: "observability"
   - objective: OBJ-SYSADMIN
 
 hosts_file: hosts.yaml

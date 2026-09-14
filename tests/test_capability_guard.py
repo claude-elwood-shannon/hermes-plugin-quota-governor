@@ -297,10 +297,10 @@ class TestApprovedObjective(unittest.TestCase):
 class TestBridgeCapabilitiesEndpoints(unittest.TestCase):
     """SC7/SC8 + negative paths. /status valida estructura (best-effort)."""
 
-    def test_openapi_v15_lists_capabilities(self):
+    def test_openapi_v16_lists_capabilities(self):
         code, body = req("/openapi.json")
         self.assertEqual(code, 200)
-        self.assertEqual(body["info"]["version"], "1.5.0")
+        self.assertEqual(body["info"]["version"], "1.6.0")
         self.assertIn("/capabilities", body["paths"])
         self.assertIn("/capabilities/{name}/hosts", body["paths"])
         self.assertIn("/capabilities/{name}/status", body["paths"])
@@ -317,12 +317,17 @@ class TestBridgeCapabilitiesEndpoints(unittest.TestCase):
     def test_sysadmin_lan_hosts(self):
         code, body = req("/capabilities/sysadmin-lan/hosts")
         self.assertEqual(code, 200)
-        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["count"], 2)  # gpu-host + services-host (t_74f5f315)
         h = body["hosts"][0]
         self.assertEqual(h["id"], "gpu-host")
         self.assertEqual(h["ip"], "192.168.1.32")
         self.assertEqual(h["ssh_user"], "hermesuser")
         self.assertIn("edit_credentials", h["deny"])
+        h2 = body["hosts"][1]
+        self.assertEqual(h2["id"], "services-host")
+        self.assertEqual(h2["ip"], "192.168.1.23")
+        self.assertEqual(h2["ssh_user"], "iinstances")
+        self.assertIn("system_packages", h2["deny"])
 
     def test_self_governance_no_hosts(self):
         code, body = req("/capabilities/self-governance/hosts")
@@ -334,7 +339,7 @@ class TestBridgeCapabilitiesEndpoints(unittest.TestCase):
         code, body = req("/capabilities/sysadmin-lan/status")
         self.assertEqual(code, 200)
         self.assertEqual(body["capability"], "sysadmin-lan")
-        self.assertEqual(len(body["hosts"]), 1)
+        self.assertEqual(len(body["hosts"]), 2)
         h = body["hosts"][0]
         self.assertEqual(h["id"], "gpu-host")
         self.assertIsInstance(h["reachable"], bool)

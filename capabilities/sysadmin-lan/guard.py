@@ -81,7 +81,9 @@ _PERM_PATTERNS = [
         r"show|list-units|list-timers|list-dependencies|cat)\b|"
         r"\bjournalctl\b|\buptime\b|\bfree\b|\bdf\b|\bps\b|\btop\s+-b\b|"
         r"\bpstree\b|\bsensors\b|\blspci\b|\blsusb\b|\buname\b|"
-        r"\bhostnamectl\b|\btimedatectl\b|\biostat\b|\bvmstat\b")),
+        r"\bhostnamectl\b|\btimedatectl\b|\biostat\b|\bvmstat\b|"
+        r"\bdocker\s+(ps|images|image\s+ls|info|version)\b|"
+        r"\bdocker\s+volume\s+ls\b|\bss\s+-tln\b|\bcat\s+/proc/sys/")),
     ("read_files", re.compile(
         r"(^|[;&|]|\$\(|`|\bsudo\s+|\bdoas\s+)\s*"
         r"(cat|head|tail|less|more|grep|egrep|fgrep|rg|ls|stat|wc|file|diff|"
@@ -98,7 +100,23 @@ _PERM_PATTERNS = [
     ("manage_packages", re.compile(
         r"(^|[;&|]|\$\(|`|\bsudo\s+|\bdoas\s+)\s*pip3?\s+"
         r"(install|download|show|list|uninstall|cache)\b[^;&|]*\bvllm\b")),
-    # edit_vllm_config se evalúa a nivel de función (ver _edit_vllm_ok).
+    # --- services-host (t_74f5f315): docker/compose ---
+    ("restart_containers", re.compile(
+        r"(^|[;&|]|\$\(|`|\bsudo\s+|\bdoas\s+)\s*docker\s+"
+        r"(restart|stop|start|pause|unpause)\s+\S|"
+        r"\bdocker\s+compose\s+(restart|stop|start)\b")),
+    ("manage_compose", re.compile(
+        r"\bdocker\s+compose\s+(up|down|stop|start|restart|pull|build|ps|"
+        r"config|logs|events|top|port)\b")),
+    ("deploy_services", re.compile(
+        r"\bdocker\s+compose\s+(up|pull|down)\b")),
+    ("manage_volumes", re.compile(
+        r"\bdocker\s+volume\s+(create|ls|list|inspect)\b")),
+    ("read_logs", re.compile(
+        r"\bdocker\s+(logs|inspect|stats)\b|\bjournalctl\b")),
+    # read_status (nvidia-smi/systemctl/df/free/ps...) ya cubre la lectura
+    # básica; docker ps/images/info/version también es lectura de estado.
+    # edit_vllm_config y edit_compose_files se evalúan a nivel de función.
 ]
 
 # Escritura en /etc, /usr, /boot: jamás (edit_vllm_config las excluye).
@@ -119,6 +137,19 @@ def _edit_vllm_ok(cmd):
         and not _SYSTEM_WRITE_RE.search(cmd)
 
 
+# edit_compose_files (services-host, t_74f5f315): mecanismo de escritura +
+# objetivo docker-compose (~/git/docker-compose/**) + sin rutas de sistema.
+_COMPOSE_TARGET_RE = re.compile(
+    r"docker-compose|git/docker-compose", re.IGNORECASE)
+_COMPOSE_SYSTEM_RE = _SYSTEM_WRITE_RE
+
+
+def _edit_compose_ok(cmd):
+    return bool(_WRITE_MECH_RE.search(cmd)) \
+        and bool(_COMPOSE_TARGET_RE.search(cmd)) \
+        and not _COMPOSE_SYSTEM_RE.search(cmd)
+
+
 def check_command(cmd, permissions, deny):
     """Devuelve {'allowed', 'verdict', 'rule', 'reason'} para un comando
     REMOTO (sin el prefijo ssh). deny primero, luego permissions, luego
@@ -136,6 +167,10 @@ def check_command(cmd, permissions, deny):
         return {"allowed": True, "verdict": "allowed",
                 "rule": "edit_vllm_config",
                 "reason": "write to vLLM surface (no system paths)"}
+    if "edit_compose_files" in permissions and _edit_compose_ok(cmd):
+        return {"allowed": True, "verdict": "allowed",
+                "rule": "edit_compose_files",
+                "reason": "write to compose surface (no system paths)"}
     return {"allowed": False, "verdict": "blocked", "rule": None,
             "reason": "operation not permitted by sysadmin-lan manifest"}
 

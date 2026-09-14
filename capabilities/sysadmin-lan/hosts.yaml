@@ -1,7 +1,8 @@
 # Inventario de hosts de la capacidad sysadmin-lan (SINGLE SOURCE OF TRUTH).
-# Solo gpu-host por decision del mediador: no anadir hosts sin nueva tarea.
-# ssh_user verificado por sondeo real el 2026-09-14 (el body del mediador
-# decia "user", pero el acceso SSH que funciona es hermesuser).
+# t_2c9322f1: gpu-host (primer host). t_74f5f315: services-host (segundo).
+# ssh_users verificados por sondeo real el 2026-09-14 (el body del mediador
+# decia "user", pero el acceso SSH que funciona es hermesuser en gpu-host e
+# iinstances en services-host).
 hosts:
   - id: gpu-host
     ip: 192.168.1.32
@@ -21,3 +22,28 @@ hosts:
       - change_network       # no iptables, networkd, nmcli, sysctl -w
       - system_packages      # no apt install/dpkg/snap
       - delete_data          # no rm, dd, mkfs, shred, truncate
+
+  # t_74f5f315 (MEDIATOR 2026-09-14): services host — segundo host managed.
+  # ssh_user verificado por sondeo real el 2026-09-14 (iinstances@, BatchMode
+  # OK). Todo el software NUEVO va en containers (docker compose); Docker
+  # Root Dir ya vive en /data/docker (159G libres) — el disco raíz (91% usado)
+  # queda fuera del alcance del stack de observabilidad.
+  - id: services-host
+    ip: 192.168.1.23
+    name: services
+    role: Docker host (Open WebUI :3001, iSponsorBlockTV, observability stack)
+    ssh_user: iinstances
+    ssh_key: ~/.ssh/id_ed25519
+    permissions:
+      - read_status          # docker ps, docker compose ps, free, df, ss, journalctl
+      - restart_containers   # docker restart / docker compose restart
+      - manage_compose       # docker compose up -d / stop / pull (services existentes)
+      - edit_compose_files   # escribir SOLO en ~/git/docker-compose/**
+      - deploy_services      # desplegar nuevos servicios via compose (observability)
+      - manage_volumes       # docker volume create/ls/inspect (nunca prune)
+      - read_logs            # docker logs, journalctl (read-only)
+    deny:
+      - edit_credentials     # nunca SSH keys, authorized_keys, .env con secretos
+      - system_packages      # no apt install/dpkg/snap (todo via containers)
+      - change_network       # no iptables, netplan, nmcli, sysctl -w
+      - delete_data          # no rm -rf, docker system prune, volume rm

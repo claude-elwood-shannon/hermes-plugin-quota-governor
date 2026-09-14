@@ -1,11 +1,31 @@
-# Sysadmin LAN — GPU Host (ml-host)
+# Sysadmin LAN — GPU Host (ml-host) + Services Host
 
-Capacidad modular: gestion sysadmin del host GPU de la LAN, acotada por el
+Capacidad modular: gestion sysadmin de hosts de la LAN, acotada por el
 manifest de esta carpeta. Los guardrails globales (GR4/GR5/GR11) se mantienen;
 la capacidad abre solo excepciones selectivas y limitadas.
 
-## Host managed
+## Hosts managed
 - **gpu-host** (192.168.1.32) — vLLM inference server, 4060 Ti 16GB
+- **services-host** (192.168.1.23) — Docker host: Open WebUI :3001,
+  iSponsorBlockTV, stack de observabilidad (Prometheus :9090,
+  Elasticsearch :9200, Grafana :3000, OpenObserve :5080)
+
+## Que puedes hacer en services-host
+- Leer estado: `docker ps`, `docker compose ps`, `free`, `df`, `ss -tln`,
+  `journalctl`, `cat /proc/sys/*`
+- Contenedores: `docker restart|stop|start <c>`,
+  `docker compose restart|stop|start`
+- Compose: `docker compose up -d|down|pull|build|ps|logs|config` en
+  `~/git/docker-compose/**` (desplegar nuevos servicios incluido)
+- Volúmenes: `docker volume create|ls|inspect` (NUNCA prune/rm)
+- Logs: `docker logs`, `journalctl` (read-only)
+- Escribir SOLO en `~/git/docker-compose/**` (edit_compose_files)
+
+## Que NO puedes hacer en services-host
+- Instalar paquetes del sistema (apt/dpkg/snap) — todo via containers
+- Cambiar red (iptables, netplan, nmcli, sysctl -w)
+- Borrar datos (rm -rf, `docker system prune`, `docker volume rm`)
+- Editar credenciales, SSH keys, authorized_keys, .env con secretos
 
 ## Que puedes hacer en gpu-host
 - Leer estado: nvidia-smi, systemctl status/is-active, journalctl, free, df, ps
@@ -40,8 +60,13 @@ python3 capabilities/sysadmin-lan/guard.py --check-op \
 No se permite saltarse el guard (p. ej. ejecutar el ssh sin su exit 0).
 
 ## Como acceder
-- SSH: `ssh hermesuser@192.168.1.32` (key ~/.ssh/id_ed25519)
+- SSH gpu-host: `ssh hermesuser@192.168.1.32` (key ~/.ssh/id_ed25519)
+- SSH services-host: `ssh iinstances@192.168.1.23` (key ~/.ssh/id_ed25519)
 - vLLM API: `http://192.168.1.32:8000`
+- Observability: `http://192.168.1.23:9090` (Prometheus),
+  `http://192.168.1.23:3000` (Grafana, admin/admin initial),
+  `http://192.168.1.23:5080` (OpenObserve), `http://192.168.1.57:9120`
+  (bridge, `/metrics-prometheus`)
 - Endpoints bridge: `GET /capabilities`,
   `GET /capabilities/sysadmin-lan/hosts`,
   `GET /capabilities/sysadmin-lan/status`
@@ -54,5 +79,6 @@ No se permite saltarse el guard (p. ej. ejecutar el ssh sin su exit 0).
 
 ## Triggers de activacion
 El agente carga este skill.md cuando una tarea contiene
-`[capability: sysadmin-lan]` en el body, o "gpu-host"/"ml-host" en el titulo,
-o pertenece al objetivo OBJ-SYSADMIN (ver manifest.yaml `triggers`).
+`[capability: sysadmin-lan]` en el body, o "gpu-host"/"ml-host" (gpu-host) o
+"services-host"/"observability" (services-host) en el titulo, o pertenece al
+objetivo OBJ-SYSADMIN (ver manifest.yaml `triggers`).
