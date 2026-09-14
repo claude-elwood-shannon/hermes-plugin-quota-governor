@@ -97,6 +97,11 @@ SUCCESSOR_DEPTH_RE = re.compile(r"\bsuccessor-depth:(\d+)\b", re.I)
 SUCCESSOR_LEGACY_TITLE_RE = re.compile(r"^Sucesor estructural de \S+", re.I)
 SUCCESSOR_MAX_DEPTH = 1
 
+# P2×P5 (t_acf726e6): sello de stock muerto — un done cuya cadena ya cubrió
+# su trabajo (firma presente en el board, solo done/archived) deja de contar
+# como refillable tras el censo (idempotente, best-effort).
+P2X_P5_DONE_RE = re.compile(r"\bP2xP5-no-refill\b")
+
 
 def _load_approved_objectives():
     """Lazy-load scripts/approved_objectives.py (fail-open: None if absent
@@ -289,16 +294,111 @@ def successor_chain_open(db_path: Path, sig: str,
     return bool(rows)
 
 
-def refillable(db_path: Path, now: float | None = None) -> bool:
-    """P2 desired=3 (MEDIATOR t_acf726e6): True if the backlog-guard's
-    refill depth has legitimate work left — a class-C done task <24h with
-    no open successor (the same pool step 3 draws from). When False, the
-    step-2 'queue alive' shortcut stands and the drought verdict (step 4)
-    stays honest: dry means dry, no filler (pitfall 24g-c)."""
+def successor_chain_has_open(db_path: Path, sig: str,
+                             exclude_task_id: str | None = None) -> bool:
+    """True if a sig-carrying task exists in an OPEN status (ready, running,
+    blocked, todo) — the chain is actively covered by a live member (P2×P5:
+    distinguishes live coverage from dead stock done-only chains)."""
+    if not db_path.exists():
+        return False
+    try:
+        con = _connect(db_path)
+        try:
+            q = ("SELECT id FROM tasks WHERE status IN "
+                 "('ready','running','blocked','todo') "
+                 "AND body LIKE ?")
+            args: list = [f"%successor-sig:{sig}%"]
+            if exclude_task_id:
+                q += " AND id != ?"
+                args.append(exclude_task_id)
+            rows = con.execute(q, args).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return bool(rows)
+
+
+def _refillable_candidate(db_path: Path, now: float | None = None,
+                          skip_sigs: set | None = None,
+                          write: bool = True) -> tuple:
+    """P2 desired=3 (MEDIATOR t_acf726e6): next refillable parent — a
+    class-C done task <24h whose successor chain has no OPEN member.
+    Returns (kind, payload):
+      ("parent", parent_dict_with_sig)  -> create its successor
+      ("dedup",  (parent, sig))         -> P5 signature verdict, stop
+      ("capped", (parent, depth))       -> P5 depth verdict, stop
+      ("dry",    None)                  -> pool exhausted
+    skip_sigs: signatures created earlier in THIS tick (live coverage).
+    write: False (dry-run) censuses WITHOUT stamping dead stock.
+
+    The FIRST clean parent wins over any P5 verdict — the capped/dedup
+    verdicts describe the residue AFTER refill, not a stop before it.
+    Depth-aware (P2×P5): stamped or legacy-successor parents would create
+    depth-2 children, which step 3's depth cap retains — they carry zero
+    backlog value, and a legacy parent's sig equals its root's (would
+    recycle the cap), so they never refill. A parent whose chain exists
+    only as done/archived (P5 dead stock) is stamped out of the pool
+    (idempotent, best-effort)."""
+    verdict: tuple | None = None
     for parent in recent_clase_c_done(db_path, now=now):
-        if not has_open_successor(db_path, parent["id"]):
-            return True
-    return False
+        pid = parent["id"]
+        if P2X_P5_DONE_RE.search(parent.get("body") or ""):
+            continue  # ya censado como stock muerto en un tick previo
+        if has_open_successor(db_path, pid):
+            continue  # cobertura viva via id (silencioso, como en P5)
+        depth, inherited = _successor_stamp(parent, "")
+        if inherited:
+            if depth > SUCCESSOR_MAX_DEPTH and verdict is None:
+                verdict = ("capped", (parent, depth))
+            continue
+        if SUCCESSOR_LEGACY_TITLE_RE.match(parent.get("title") or ""):
+            continue  # legacy: su sig colisionaria con la raiz de la cadena
+        pattern = successor_pattern(parent["title"], parent.get("body", ""))
+        sig = successor_signature(pid, pattern)
+        if sig in (skip_sigs or ()):
+            continue  # ya creado en este mismo tick (cobertura viva)
+        if successor_chain_open(db_path, sig, exclude_task_id=pid):
+            if successor_chain_has_open(db_path, sig, exclude_task_id=pid):
+                if verdict is None:
+                    verdict = ("dedup", (parent, sig))
+            elif write:
+                _prune_dead_stock(db_path, pid)
+            continue  # stock muerto: la cadena ya produjo su trabajo
+        parent["sig"] = sig
+        return ("parent", parent)
+    return verdict if verdict is not None else ("dry", None)
+
+
+def _prune_dead_stock(db_path: Path, pid: str) -> None:
+    """Best-effort P2×P5 bookkeeping: append the no-refill stamp to the
+    DONE parent's body so dead stock (chain done, no open member) stops
+    counting as refillable. Fail-open: on any error the caller falls back
+    to P5 dedup alone (correct, just re-censused every tick)."""
+    try:
+        con = sqlite3.connect(str(db_path), timeout=3)
+        try:
+            row = con.execute("SELECT body FROM tasks WHERE id = ?",
+                              (pid,)).fetchone()
+            if row and not P2X_P5_DONE_RE.search(row[0] or ""):
+                con.execute("UPDATE tasks SET body = ? WHERE id = ?",
+                            ((row[0] or "") + "\nP2xP5-no-refill: stock done",
+                             pid))
+                con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+
+
+def refillable(db_path: Path, now: float | None = None,
+               write: bool = True) -> bool:
+    """P2 desired=3: True if the backlog-guard has legitimate refill work
+    left (a depth-1-stammable class-C done task <24h whose chain has no
+    open member). When False, the step-2 'queue alive' shortcut stands and
+    the drought verdict (step 4) stays honest: dry means dry, no filler
+    (pitfall 24g-c). write=False (dry-run): census without stamping."""
+    return _refillable_candidate(db_path, now=now, write=write)[0] == "parent"
 
 
 def header_of(body: str) -> str:
@@ -498,14 +598,14 @@ def run(hermes_home=None, execute: bool = False, now=None,
     _log(ledger, {"ts": now, "action": "backlog-guard", "ready_assigned": ready_assigned_n,
                   "live_workers": live_workers or 0, "backlog_total": backlog_total,
                   "verdict": "OK" if backlog_total >= BACKLOG_MIN else "LOW"})
-    if backlog_total >= BACKLOG_MIN and not refillable(db, now=now):
+    if backlog_total >= BACKLOG_MIN:
         act({"ts": now, "action": "skipped", "reason": f"backlog OK ({backlog_total})"},
             f"backlog OK (ready={ready_assigned_n}, running={live_workers or 0})")
         return decisions
-    # backlog OK pero refillable (P2 desired=3): la cascade cae al paso 3 y
-    # rellena hasta el mínimo (ready_assigned + running >= 3).
     # verdict LOW: el ledger ya registró el guard; la cascade continúa y su
     # acción será la única línea de decisión del tick (contrato 1-linea).
+    # (El refill del paso 3 solo actúa por DEBAJO del mínimo: la letra del
+    # mediador es 'hasta alcanzar el mínimo', no un buffer por encima.)
 
     # ── MEDIATOR 14-sep: bifurcación ruta A / ruta B en el gate de cuota ──
     # Ruta A (objetivo aprobado con balance): tarea con tag objective:OBJ-XX
@@ -605,43 +705,54 @@ def run(hermes_home=None, execute: bool = False, now=None,
 
     # ── Step 2: if ready tasks WITH assignee exist, the queue is alive ──
     # (the dispatcher claims them within ~60s — no new work needed)
+    # P2 desired=3: con stock refillable la cascade cae al paso 3 y rellena
+    # hasta el mínimo; pool seco = cola viva clásica (sin filler).
     ready_assigned = [t for t in ready_tasks(db)
                       if (t.get("assignee") or "").strip()]
-    if ready_assigned:
+    if ready_assigned and not refillable(db, now=now, write=execute):
+        extra = (f" — backlog {backlog_total} < {BACKLOG_MIN}, pool seco "
+                 f"(alarma, sin filler)") if backlog_total < BACKLOG_MIN else ""
         act({"ts": now, "action": "queue-alive",
-             "ready_assigned": len(ready_assigned)},
-            f"cola viva: {len(ready_assigned)} ready con assignee (dispatcher los reclama)")
+             "ready_assigned": len(ready_assigned),
+             "backlog_total": backlog_total},
+            f"cola viva: {len(ready_assigned)} ready con assignee "
+            f"(dispatcher los reclama){extra}")
         return decisions
 
-    # ── Step 3: create ONE structural class-C successor of the most recent
-    # done task (<24h, clase:C) that has no open successor yet ──
+    # ── Step 3: create structural class-C successors of the most recent
+    # done tasks (<24h, clase:C) that have no open successor yet ──
+    # P2 desired=3 (t_acf726e6): replenish UNTIL the minimum backlog holds
+    # (ready_assigned + running >= BACKLOG_MIN), pool-bounded — dry stays
+    # dry (step 4, never filler).
     # P5 dedup (MEDIATOR 14-sep): la cadena recursiva "Sucesor de Sucesor
     # de ..." muere aqui. Dos puertas antes de crear:
     #   (a) firma: si la firma (raiz+patron) ya existe en el board
     #       (abierta o hecha), la cadena ya cubrio su trabajo — no re-entra;
     #   (b) profundidad: un sucesor no genera otro sucesor (tope
     #       SUCCESSOR_MAX_DEPTH); legacy sin estampa cuenta como depth 1.
-    for parent in recent_clase_c_done(db, now=now):
-        if has_open_successor(db, parent["id"]):
-            continue
-        pattern = successor_pattern(parent["title"], parent.get("body", ""))
-        m_sig = SUCCESSOR_SIG_RE.search(parent.get("body") or "")
-        depth, inherited = _successor_stamp(parent, "")
-        if inherited and depth > SUCCESSOR_MAX_DEPTH:
+    skip_sigs: set = set()
+    while backlog_total < BACKLOG_MIN:
+        kind, payload = _refillable_candidate(db, now=now,
+                                              skip_sigs=skip_sigs,
+                                              write=execute)
+        if kind == "capped":
+            parent, depth = payload
             act({"ts": now, "action": "successor-depth-capped", "parent": parent["id"],
                  "depth": depth},
                 f"cola viva: sucesor de {parent['id']} retenido — tope de "
                 f"profundidad ({depth} > {SUCCESSOR_MAX_DEPTH}), sin cadena recursiva")
             return decisions
-        sig = (m_sig.group(1) if (inherited and m_sig)
-               else successor_signature(parent["id"], pattern))
-        if successor_chain_open(db, sig, exclude_task_id=parent["id"]):
+        if kind == "dedup":
+            parent, sig = payload
             act({"ts": now, "action": "successor-dedup", "parent": parent["id"],
                  "sig": sig},
                 f"cola viva: dedup P5 — firma {sig} ya existe en el board, "
                 f"sin nuevo sucesor de {parent['id']}")
             return decisions
-        title, body = build_successor(parent, sig=sig, depth=depth)
+        if kind != "parent":
+            break  # pool dry: drought verdict below stays honest
+        parent = payload
+        title, body = build_successor(parent, sig=parent["sig"], depth=1)
         assignee = parent.get("assignee") or DEFAULT_ASSIGNEE
         if not execute:
             act({"ts": now, "action": "created-successor", "parent": parent["id"],
@@ -649,13 +760,16 @@ def run(hermes_home=None, execute: bool = False, now=None,
                 f"cola viva: sucesor estructural de {parent['id']} ({title[:TITLE_LOG_CHARS_SHORT]})")
             return decisions
         tid = create_task(title, body, assignee)
-        if tid:
-            act({"ts": now, "action": "created-successor", "parent": parent["id"],
-                 "task": tid, "title": title[:TITLE_LOG_CHARS], "assignee": assignee},
-                f"cola viva: sucesor estructural de {parent['id']} -> {tid} ({title[:TITLE_LOG_CHARS_SHORT]})")
+        if not tid:
+            act({"ts": now, "action": "create-failed", "parent": parent["id"]},
+                f"cola seca: fallo al crear sucesor de {parent['id']}")
             return decisions
-        act({"ts": now, "action": "create-failed", "parent": parent["id"]},
-            f"cola seca: fallo al crear sucesor de {parent['id']}")
+        act({"ts": now, "action": "created-successor", "parent": parent["id"],
+             "task": tid, "title": title[:TITLE_LOG_CHARS], "assignee": assignee},
+            f"cola viva: sucesor estructural de {parent['id']} -> {tid} ({title[:TITLE_LOG_CHARS_SHORT]})")
+        skip_sigs.add(parent["sig"])  # cobertura viva dentro de este tick
+        backlog_total += 1  # each created successor counts toward the minimum
+    if backlog_total >= BACKLOG_MIN:
         return decisions
 
     # ── Step 3.5: successors from closed bodies (OBJ-39-REBELION) ──

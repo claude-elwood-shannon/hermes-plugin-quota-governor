@@ -93,12 +93,14 @@ class TestDecideHealthy(unittest.TestCase):
     def setUp(self):
         self.planner = _load_planner()
 
-    def test_low_session_and_weekly_allows_2_workers_any(self):
+    def test_low_session_and_weekly_allows_3_workers_any(self):
+        """P2 desired=3 (t_acf726e6): cuota sana = 3 workers, el mínimo
+        operativo del backlog-guard (ready_assigned + running >= 3)."""
         snap = self.planner.QuotaSnapshot(
             ollama_session_pct=20.0, ollama_weekly_pct=20.0)
         dec = self.planner.decide(snap, spending_limit=5.0)
         self.assertEqual(dec.action, "run")
-        self.assertEqual(dec.max_workers, 2)
+        self.assertEqual(dec.max_workers, 3)
         self.assertEqual(dec.max_task_cost, "any")
         self.assertTrue(dec.should_spawn)
         self.assertIn("quota healthy", dec.reason)

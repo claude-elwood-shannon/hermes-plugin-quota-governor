@@ -167,7 +167,9 @@ elif sp > 60:
 elif sp > 30:
     act, mw, rsn = 'run', 1, f'session moderate ({sp:.0f}%)'
 else:
-    mw = 2 if wp < 50 else 1
+    # P2 desired=3 (MEDIATOR t_acf726e6): healthy run level = minimum
+    # backlog; mirrors quota_planner.decide() (3 if weekly < 50 else 1).
+    mw = 3 if wp < 50 else 1
     act, rsn = 'run', f'healthy'
 
 print(f'{act}|{mw}|{sp:.1f}|{wp:.1f}|{sr}|{wr}|{cost:.4f}|{write_stop}|{rsn}')

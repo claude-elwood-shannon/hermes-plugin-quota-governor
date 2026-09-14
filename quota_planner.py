@@ -231,7 +231,12 @@ def decide(snapshot: QuotaSnapshot, prev_activity_cost: float = 0.0,
         )
 
     # --- Session < 30%, weekly < 75%: run healthy ---
-    max_workers = 2 if weekly < 50 else 1
+    # P2 desired=3 (MEDIATOR t_acf726e6): the healthy run level equals the
+    # operational minimum backlog (ready_assigned + running >= 3), so the
+    # concurrency guard holds the board at the minimum while quota is free.
+    # weekly < 50% keeps 3; a higher weekly falls back to 1 (throttle
+    # before burn). Mirrored inline in scripts/quota-governor-tick.sh.
+    max_workers = 3 if weekly < 50 else 1
     return GovernorDecision(
         action="run",
         max_workers=max_workers,

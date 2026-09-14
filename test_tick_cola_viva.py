@@ -196,8 +196,10 @@ class TestCascade(Base):
                       "assignee": "pr-ollama", "body": CLASE_C_DONE,
                       "completed_at": NOW - 3600}])
         out = self._run()
-        self.assertEqual(len(out), 1)
+        # P2: stock de UN padre -> 1 sucesor y pool seco -> sequia legitima
+        self.assertEqual(len(out), 2)
         self.assertIn("sucesor estructural de t_done", out[0])
+        self.assertIn("cola seca legitima", out[1])
         self.assertEqual(len(self.calls["create"]), 1)
         title, body, assignee = self.calls["create"][0]
         self.assertIn("t_done", title)
@@ -252,6 +254,148 @@ class TestCascade(Base):
         self.assertEqual(len(out), 1)
         self.assertEqual(self.calls["assign"], [("t_ready", "pr-ollama")])
         self.assertEqual(self.calls["create"], [])
+
+
+class TestP2Desired3(Base):
+    """P2 desired=3 (MEDIATOR t_acf726e6): el backlog-guard rellena HASTA el
+    minimo (ready_assigned + running >= BACKLOG_MIN), limitado al pool
+    legitimo; el stock P5 (estampado/legacy/stock-muerto) nunca rellena y
+    la sequia sigue siendo sequia (regla de oro: no filler)."""
+
+    def _root(self, tid="t_done", **kw):
+        d = {"id": tid, "title": "OBJ-35 backfill predictor",
+             "assignee": "pr-ollama", "body": CLASE_C_DONE,
+             "completed_at": NOW - 3600}
+        d.update(kw)
+        return d
+
+    def test_1_refillable_true_with_untouched_root(self):
+        _mk_db(self.db, [], done=[self._root()])
+        self.assertTrue(cv.refillable(Path(self.db), now=NOW))
+
+    def test_2_stamped_done_root_not_refillable(self):
+        sig = cv.successor_signature("t_done", "test")
+        root = self._root(
+            body=CLASE_C_DONE + f"\nsuccessor-sig:{sig} | successor-depth:1")
+        _mk_db(self.db, [], done=[root])
+        self.assertFalse(cv.refillable(Path(self.db), now=NOW))
+
+    def test_3_legacy_done_root_not_refillable(self):
+        root = self._root(
+            title="Sucesor estructural de t_origen: docs de OBJ-35 backfill")
+        _mk_db(self.db, [], done=[root])
+        self.assertFalse(cv.refillable(Path(self.db), now=NOW))
+
+    def test_4_dead_stock_stamped_out_and_not_refillable(self):
+        sig = cv.successor_signature("t_done", "test")
+        # hijo DONE (stock muerto: lleva la firma de la cadena) y MAS VIEJO
+        # que la raiz: el censo alcanza la raiz primero, la sella, y el
+        # hijo estampado queda como veredicto capped.
+        child = {"id": "t_hijo",
+                 "title": "Sucesor estructural de t_done: test de x",
+                 "assignee": "pr-ollama",
+                 "body": CLASE_C_DONE + f"\nsuccessor-sig:{sig} | "
+                                        f"successor-depth:1",
+                 "completed_at": NOW - 7200}
+        _mk_db(self.db, [], done=[child, self._root()])
+        self.assertFalse(cv.refillable(Path(self.db), now=NOW))
+        con = sqlite3.connect(self.db)
+        try:
+            stamp = con.execute(
+                "SELECT body FROM tasks WHERE id='t_done'").fetchone()[0]
+        finally:
+            con.close()
+        self.assertIn("P2xP5-no-refill", stamp)
+
+    def test_5_live_chain_via_id_not_refillable(self):
+        open_succ = {"id": "t_open", "title": "x", "status": "ready",
+                     "assignee": "pr-ollama",
+                     "body": "Sucesor estructural de t_done"}
+        _mk_db(self.db, [open_succ], done=[self._root()])
+        self.assertFalse(cv.refillable(Path(self.db)))
+
+    def test_6_low_guard_sin_pool_se_dry_verdict(self):
+        _mk_db(self.db, [])
+        out = self._run()
+        self.assertEqual(len(out), 1)
+        self.assertIn("cola seca legitima", out[0])
+        self.assertEqual(self.calls["create"], [])
+
+    def test_7_executes_to_the_minimum_pool_bounded(self):
+        _mk_db(self.db, [], done=[self._root(f"t_done{i}")
+                                  for i in range(3)])
+        out = self._run()
+        # rellena exactamente hasta el minimo: 3 sucesores, sin sequia
+        # (el ciclo se cierra por backlog_total, no por pool seco)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(len(self.calls["create"]), 3)
+        self.assertEqual(
+            sum(1 for t, _, _ in self.calls["create"] if "t_done" in t), 3)
+        self.assertNotIn("cola seca legitima", "\n".join(out))
+
+    def test_8_backlog_ok_without_pool_stays_silent(self):
+        _mk_db(self.db, [_ready(assignee="pr-ollama"),
+                         _ready(assignee="pr-ollama")])
+        out = self._run(live_workers=2)
+        # backlog_total = 2 live + 2 ready = 4 >= 3 -> guard skip, silencio
+        self.assertEqual(out, ["backlog OK (ready=2, running=2)"])
+        self.assertEqual(self.calls["create"], [])
+
+    def test_8_low_backlog_dry_pool_alarms_in_step2(self):
+        _mk_db(self.db, [_ready(assignee="pr-ollama"),
+                         _ready(assignee="pr-ollama")])
+        out = self._run(live_workers=0)  # backlog_total = 2 < 3, pool seco
+        self.assertEqual(out, ["cola viva: 2 ready con assignee (dispatcher "
+                               "los reclama) — backlog 2 < 3, pool seco "
+                               "(alarma, sin filler)"])
+        self.assertEqual(self.calls["create"], [])
+
+    def test_8b_low_backlog_with_pool_alarms_after_step1(self):
+        # LOW (running=0) + stock con 1 raiz limpia: refill 1 y pool seco
+        _mk_db(self.db, [], done=[self._root()])
+        out = self._run()
+        self.assertEqual(len(out), 2)
+        self.assertIn("sucesor estructural de t_done", out[0])
+        self.assertIn("cola seca legitima", out[1])
+
+    def test_8c_dry_pool_low_backlog_alarms_in_queue_alive(self):
+        # LOW (1 ready asignada) + pool seco -> alarma visible, sin filler
+        _mk_db(self.db, [{"id": "t_a", "title": "x", "status": "ready",
+                          "assignee": "pr-ollama",
+                          "body": "sin tag de objetivo"}])
+        out = self._run()
+        self.assertEqual(len(out), 1)
+        self.assertIn("ready con assignee", out[0])
+        self.assertIn("backlog 1 < 3, pool seco (alarma, sin filler)", out[0])
+
+    def test_9_quota_gate_outranks_refill(self):
+        _mk_db(self.db, [_ready(assignee=None, body="sin tag de objetivo")],
+               done=[self._root("t_done0"), self._root("t_done1")])
+        out = self._run(weekly_pct=85.0)
+        self.assertEqual(len(out), 1)
+        self.assertIn("weekly al 85.0%", out[0])
+        self.assertEqual(self.calls["create"], [])
+        self.assertEqual(self.calls["assign"], [])
+
+    def test_10_p5_dedup_stops_the_tick(self):
+        sig = cv.successor_signature("t_done", "test")
+        child = {"id": "t_hijo",
+                 "title": "Sucesor estructural de t_done: test de x",
+                 "assignee": "pr-ollama",
+                 "body": CLASE_C_DONE + f"\nsuccessor-sig:{sig} | "
+                                        f"successor-depth:1",
+                 "status": "running"}
+        _mk_db(self.db, [child], done=[self._root()])
+        out = self._run()
+        # P5: el veredicto dedup CORTA el tick (return) — sin linea extra
+        self.assertEqual(len(out), 1)
+        self.assertIn("dedup P5", out[0])
+        self.assertEqual(self.calls["create"], [])
+
+    def test_11_assignee_inherited_from_parent(self):
+        _mk_db(self.db, [], done=[self._root(assignee="pr-nanogpt")])
+        self._run()
+        self.assertEqual(self.calls["create"][0][2], "pr-nanogpt")
 
 
 class TestDryRun(Base):
