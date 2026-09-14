@@ -1,0 +1,40 @@
+# hermes-bridge.service — unidad de USUARIO systemd para el bridge Open WebUI.
+#
+# Instalación (house): cp a ~/.config/systemd/user/ + 
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-bridge
+# Boot sin sesión activa: requiere Linger=yes (loginctl enable-linger $USER).
+#
+# Adoptantes: BRIDGE_PLUGIN_REPO pinnea el checkout del repo (house lo fija a
+# su ruta local, misma convención que open-webui-bridge-cron.sh). Ajustadlo a
+# vuestro checkout si desplegáis el bridge fuera de él.
+#
+# Notas:
+#   - Unidad de usuario: no lleva User= (implícito) ni multi-user.target;
+#     el equivalente es default.target.
+#   - Con esta unidad instalada, open-webui-bridge-cron.sh deja de
+#     respawnear: queda como monitor (heartbeat) y empuja systemd en caso
+#     de muerte. El respawn nohup legado sólo corre si la unidad no existe.
+#   - PATH reconstruido mínimo: el bridge lanza `hermes` desnudo, que vive
+#     en ~/.local/bin (§12 del wrapper). HERMES_HOME apunta a la raíz
+#     compartida (no al perfil) para leer/escribir el kanban compartido.
+
+[Unit]
+Description=Hermes Bridge API for Open WebUI (HTTP :9120)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=/usr/bin/python3.12 %h/.hermes/scripts/bridge/open-webui-bridge.py
+Environment=HERMES_HOME=%h/.hermes
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=BRIDGE_PLUGIN_REPO=/data/git/hermes-plugin-quota-governor
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

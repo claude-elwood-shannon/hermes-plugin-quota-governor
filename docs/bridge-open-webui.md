@@ -38,28 +38,40 @@ it and respawns from the canonical path (see Convergence below).
 
 ## How it runs
 
-The bridge is a **daemon, not a cron**: it serves until killed. Start it
-with nohup so it survives the shell:
+The bridge is a **daemon, not a cron**: it serves until killed. Since the
+systemd migration (MEDIATOR 2026-09-14) the lifecycle is owned by a
+**systemd user unit**, `scripts/bridge/hermes-bridge.service` in this repo:
 
 ```bash
-nohup python3 ~/.hermes/scripts/bridge/open-webui-bridge.py > /dev/null 2>&1 &
+cp scripts/bridge/hermes-bridge.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-bridge   # boot survival: needs Linger=yes
 ```
 
-In production it should never be started by hand: two cron layers own the
-lifecycle (crontab of the host):
+The unit pins `BRIDGE_PLUGIN_REPO` to the plugin repo checkout, exports a
+reconstructed minimal `PATH` (the bridge spawns a bare `hermes`, which lives
+in `~/.local/bin`), runs with `Restart=always` / `RestartSec=5`, and logs to
+the user journal (`journalctl --user -u hermes-bridge`). Adoptants running
+the bridge outside this repo must adjust `BRIDGE_PLUGIN_REPO` in the unit.
+
+The 5-min cron layer (crontab of the host) remains as **monitor, not
+owner**:
 
 ```cron
-# supervisor: probe + converge + heartbeat, every 5 min
+# monitor: HTTP probe + heartbeat + nudge systemd, every 5 min
 */5 * * * * ~/.hermes/scripts/bridge/open-webui-bridge-cron.sh >> ~/.hermes/logs/open-webui-bridge.log 2>&1
 # watchdog of the watchdog: verifies the heartbeat, every 15 min (already wired)
 */15 * * * * /home/iinstances/.hermes/scripts/cron-health-check.sh >> /home/iinstances/.hermes/logs/cron-health-check.log 2>&1
 ```
 
-The supervisor (`scripts/bridge/open-webui-bridge-cron.sh`, 3 copies like
+The monitor (`scripts/bridge/open-webui-bridge-cron.sh`, 3 copies like
 the server, mode 755) probes the service, touches the heartbeat when
-healthy, and respawns from the canonical path when needed. It is also the
+healthy, kills non-canonical bridge holders (convergence, unchanged), and
+when the bridge is down it **nudges systemd** (`systemctl --user start`
+or `restart` hermes-bridge) instead of respawning it. It is also the
 restart command that `cron-health-check.sh` executes when it finds the
-heartbeat stale.
+heartbeat stale. The legacy `nohup` respawn from the canonical path is
+kept only as a fallback for adoptants without the unit installed.
 
 Liveness is HTTP-based, not log-mtime-based: the bridge is silent (its log
 only grows on respawn), so the supervisor probes
@@ -115,7 +127,9 @@ open-webui-bridge|~/.hermes/logs/open-webui-bridge.heartbeat|300|480|bash ~/.her
 - heartbeat fresh (≤480 s) → `OK` (the normal state; the wrapper touches it
   every 15 min tick).
 - heartbeat stale → `DEAD` → the health-check runs the wrapper, which
-  respawns the daemon; the restart is logged
+  nudges systemd to rebuild the daemon (`systemctl --user start/restart
+  hermes-bridge`; legacy `nohup` respawn only when the unit is not
+  installed); the restart is logged
   (`CRON DEAD: open-webui-bridge — reiniciado (ok)`) and alarm-JSONL'd.
 - DIRECCION-STOP is respected: with the STOP file present, the health-check
   still verifies and alarms but does NOT restart.
