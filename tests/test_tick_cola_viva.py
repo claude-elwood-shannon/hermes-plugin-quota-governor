@@ -187,3 +187,64 @@ def test_build_successor_caps_title_and_carries_tags():
     assert len(title) <= TITLE_MAX_CHARS
     assert "tX" in title
     assert "clase:C" in body
+
+
+# ------------------------------------------------------- hueco OBJ-44 (tarea
+# t_5ae86c2d): paso 3.6 anti-sequia (dry-run) e incidente de sequia con >=5
+# en triage (rama del commit 8f4870a). Nadie los cubria.
+
+
+def _read_ledger(hermetic_world):
+    p = hermetic_world / "quota-governor" / "cola-viva.jsonl"
+    return [json.loads(l) for l in
+            p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def test_step36_drought_check_dry_run(hermetic_world):
+    """Paso 3.6, execute=False, tablero sin candidatos (0 ready, sin cierres
+    clase:C <24h): la decision es 'paso 3.6 anti-sequia evaluado (dry-run)'
+    con accion drought-check, y no se crea ni asigna nada."""
+    db = create_db(hermetic_world / "kanban.db")
+    db.close()
+    now = 1789001175.0
+    decisions = run(hermes_home=hermetic_world, execute=False, now=now,
+                    live_workers=0)
+    assert decisions == ["DRY: cola viva: paso 3.6 anti-sequia evaluado "
+                         "(dry-run)"], decisions
+    entries = _read_ledger(hermetic_world)
+    assert any(e.get("action") == "drought-check" for e in entries)
+    # sin mutaciones: el board sigue sin tareas y sin assignees
+    con = sqlite3.connect(str(hermetic_world / "kanban.db"))
+    n = con.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    con.close()
+    assert n == 0, "dry-run del paso 3.6 no debe crear tareas"
+
+
+def test_step4_triage_incident_vs_legit_drought(hermetic_world):
+    """Paso 4, execute=True, tablero seco: >=5 en triage -> INCIDENTE
+    (waiting-user); <5 triage -> cola seca legitima. Con execute=True los
+    unicos writes del tick pasan por el CLI hermes (create/assign), que aqui
+    no se invoca porque no hay ready ni clase:C recientes: sin red real."""
+    now = 1789001175.0
+    db = create_db(hermetic_world / "kanban.db")
+    for i in range(5):
+        insert_task(db, f"tr{i}", f"Triage {i}", "triage")
+    db.close()
+    decisions = run(hermes_home=hermetic_world, execute=True, now=now,
+                    live_workers=0)
+    assert decisions == ["INCIDENTE: sequia con 5 tareas en triage — el board "
+                         "espera al usuario, no esta seco"], decisions
+    assert any(e.get("action") == "waiting-user" and e.get("triage") == 5
+               for e in _read_ledger(hermetic_world))
+
+    # rama contraria: <5 en triage (borramos 3 -> quedan 2)
+    con = sqlite3.connect(str(hermetic_world / "kanban.db"))
+    con.execute("DELETE FROM tasks WHERE id IN ('tr2','tr3','tr4')")
+    con.commit()
+    con.close()
+    decisions = run(hermes_home=hermetic_world, execute=True, now=now,
+                    live_workers=0)
+    assert decisions == ["cola seca legitima: sin trabajo legitimo "
+                         "(regla de oro: no filler)"], decisions
+    assert any(e.get("action") == "cola-seca-legitima"
+               for e in _read_ledger(hermetic_world))
