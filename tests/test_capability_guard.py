@@ -49,6 +49,11 @@ spec = importlib.util.spec_from_file_location("bridge_under_test", BRIDGE)
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 
+guard_spec = importlib.util.spec_from_file_location("guard_under_test", GUARD)
+assert guard_spec is not None and guard_spec.loader is not None
+guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(guard)
+
 srv = HTTPServer(("127.0.0.1", 0), bridge.HermesBridge)
 PORT = srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -175,6 +180,48 @@ class TestGuardOperations(unittest.TestCase):
                               "--command", cmd)
             self.assertEqual((rc, d["verdict"]), (1, "denied"), cmd)
             self.assertEqual(d["rule"], "delete_data", cmd)
+
+    def test_denied_write_root_disk(self):
+        # t_5d573ffc: host_rules services-host — respetar / y usar /data.
+        # Cualquier destino de escritura absoluto fuera de /data y del
+        # arbol compose ~/git/docker-compose → denied (deny prioritario).
+        for cmd in ("cp /tmp/x.yml /opt/miapp/config.yml",
+                    "tee /etc/motd",
+                    "tee -a /var/backups/db.sql",
+                    "sed -i 's/a/b/' /etc/hosts",
+                    "mv /tmp/a /srv/nginx.conf",
+                    "echo hola > /root/leeme.txt"):
+            rc, d = guard_run("--check-op", "--host", "services-host",
+                              "--command", cmd)
+            self.assertEqual((rc, d["verdict"]), (1, "denied"), cmd)
+            self.assertEqual(d["rule"], "write_root_disk", cmd)
+
+    def test_allowed_data_and_compose_writes(self):
+        # /data y ~/git/docker-compose estan en el disco de datos: el extractor
+        # de write_root_disk NO los marca (la regla no bloquea /data). El
+        # permiso de escritura si cabe es edit_compose_files; escribir en
+        # /data/* suelto queda fuera del manifest (blocked, como hoy).
+        for cmd in ("echo datos > /data/ml/app.conf",
+                    "echo x > /data/docker/volumes/prueba/_data/f"):
+            self.assertEqual(guard._root_disk_write_paths(cmd), [], cmd)
+        rc, d = guard_run("--check-op", "--host", "services-host",
+                          "--command",
+                          "cp /tmp/n.yml "
+                          "/home/iinstances/git/docker-compose/x/x.yml")
+        self.assertEqual((rc, d["verdict"]), (0, "allowed"))
+        self.assertEqual(d["rule"], "edit_compose_files")
+        rc, d = guard_run("--check-op", "--host", "services-host",
+                          "--command", "docker volume create obs_prueba")
+        self.assertEqual((rc, d["verdict"]), (0, "allowed"))
+        self.assertEqual(d["rule"], "manage_volumes")
+
+    def test_input_redirect_is_not_a_write(self):
+        # "< fichero" es redireccion de ENTRADA: nunca cuenta como destino.
+        rc, d = guard_run("--check-op", "--host", "services-host",
+                          "--command",
+                          "tee -a /home/iinstances/git/docker-compose/"
+                          "x.yml < /tmp/patch")
+        self.assertEqual((rc, d["verdict"]), (0, "allowed"))
 
     def test_blocked_unknown_host(self):
         for host in ("other-host", "db-host"):

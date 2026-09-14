@@ -28,6 +28,10 @@ hosts:
   # OK). Todo el software NUEVO va en containers (docker compose); Docker
   # Root Dir ya vive en /data/docker (159G libres) — el disco raíz (91% usado)
   # queda fuera del alcance del stack de observabilidad.
+  # t_5d573ffc (MEDIATOR 2026-09-15): regla permanente — respetar / y usar
+  # /data para todo (manifest.yaml host_rules). Exigida por el guard como
+  # deny write_root_disk: todo destino de escritura absoluto debe vivir en
+  # /data o en ~/git/docker-compose/** (ambos en el disco de datos).
   - id: services-host
     ip: 192.168.1.23
     name: services
@@ -48,3 +52,4 @@ hosts:
       - system_packages      # no apt install/dpkg/snap (todo via containers)
       - change_network       # no iptables, netplan, nmcli, sysctl -w
       - delete_data          # no rm -rf, docker system prune, volume rm
+      - write_root_disk      # no escribir fuera de /data y ~/git/docker-compose/**

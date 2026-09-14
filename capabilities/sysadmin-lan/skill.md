@@ -10,6 +10,25 @@ la capacidad abre solo excepciones selectivas y limitadas.
   iSponsorBlockTV, stack de observabilidad (Prometheus :9090,
   Elasticsearch :9200, Grafana :3000, OpenObserve :5080)
 
+## Regla permanente del services host: respetar / y usar /data (t_5d573ffc)
+
+El disco raiz del services-host esta al **91%** y `/data` tiene ~163G libres
+(Docker Root ya vive en `/data/docker`). Regla permanente para TODA
+operacion en este host:
+
+1. **No instalar ni escribir nada en `/`** — toda instalacion, volumen o
+   dato nuevo va en `/data`.
+2. **Verificar espacio en `/` antes de cualquier operacion** (`df -h / /data`).
+3. **Si una operacion requiere espacio en `/`, rechazarla** y reescribirla
+   contra `/data`.
+4. Los volumenes docker nacen bajo `/data/docker/volumes/` automaticamente
+   (Docker Root = `/data/docker`): usar named volumes, nunca binds hacia
+   rutas del disco raiz.
+
+La regla es **exigible**: el guard la aplica como deny `write_root_disk`
+(escritura absoluta fuera de `/data` y de `~/git/docker-compose/**` →
+denied, con prioridad sobre cualquier permiso).
+
 ## Que puedes hacer en services-host
 - Leer estado: `docker ps`, `docker compose ps`, `free`, `df`, `ss -tln`,
   `journalctl`, `cat /proc/sys/*`
@@ -26,6 +45,8 @@ la capacidad abre solo excepciones selectivas y limitadas.
 - Cambiar red (iptables, netplan, nmcli, sysctl -w)
 - Borrar datos (rm -rf, `docker system prune`, `docker volume rm`)
 - Editar credenciales, SSH keys, authorized_keys, .env con secretos
+- Escribir fuera de `/data` y de `~/git/docker-compose/**`
+  (deny `write_root_disk`: el disco raiz `/` esta al 91% — NO usar)
 
 ## Que puedes hacer en gpu-host
 - Leer estado: nvidia-smi, systemctl status/is-active, journalctl, free, df, ps

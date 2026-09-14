@@ -125,6 +125,14 @@ _PERM_PATTERNS = [
 # Escritura en /etc, /usr, /boot: jamás (edit_vllm_config las excluye).
 _SYSTEM_WRITE_RE = re.compile(r"(/etc\b|/usr\b|/boot\b|/var/lib\b)")
 
+# t_5d573ffc: regla permanente del services host — respetar / (raíz al 91%)
+# y usar /data para todo. Los dos mecanismos de ESCRITURA del host se
+# restringen a superficies fuera del disco raíz:
+#  - edit_compose_files: ~/git/docker-compose/** (via bind mounts)
+#  - manage_volumes: docker volume create (Docker Root = /data/docker)
+# Cualquier escritura a una ruta ABSOLUTA fuera de /data y del árbol compose
+# cae en write_root_disk (deny). /data/docker y /home/iinstances/git/
+# docker-compose están en el disco de datos, no en /.
 _WRITE_MECH_RE = re.compile(
     r"\bsed\s+-i\b|\btee\s*(-a\s*)?\b|>>?|\bscp\b|\brsync\b|\bpatch\b|"
     r"\bcp\s+[^;&|]+\s+\S|\bmv\s+[^;&|]+\s+\S|\binstall\s")
@@ -151,6 +159,34 @@ def _edit_compose_ok(cmd):
     return bool(_WRITE_MECH_RE.search(cmd)) \
         and bool(_COMPOSE_TARGET_RE.search(cmd)) \
         and not _COMPOSE_SYSTEM_RE.search(cmd)
+
+
+# t_5d573ffc — write_root_disk (services-host): la regla del manifest
+# (host_rules) hecha exigible. Todo DESTINO de escritura absoluto debe vivir
+# bajo /data o dentro del arbol compose ~/git/docker-compose (ambos fuera del
+# disco raiz). Se extrae el ultimo token no-flag del segmento de cada
+# mecanismo de escritura; si es una ruta absoluta fuera de esas superficies →
+# deny.
+_ROOT_DISK_DATA_RE = re.compile(r"^/data(?:/|$)")
+_ROOT_DISK_COMPOSE_RE = re.compile(
+    r"^/home/iinstances/git/docker-compose(?:/|$)")
+_ROOT_DISK_SEP_RE = re.compile(r"[;|&`$()<>]")
+
+
+def _root_disk_write_paths(cmd):
+    """Destinos de escritura ABSOLUTOS fuera de /data y del arbol compose."""
+    paths = []
+    for m in _WRITE_MECH_RE.finditer(cmd):
+        nm = _ROOT_DISK_SEP_RE.search(cmd, m.start() + 1)
+        seg = cmd[m.start():nm.start() if nm else len(cmd)]
+        toks = [t.strip("\"'") for t in seg.split() if not t.startswith("-")]
+        if not toks:
+            continue
+        tok = toks[-1]
+        if tok.startswith("/") and not _ROOT_DISK_DATA_RE.match(tok) \
+                and not _ROOT_DISK_COMPOSE_RE.match(tok):
+            paths.append(tok)
+    return paths
 
 
 # curl como probe de LECTURA (health checks LAN, t_74f5f315): solo el tramo
@@ -181,6 +217,16 @@ def check_command(cmd, permissions, deny):
             return {"allowed": False, "verdict": "denied", "rule": rule,
                     "reason": f"touches deny rule '{rule}' "
                               f"(sysadmin-lan hosts.yaml)"}
+    # t_5d573ffc — host_rules: respetar / y usar /data (services-host).
+    # Escritura al disco raiz fuera de /data y del arbol compose → denied,
+    # con prioridad sobre cualquier permission (mismo orden que los deny).
+    if "write_root_disk" in deny:
+        bad = _root_disk_write_paths(cmd)
+        if bad:
+            return {"allowed": False, "verdict": "denied",
+                    "rule": "write_root_disk",
+                    "reason": f"write to root disk path(s) {bad} — host_rules "
+                              f"requires /data (manifest.yaml)"}
     for rule, rx in _PERM_PATTERNS:
         if rule in permissions and rx.search(cmd):
             return {"allowed": True, "verdict": "allowed", "rule": rule,

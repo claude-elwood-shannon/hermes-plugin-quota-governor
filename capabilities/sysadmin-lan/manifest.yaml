@@ -18,4 +18,15 @@ triggers:
   - task_title_contains: "observability"
   - objective: OBJ-SYSADMIN
 
+# Reglas del host services-host (192.168.1.23), t_5d573ffc:
+# - Respetar / — disco raiz al 91%, NO instalar nada ahi
+# - Usar /data para todo: volumenes docker, datos de servicios, logs
+# - Docker Root ya en /data/docker — mantener este patron
+host_rules:
+  services-host:
+    disk_root: "91% — NO usar"
+    data_path: "/data"
+    docker_root: "/data/docker"
+    note: "Toda instalación, volumen o dato nuevo debe ir en /data"
+
 hosts_file: hosts.yaml
