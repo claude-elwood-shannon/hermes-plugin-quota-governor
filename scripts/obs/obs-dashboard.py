@@ -244,6 +244,8 @@ def alert_cards(hermes_home=None):
             cards.append({"kind": "ok", "text": s})
         elif "board off" in low or low.startswith("burn"):
             cards.append({"kind": "danger", "text": s})
+        elif low.startswith("vllm service down"):
+            cards.append({"kind": "danger", "text": s})
         else:
             cards.append({"kind": "warn", "text": s})
     return cards

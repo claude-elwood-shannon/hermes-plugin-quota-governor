@@ -325,6 +325,8 @@ OPENAPI_SPEC = {
         "/backup/stats": {"get": {"summary": "Get backup repository stats", "description": "Returns restic repo size and file count. Does not expose credentials.", "operationId": "get_backup_stats", "responses": {"200": {"description": "Repo stats", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/backup/log": {"get": {"summary": "Get backup log", "description": "Returns last N lines of backup.log", "operationId": "get_backup_log", "parameters": [{"name": "lines", "in": "query", "required": False, "schema": {"type": "integer", "default": 30}}], "responses": {"200": {"description": "Backup log", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/backup/health": {"get": {"summary": "Check backup system health", "description": "Verifies last snapshot age, log errors, cron presence, and repo size.", "operationId": "get_backup_health", "responses": {"200": {"description": "Health status", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_27e6f8f8 2b: GPU ml-host health (SSH probe, cacheless) ----
+        "/gpu/health": {"get": {"summary": "GPU ml-host health snapshot", "description": "Probes ml-host (192.168.1.32) over SSH + vLLM HTTP API and returns temperature, VRAM, utilization, active model, service state and today's rounds. Zero dependencies (stdlib only); SSH is best-effort, every failure degrades to null/false.", "operationId": "get_gpu_health", "responses": {"200": {"description": "GPU health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
     }
 }
 
@@ -567,6 +569,116 @@ def _safe_join(base, name):
 
 # --------------------------------------- verify-task (t_3cafd196): lógica
 
+# --- t_27e6f8f8 2b: GPU ml-host health (SSH probe, cacheless) ---
+# Self-contained (stdlib only — house rule "zero dependencies"). One
+# SSH round trip for smi + services + rounds tail, one local HTTP call
+# for the live model id. Every failure degrades to null/[]/False —
+# never raises, never blocks the bridge event loop for long.
+_GPU_HOST = "hermesuser@192.168.1.32"
+_GPU_API = "http://192.168.1.32:8000"
+_GPU_ROUNDS = "/data/ml/data/hermes/logs/rounds.jsonl"
+
+def _ssh_gpu(cmd, timeout=12):
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5",
+             "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "BatchMode=yes",
+             _GPU_HOST, cmd],
+            capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+
+def _http_json(url, timeout=5):
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return {}
+
+def _gpu_health_snapshot():
+    now = time.time()
+    data = {"ts": now, "host": "ml-host (192.168.1.32)"}
+
+    smi = _ssh_gpu(
+        "nvidia-smi --query-gpu=temperature.gpu,memory.used,"
+        "memory.total,utilization.gpu --format=csv,noheader,nounits")
+    if smi:
+        parts = [p.strip() for p in smi.split(",")]
+        if len(parts) >= 4:
+            try:
+                data["temp_c"] = int(parts[0])
+                data["vram_used_mib"] = int(parts[1])
+                data["vram_total_mib"] = int(parts[2])
+                data["util_pct"] = int(parts[3])
+            except ValueError:
+                pass
+
+    models = _http_json(f"{_GPU_API}/v1/models")
+    if models.get("data"):
+        m = models["data"][0]
+        data["model"] = m.get("id", "?")
+        data["model_ctx_len"] = m.get("max_model_len")
+        data["vllm_active"] = True
+    else:
+        data["vllm_active"] = False
+
+    data["vllm_service"] = _ssh_gpu(
+        "systemctl --user is-active vllm 2>/dev/null") or "unknown"
+    data["rounds_timer"] = _ssh_gpu(
+        "systemctl --user is-active vllm-rounds.timer 2>/dev/null") \
+        or "unknown"
+
+    data["rounds_today"] = None
+    data["last_round"] = None
+    try:
+        import datetime as _dt
+        tail = _ssh_gpu(f"tail -n 300 {_GPU_ROUNDS}", timeout=15)
+        midnight = _dt.datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        today = []
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and (r.get("ts") or 0) >= midnight:
+                today.append({"task": r.get("task"),
+                              "status": r.get("status"),
+                              "model": r.get("model"),
+                              "temp": r.get("temp"),
+                              "tok_s": r.get("tok_s"),
+                              "ts": r.get("ts")})
+        data["rounds_today"] = len(today)
+        if today:
+            data["last_round"] = today[-1]
+    except Exception:
+        pass
+
+    data["alerts"] = []
+    t = data.get("temp_c")
+    if isinstance(t, int) and t >= 80:
+        data["alerts"].append("GPU TEMP CRITICAL")
+    u, tot = data.get("vram_used_mib"), data.get("vram_total_mib")
+    if isinstance(u, int) and isinstance(tot, int) and tot > 0 \
+            and u / tot * 100.0 > 90:
+        data["alerts"].append("GPU VRAM NEAR LIMIT")
+    if data.get("vllm_active") is False:
+        data["alerts"].append("vLLM SERVICE DOWN")
+    if data.get("vllm_active") and data.get("rounds_today") == 0:
+        data["alerts"].append("GPU IDLE")
+    return data
+
+_GPU_HEALTH = _gpu_health_snapshot
+
+
 def _verify_logic(task):
     status = (task.get("status") or "").lower()
     if status != "done":
@@ -755,6 +867,8 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_backup_log(qs)
         elif path == "/backup/health":
             self._handle_backup_health()
+        elif path == "/gpu/health":
+            self._send_json(_GPU_HEALTH())
         elif path == "/task":
             self._handle_get_task(qs)
         elif path == "/tasks":
