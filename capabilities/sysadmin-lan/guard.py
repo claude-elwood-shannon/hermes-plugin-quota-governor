@@ -83,7 +83,9 @@ _PERM_PATTERNS = [
         r"\bpstree\b|\bsensors\b|\blspci\b|\blsusb\b|\buname\b|"
         r"\bhostnamectl\b|\btimedatectl\b|\biostat\b|\bvmstat\b|"
         r"\bdocker\s+(ps|images|image\s+ls|info|version)\b|"
-        r"\bdocker\s+volume\s+ls\b|\bss\s+-tln\b|\bcat\s+/proc/sys/")),
+        r"\bdocker\s+volume\s+ls\b|\bss\s+-tln\b|\bcat\s+/proc/sys/|"
+        # probes HTTP de lectura (health checks de servicios LAN)
+        r"\bcurl\s+(?:-[a-zA-Z]+\s+)*https?://")),
     ("read_files", re.compile(
         r"(^|[;&|]|\$\(|`|\bsudo\s+|\bdoas\s+)\s*"
         r"(cat|head|tail|less|more|grep|egrep|fgrep|rg|ls|stat|wc|file|diff|"
@@ -109,7 +111,10 @@ _PERM_PATTERNS = [
         r"\bdocker\s+compose\s+(up|down|stop|start|restart|pull|build|ps|"
         r"config|logs|events|top|port)\b")),
     ("deploy_services", re.compile(
-        r"\bdocker\s+compose\s+(up|pull|down)\b")),
+        r"\bdocker\s+compose\s+(up|pull|down)\b|"
+        # crear el arbol de directorios del compose es parte de desplegar
+        # (restringido a ~/git/docker-compose/**)
+        r"\bmkdir\s+-p\s+[^\n;&|]*git/docker-compose")),
     ("manage_volumes", re.compile(
         r"\bdocker\s+volume\s+(create|ls|list|inspect)\b")),
     ("read_logs", re.compile(
