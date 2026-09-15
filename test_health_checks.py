@@ -117,30 +117,9 @@ def read_alert_log():
     return entries
 
 
-# ---------------------------------------------------------------------------
-# Clean up any previous test state
-# ---------------------------------------------------------------------------
-print("=" * 60)
-
-def main():
-    print("OBJ-09 Health Checks Test")
-    print(f"Test HERMES_HOME: {TEST_HOME}")
-    print("=" * 60)
-
-    # Clear the alert log if it exists
-    alert_log = get_alert_log_path()
-    if alert_log.exists():
-        alert_log.unlink()
-
-    # ---------------------------------------------------------------------------
-    # Test 1: Fast burn detection
-    # ---------------------------------------------------------------------------
-    print("\n--- Test 1: Fast burn detection ---")
-
-    now = datetime.now(timezone.utc)
-
-    # Two observations: 3 min apart, session jumps from 20% to 55% (>30pp delta)
-    obs_entries = [
+def _fast_burn_obs(now):
+    """Return the classic fast-burn observation pair (20% -> 55%)."""
+    return [
         {
             "timestamp": (now - timedelta(minutes=3)).isoformat(),
             "event": "periodic_sample",
@@ -152,9 +131,32 @@ def main():
             "quota": {"ollama_session_pct": 55.0, "ollama_weekly_pct": 15.0},
         },
     ]
-    setup_observation_file(obs_entries)
 
-    # Clear alert log for this test
+
+def _stale_obs(now, hours):
+    """Return a single observation that is ``hours`` old."""
+    return [
+        {
+            "timestamp": (now - timedelta(hours=hours)).isoformat(),
+            "event": "periodic_sample",
+            "quota": {"ollama_session_pct": 10.0, "ollama_weekly_pct": 5.0},
+        },
+    ]
+
+
+def _print_header():
+    """Print the test banner and test home."""
+    print("=" * 60)
+    print("OBJ-09 Health Checks Test")
+    print(f"Test HERMES_HOME: {TEST_HOME}")
+    print("=" * 60)
+
+
+def _test_fast_burn(now, alert_log):
+    """Run fast-burn detection: positive (30pp+) and negative (small delta)."""
+    print("\n--- Test 1: Fast burn detection ---")
+
+    setup_observation_file(_fast_burn_obs(now))
     if alert_log.exists():
         alert_log.unlink()
 
@@ -166,7 +168,6 @@ def main():
     else:
         fail("Fast burn: no alert generated (expected one)")
 
-    # Verify it's in the log
     log_entries = read_alert_log()
     fast_burn_in_log = any(e.get("type") == "fast_burn" for e in log_entries)
     if fast_burn_in_log:
@@ -195,13 +196,13 @@ def main():
     else:
         fail(f"Unexpected alert for small delta: {alert_neg}")
 
-    # ---------------------------------------------------------------------------
-    # Test 2: Zombie worker detection
-    # ---------------------------------------------------------------------------
+
+def _test_zombie_workers(now, alert_log):
+    """Run zombie-worker detection: a stale heartbeat must flag, healthy not."""
     print("\n--- Test 2: Zombie worker detection ---")
 
     # Restore the fast-burn observations (so silent plugin doesn't fire)
-    setup_observation_file(obs_entries)
+    setup_observation_file(_fast_burn_obs(now))
 
     # Create a kanban DB with a zombie task (heartbeat >2h ago)
     zombie_time = int((now - timedelta(hours=3)).timestamp())  # 3h ago
@@ -212,7 +213,6 @@ def main():
         ("t_healthy_01", "Healthy task", "pr-ollama", "running", healthy_time, healthy_time),
     ])
 
-    # Clear alert log for this test
     if alert_log.exists():
         alert_log.unlink()
 
@@ -241,22 +241,10 @@ def main():
     else:
         fail("Zombie worker alert NOT found in log file")
 
-    # ---------------------------------------------------------------------------
-    # Test 3: Silent plugin detection
-    # ---------------------------------------------------------------------------
-    print("\n--- Test 3: Silent plugin detection ---")
 
-    # Create an observations file with a single observation >1h old
-    old_ts = (now - timedelta(hours=2)).isoformat()
-    setup_observation_file([
-        {
-            "timestamp": old_ts,
-            "event": "periodic_sample",
-            "quota": {"ollama_session_pct": 10.0, "ollama_weekly_pct": 5.0},
-        },
-    ])
-
-    # Clear alert log for this test
+def _assert_silent_positive(now, alert_log):
+    """Verify a stale observation (>1h) triggers a silent_plugin alert + log."""
+    setup_observation_file(_stale_obs(now, 2))
     if alert_log.exists():
         alert_log.unlink()
 
@@ -276,7 +264,9 @@ def main():
     else:
         fail("Silent plugin alert NOT found in log file")
 
-    # Test negative: recent observation should NOT trigger silent plugin
+
+def _assert_silent_recent_no_alert(now):
+    """Verify a recent observation (<1h) does NOT trigger silent_plugin."""
     print("\n  --- Negative test: recent observation (<1h) ---")
     recent_ts = (now - timedelta(minutes=10)).isoformat()
     setup_observation_file([
@@ -292,7 +282,9 @@ def main():
     else:
         fail(f"Unexpected alert for recent observation: {alert_neg}")
 
-    # Test: no observations file at all
+
+def _assert_silent_missing_file(alert_log):
+    """Verify a missing observations file triggers a silent_plugin alert."""
     print("\n  --- Edge case: no observations file ---")
     obs_path = get_observations_file()
     if obs_path.exists():
@@ -305,17 +297,12 @@ def main():
     else:
         fail("No alert for missing observations file (expected one)")
 
-    # Test: idle profile suppression (no active tasks)
+
+def _assert_silent_idle_profile(now, alert_log):
+    """Verify a profile with no active tasks suppresses silent_plugin."""
     print("\n  --- Idle profile: no active tasks should suppress silent_plugin ---")
     # Setup stale observations but give the profile zero active tasks
-    old_ts = (now - timedelta(hours=2)).isoformat()
-    setup_observation_file([
-        {
-            "timestamp": old_ts,
-            "event": "periodic_sample",
-            "quota": {"ollama_session_pct": 10.0, "ollama_weekly_pct": 5.0},
-        },
-    ])
+    setup_observation_file(_stale_obs(now, 2))
     # Profile name = "pr-idle-dummy", no tasks in DB for it
     if alert_log.exists():
         alert_log.unlink()
@@ -325,7 +312,9 @@ def main():
     else:
         fail(f"Alert fired for idle profile: {alert_idle}")
 
-    # Test: active task should NOT suppress
+
+def _assert_silent_active_profile(now, alert_log):
+    """Verify a profile with a running task does NOT suppress silent_plugin."""
     print("\n  --- Active profile: running task should NOT suppress silent_plugin ---")
     # Give pr-active-dummy a running task in the kanban DB
     setup_kanban_db([
@@ -339,13 +328,19 @@ def main():
     else:
         fail("Silent_plugin suppressed but profile has running tasks")
 
-    # Clean up the active task kanban DB so run_all_health_checks doesn't see it
-    if alert_log.exists():
-        alert_log.unlink()
 
-    # ---------------------------------------------------------------------------
-    # Test: Dedup/backoff — same alert type consecutively should suppress
-    # ---------------------------------------------------------------------------
+def _test_silent_plugin(now, alert_log):
+    """Run silent-plugin detection: stale obs, edge cases and profile states."""
+    print("\n--- Test 3: Silent plugin detection ---")
+    _assert_silent_positive(now, alert_log)
+    _assert_silent_recent_no_alert(now)
+    _assert_silent_missing_file(alert_log)
+    _assert_silent_idle_profile(now, alert_log)
+    _assert_silent_active_profile(now, alert_log)
+
+
+def _test_dedup_backoff(alert_log):
+    """Run dedup/backoff checks: same alert consecutive should suppress."""
     print("\n--- Test: Dedup/backoff for repeated alerts ---")
 
     # Clear log
@@ -391,36 +386,9 @@ def main():
     if alert_log.exists():
         alert_log.unlink()
 
-    # ---------------------------------------------------------------------------
-    print("\n--- Test 4: run_all_health_checks integration ---")
 
-    # Setup: fresh observations with fast-burn + zombie + silent
-    # NOTE: re-setup the zombie kanban DB because the previous test overwrote it
-    zombie_time = int((now - timedelta(hours=3)).timestamp())  # 3h ago
-    healthy_time = int(now.timestamp())  # just now
-
-    setup_kanban_db([
-        ("t_zombie_01", "Zombie task", "pr-nanogpt", "running", zombie_time, zombie_time),
-        ("t_healthy_01", "Healthy task", "pr-ollama", "running", healthy_time, healthy_time),
-    ])
-    setup_observation_file([
-        {
-            "timestamp": (now - timedelta(minutes=3)).isoformat(),
-            "event": "periodic_sample",
-            "quota": {"ollama_session_pct": 20.0, "ollama_weekly_pct": 10.0},
-        },
-        {
-            "timestamp": now.isoformat(),
-            "event": "periodic_sample",
-            "quota": {"ollama_session_pct": 55.0, "ollama_weekly_pct": 15.0},
-        },
-    ])
-    # zombie DB already set up from test 2
-
-    if alert_log.exists():
-        alert_log.unlink()
-
-    all_alerts = run_all_health_checks()
+def _test_run_all_asserts(all_alerts, log_entries):
+    """Assert the expected alert types appear in both results and log."""
     types_found = {a["type"] for a in all_alerts}
     print(f"  All alerts: {len(all_alerts)} ({types_found})")
 
@@ -451,7 +419,6 @@ def main():
         fail("format_alerts_for_stdout produced no output")
 
     # Verify all alerts are in the log
-    log_entries = read_alert_log()
     log_types = {e.get("type") for e in log_entries}
     print(f"  Log types: {log_types}")
     if "fast_burn" in log_types and "zombie_worker" in log_types:
@@ -459,12 +426,63 @@ def main():
     else:
         fail(f"Missing alert types in log. Found: {log_types}")
 
-    # ---------------------------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------------------------
+
+def _test_run_all_integration(now, alert_log):
+    """Run run_all_health_checks integration and verify combined output."""
+    print("\n--- Test 4: run_all_health_checks integration ---")
+
+    # Setup: fresh observations with fast-burn + zombie + silent
+    # NOTE: re-setup the zombie kanban DB because the previous test overwrote it
+    zombie_time = int((now - timedelta(hours=3)).timestamp())  # 3h ago
+    healthy_time = int(now.timestamp())  # just now
+
+    setup_kanban_db([
+        ("t_zombie_01", "Zombie task", "pr-nanogpt", "running", zombie_time, zombie_time),
+        ("t_healthy_01", "Healthy task", "pr-ollama", "running", healthy_time, healthy_time),
+    ])
+    setup_observation_file(_fast_burn_obs(now))
+
+    if alert_log.exists():
+        alert_log.unlink()
+
+    all_alerts = run_all_health_checks()
+    log_entries = read_alert_log()
+    _test_run_all_asserts(all_alerts, log_entries)
+
+
+def _print_summary():
+    """Print the pass/fail summary block."""
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")
     print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Clean up any previous test state
+# ---------------------------------------------------------------------------
+
+def main():
+    _print_header()
+
+    # Clear the alert log if it exists
+    alert_log = get_alert_log_path()
+    if alert_log.exists():
+        alert_log.unlink()
+
+    now = datetime.now(timezone.utc)
+
+    _test_fast_burn(now, alert_log)
+    _test_zombie_workers(now, alert_log)
+    _test_silent_plugin(now, alert_log)
+
+    # Clean up the active task kanban DB so run_all_health_checks doesn't see it
+    if alert_log.exists():
+        alert_log.unlink()
+
+    _test_dedup_backoff(alert_log)
+    _test_run_all_integration(now, alert_log)
+
+    _print_summary()
 
     # Cleanup
     shutil.rmtree(TEST_HOME, ignore_errors=True)
