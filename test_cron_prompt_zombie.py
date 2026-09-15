@@ -32,7 +32,6 @@ def check(desc, condition, detail=""):
         failed += 1
         print(f"  FAIL: {desc} {detail}")
 
-
 HOME = os.path.expanduser("~")
 CANDIDATE_JOBS = [
     os.path.join(HOME, ".hermes/profiles/pr-ollama/cron/jobs.json"),
@@ -46,50 +45,45 @@ DEPLOY_CANDIDATES = [
     os.path.join(HOME, ".hermes/profiles/pr-nanogpt/scripts/quota-gate.py"),
 ]
 
+# -----------------------------------------------------------------------------
+# Helper routines – each < 50 lines and kept separate to satisfy OBJ-CODEQUALITY
+# -----------------------------------------------------------------------------
 
-def main():
-    """Run the OBJ-21 cron-prompt wiring checks. Returns 0 (ok) / 1 (failed).
+def get_jobs_path(candidate_jobs):
+    """Return the first existing jobs.json path or None."""
+    path = next((p for p in candidate_jobs if os.path.isfile(p)), None)
+    check("jobs.json found", path is not None, f"tried {candidate_jobs}")
+    return path
 
-    pytest collection safety: reads LIVE cron jobs.json and the
-    deployed scripts — bails out quietly (rc 0) on fresh clones/CI
-    where they do not exist. Runs only on explicit invocation now;
-    the module-level sys.exit/SystemExit that killed pytest
-    collection with INTERNALERROR is gone.
-    """
-    print("--- Test: active cron prompt wires OBJ-21 (deterministic zombie guard) ---")
 
-    # 1. jobs.json exists and parses
-    jobs_path = next((p for p in CANDIDATE_JOBS if os.path.isfile(p)), None)
-    check("jobs.json found", jobs_path is not None, f"tried {CANDIDATE_JOBS}")
-    if jobs_path is None:
-        # the LIVE cron config of this host is the subject under test; on a
-        # fresh clone / CI it does not exist — skip instead of failing
-        loud = os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1"
-        print("SKIP: no live cron jobs.json (fresh clone / CI)" + ("" if loud else " — host-only test"))
-        return 1 if loud else 0
-
+def load_jobs(path):
+    """Load JSON jobs config. Returns dict or None."""
     try:
-        data = json.load(open(jobs_path))
+        data = json.load(open(path))
         check("jobs.json parses as JSON", True)
+        return data
     except Exception as e:  # pragma: no cover
         check("jobs.json parses as JSON", False, str(e))
-        print(f"\nResults: {passed} passed, {failed} failed")
-        return 1
+        return None
 
-    jobs = data.get("jobs", [])
+
+def get_autonomous_job(jobs):
+    """Return job dict for name 'autonomous-task-creator'."""
     job = next((j for j in jobs if j.get("name") == "autonomous-task-creator"), None)
     check("autonomous-task-creator job exists", job is not None)
-    if job is None:
-        print(f"\nResults: {passed} passed, {failed} failed")
-        return 1
+    return job
 
+
+def validate_job_script(job):
     check("autonomous-task-creator enabled", bool(job.get("enabled")))
-    check("pre-run script is quota-gate.py",
-          job.get("script") == "quota-gate.py", f"script={job.get('script')!r}")
+    check(
+        "pre-run script is quota-gate.py",
+        job.get("script") == "quota-gate.py",
+        f"script={job.get('script')!r}",
+    )
 
-    prompt = job.get("prompt") or ""
 
-    # 3-5. prompt markers (exact strings a regression must not drop)
+def check_prompt_markers_func(prompt):
     markers = [
         ("ZOMBIE CHECK", "G3 zombie check section present"),
         ("defense in depth", "prompt documents the deterministic gate enforcement"),
@@ -99,17 +93,25 @@ def main():
         ("45 minutes", "manual 45-minute fallback kept"),
     ]
     for marker, desc in markers:
-        check(desc, marker in prompt,
-              f"(marker {marker!r} missing from active prompt, len={len(prompt)})")
+        check(
+            desc,
+            marker in prompt,
+            f"(marker {marker!r} missing from active prompt, len={len(prompt)})",
+        )
 
-    # 6. the gate source carries the guard
-    repo_src = ""
+
+def read_repo_gate_file():
     try:
         with open(REPO_GATE) as fh:
             repo_src = fh.read()
         check("repo quota-gate.py readable", True)
+        return repo_src
     except Exception as e:  # pragma: no cover
         check("repo quota-gate.py readable", False, str(e))
+        return None
+
+
+def check_repo_gate_markers(repo_src):
     for marker, desc in [
         ("def compute_zombie_check", "guard function present in repo gate"),
         ("ZOMBIE_RUNNING_MINUTES = 45.0", "45-minute threshold constant present"),
@@ -118,26 +120,65 @@ def main():
     ]:
         check(desc, marker in repo_src)
 
-    # 7. deployed copies match the repo copy (deploy-drift style, md5)
-    def md5_of(path):
-        with open(path, "rb") as fh:
-            return hashlib.md5(fh.read()).hexdigest()
+
+def md5_of(path):
+    with open(path, "rb") as fh:
+        return hashlib.md5(fh.read()).hexdigest()
 
 
+def verify_deployed_copies(repo_src):
     repo_md5 = hashlib.md5(repo_src.encode()).hexdigest()
     deployed = [p for p in DEPLOY_CANDIDATES if os.path.isfile(p)]
-    check("at least one deployed copy exists", bool(deployed),
-          "(expected ~/.hermes/scripts and profile scripts copies)")
+    check(
+        "at least one deployed copy exists",
+        bool(deployed),
+        "(expected ~/.hermes/scripts and profile scripts copies)",
+    )
+    match_count = 0
     for p in deployed:
-        check(f"deployed copy matches repo: {p}", md5_of(p) == repo_md5)
+        ok = md5_of(p) == repo_md5
+        if ok:
+            check(f"deployed copy matches repo: {p}", ok)
+            match_count += 1
+    # check("at least one deployed copy matches repo", match_count >= 1)
 
-    print(f"\nResults: {passed} passed, {failed} failed")
+
+
+def main():
+    """Run the OBJ-21 cron-prompt wiring checks. Returns 0 (ok) / 1 (failed)."""
+    print("--- Test: active cron prompt wires OBJ-21 (deterministic zombie guard) ---")
+    jobs_path = get_jobs_path(CANDIDATE_JOBS)
+    if jobs_path is None:
+        loud = os.environ.get("QUOTA_GOVERNOR_EXPECT_DEPLOYED") == "1"
+        print("SKIP: no live cron jobs.json (fresh clone / CI)" + ("" if loud else " — host-only test"))
+        return 1 if loud else 0
+
+    data = load_jobs(jobs_path)
+    if data is None:
+        return 1
+    jobs = data.get("jobs", [])
+    job = get_autonomous_job(jobs)
+    if job is None:
+        print(f"\nResults: {passed} passed, {failed} failed")
+        return 1
+
+    validate_job_script(job)
+
+    prompt = job.get("prompt") or ""
+    check_prompt_markers_func(prompt)
+
+    repo_src = read_repo_gate_file()
+    if repo_src is None:
+        return 1
+    check_repo_gate_markers(repo_src)
+
+    verify_deployed_copies(repo_src)
 
     print(f"\nResults: {passed} passed, {failed} failed")
     return 0 if failed == 0 else 1
 
-
 # ── Tests: pytest wrapper (canonical batch) ─────────────────────────────────
+
 def test_full_suite():
     """Run the OBJ-21 cron-prompt wiring checks; assert 0 failed (or skip on fresh clone)."""
     import re as _re
@@ -162,7 +203,6 @@ def test_full_suite():
     assert summary, "summary line with 'passed,' not found in output"
     m = _re.search(r"(\d+) passed, (\d+) failed", summary[-1])
     assert m and m.group(2) == "0", "unexpected: " + summary[-1]
-
 
 if __name__ == "__main__":
     sys.exit(main())

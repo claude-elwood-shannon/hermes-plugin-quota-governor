@@ -606,85 +606,97 @@ def request_window_totals_all_homes(
         return None
 
 
+def _prepare_snapshot(hermes_home: Optional[str] = None) -> Optional[dict]:
+    """Return a usable snapshot, falling back to cache if request fails."""
+    snap = fetch_snapshot()
+    if snap["source"] == "unavailable" or snap.get("usd_balance") is None:
+        cached = read_cache(hermes_home)
+        return dict(cached, source="cache") if cached and cached.get("usd_balance") is not None else None
+    return snap
+
+
+def _update_and_log_budget(snap: dict, hermes_home: Optional[str],
+                             max_spend_usd: Optional[float] = None,
+                             warn_fraction: Optional[float] = None) -> dict:
+    """Update budget and append ledger row. Returns updated budget dict."""
+    budget = update_budget(snap, max_spend_usd=max_spend_usd,
+                           warn_fraction=warn_fraction,
+                           hermes_home=hermes_home)
+    append_ledger({
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "usd_balance": snap.get("usd_balance"),
+        "weekly_tokens_pct": snap.get("weekly_tokens_pct"),
+        "policy_allows_balance": snap.get("policy_allows_balance"),
+        "window_spent_usd": round(float(budget.get("spent_usd", 0.0)), 6),
+        "source": snap.get("source"),
+    }, hermes_home)
+    return budget
+
+
+def _compute_level(budget: dict, max_spend: float, warn_frac: float) -> str:
+    spent = float(budget.get("spent_usd", 0.0))
+    if spent >= max_spend:
+        return "stop"
+    if spent / max_spend >= warn_frac:
+        return "warn"
+    return "ok"
+
+
+def _compile_context(snap: dict, budget: dict, level: str,
+                      req_totals: Optional[dict], covered: Optional[set]) -> dict:
+    max_spend = float(budget.get("max_spend_usd", DEFAULT_MAX_SPEND_USD))
+    spent = float(budget.get("spent_usd", 0.0))
+    frac = spent / max_spend if max_spend > 0 else 0.0
+    return {
+        "usd_balance": snap.get("usd_balance"),
+        "weekly_tokens_pct": snap.get("weekly_tokens_pct"),
+        "state": snap.get("state"),
+        "policy_allows_balance": snap.get("policy_allows_balance"),
+        "window_start": budget.get("window_start"),
+        "window_spent_usd": round(spent, 4),
+        "window_max_spend_usd": max_spend,
+        "window_fraction": round(frac, 4),
+        "request_covered_usd": req_totals.get("request_covered_usd") if req_totals else None,
+        "request_balance_usd": req_totals.get("request_balance_usd") if req_totals else None,
+        "level": level,
+        "covered_model_count": len(covered) if covered is not None else None,
+        "coverage_unknown": covered is None,
+        "source": snap.get("source"),
+    }
+
+
+
 def budget_context(max_spend_usd: Optional[float] = None,
                    warn_fraction: Optional[float] = None,
                    hermes_home: Optional[str] = None) -> Tuple[Optional[dict], Optional[str]]:
     """One call for quota-gate.py. Never raises; degrades gracefully.
-
-    Returns (context_dict_or_None, warning_string_or_None).
-    """
+    Returns (context_dict_or_None, warning_string_or_None)."""
     try:
-        snap = fetch_snapshot()
-        if snap["source"] == "unavailable" or snap.get("usd_balance") is None:
-            cached = read_cache(hermes_home)
-            if cached and cached.get("usd_balance") is not None:
-                snap = dict(cached, source="cache")
-            else:
-                return None, None
-
-        budget = update_budget(snap, max_spend_usd=max_spend_usd,
-                               warn_fraction=warn_fraction,
-                               hermes_home=hermes_home)
-        append_ledger({
-            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "usd_balance": snap.get("usd_balance"),
-            "weekly_tokens_pct": snap.get("weekly_tokens_pct"),
-            "policy_allows_balance": snap.get("policy_allows_balance"),
-            "window_spent_usd": round(float(budget.get("spent_usd", 0.0)), 6),
-            "source": snap.get("source"),
-        }, hermes_home)
-
+        snap = _prepare_snapshot(hermes_home)
+        if snap is None:
+            return None, None
+        budget = _update_and_log_budget(snap, hermes_home,
+                                       max_spend_usd=max_spend_usd,
+                                       warn_fraction=warn_fraction)
         max_spend = float(budget.get("max_spend_usd", DEFAULT_MAX_SPEND_USD))
         spent = float(budget.get("spent_usd", 0.0))
-        frac = spent / max_spend if max_spend > 0 else 0.0
         warn_frac = float(budget.get("warn_fraction", DEFAULT_WARN_FRACTION))
-        if spent >= max_spend:
-            level = "stop"
-        elif frac >= warn_frac:
-            level = "warn"
-        else:
-            level = "ok"
-
+        level = _compute_level(budget, max_spend, warn_frac)
         covered, cov_err = fetch_covered_models()
         req_totals = None
         with contextlib.suppress(Exception):
             req_totals = request_window_totals(hermes_home=hermes_home)
-        ctx = {
-            "usd_balance": snap.get("usd_balance"),
-            "weekly_tokens_pct": snap.get("weekly_tokens_pct"),
-            "state": snap.get("state"),
-            "policy_allows_balance": snap.get("policy_allows_balance"),
-            "window_start": budget.get("window_start"),
-            "window_spent_usd": round(spent, 4),
-            "window_max_spend_usd": max_spend,
-            "window_fraction": round(frac, 4),
-            "request_covered_usd": (req_totals or {}).get("request_covered_usd"),
-            "request_balance_usd": (req_totals or {}).get("request_balance_usd"),
-            "level": level,
-            # MEDIATOR t_4fa0a4b5: the full covered-model LIST no longer
-            # travels in the gate snapshot. It inflated the cron prompt by
-            # ~20 KB with model names like "uncensored"/"obliterated",
-            # which trips the upstream data_inspection filter of
-            # Console Go (HTTP 400) intermittently and killed the creator
-            # before it could answer. Consumers only need the COUNT plus
-            # a targeted membership probe.
-            "covered_model_count": (len(covered)
-                                    if covered is not None else None),
-            "coverage_unknown": covered is None,
-            "source": snap.get("source"),
-        }
+        ctx = _compile_context(snap, budget, level, req_totals, covered)
         warning = None
         if level == "warn":
-            warning = (f"nanogpt budget: ${spent:.2f} of ${max_spend:.2f} "
+            warning = (f"nanogpt budget: ${ctx['window_spent_usd']:.2f} of ${max_spend:.2f} "
                        f"weekly balance budget spent (>= {int(warn_frac*100)}%)")
         elif level == "stop":
-            warning = (f"nanogpt budget EXHAUSTED: ${spent:.2f} >= "
+            warning = (f"nanogpt budget EXHAUSTED: ${ctx['window_spent_usd']:.2f} >= "
                        f"${max_spend:.2f} weekly balance budget — "
-                       f"balance-only models dropped, subscription models "
-                       f"still routed")
+                       f"balance-only models dropped, subscription models still routed")
         if cov_err and covered is None:
-            warning = (warning + "; " if warning else "") + \
-                f"nanogpt coverage list unavailable: {cov_err}"
+            warning = (warning + "; " if warning else "") + f"nanogpt coverage list unavailable: {cov_err}"
         return ctx, warning
     except Exception as exc:  # never break the gate
         return None, f"nanogpt budget context error: {exc}"

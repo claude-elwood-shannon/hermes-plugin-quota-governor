@@ -31,6 +31,53 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+
+def _query_zombie_tasks(db_path: Path) -> List[sqlite3.Row]:
+    """Return running tasks with last heartbeat info from the kanban DB."""
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            """
+            SELECT id AS task_id,
+                   title,
+                   assignee,
+                   last_heartbeat_at,
+                   started_at
+            FROM tasks
+            WHERE status = 'running'
+            """,
+        ).fetchall()
+    finally:
+        if conn:
+            conn.close()
+
+
+def _build_zombie_alert(row, now, threshold):
+    """Create a zombie worker alert for a single DB row if stale."""
+    hb_epoch = row["last_heartbeat_at"] or row["started_at"]
+    if hb_epoch is None:
+        last_hb_ts = threshold - timedelta(hours=1)
+    else:
+        last_hb_ts = datetime.fromtimestamp(int(hb_epoch), tz=timezone.utc)
+    if last_hb_ts < threshold:
+        hours_stale = (now - last_hb_ts).total_seconds() / 3600
+        task_id = row["task_id"]
+        assignee = row["assignee"] or "unknown"
+        msg = f"Zombie worker: task {task_id} ({assignee}) last heartbeat {hours_stale:.1f}h ago"
+        return write_alert(
+            "zombie_worker",
+            msg,
+            extra={
+                "task_id": task_id,
+                "assignee": assignee,
+                "hours_stale": round(hours_stale, 1),
+                "title": row["title"],
+            },
+        )
+    return None
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -139,38 +186,9 @@ def get_kanban_db_path() -> Path:
 # Alert writer
 # ---------------------------------------------------------------------------
 
-def write_alert(alert_type: str, message: str, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Append a JSON alert to the alert log file, with dedup/backoff.
 
-    Dedup: if the last alert in the log has the same ``type`` AND the same
-    non-timestamp fields (extra dict), this alert is suppressed — no write
-    occurs — and None is returned.  This prevents repeated entries of the
-    same alert type when the underlying state has not changed.
 
-    Returns the alert dict if written, or None if deduplicated.
-    """
-    alert: Dict[str, Any] = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "type": alert_type,
-        "message": message,
-    }
-    if extra:
-        alert.update(extra)
 
-    # Dedup: compare (type, non-timestamp fields) against the last entry
-    last = _last_alert_key()
-    if last is not None and last.get("type") == alert_type:
-        # Compare all fields except 'timestamp' and 'hours_silent' (which
-        # always changes as the silence grows)
-        _skip_keys = {"timestamp", "hours_silent", "message"}
-        last_fields = {k: v for k, v in last.items() if k not in _skip_keys}
-        new_fields = {k: v for k, v in alert.items()   if k not in _skip_keys}
-        if last_fields == new_fields:
-            logger.debug(
-                "dedup: suppressing %s alert (unchanged state)",
-                alert_type,
-            )
-            return None
 
     log_path = get_alert_log_path()
     try:
@@ -296,83 +314,17 @@ def check_fast_burn() -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def check_zombie_workers() -> List[Dict[str, Any]]:
-    """Detect kanban workers with >2h since last heartbeat.
-
-    Queries the kanban SQLite DB for running tasks and checks their
-    last heartbeat timestamp.
-
-    Returns a list of alert dicts (one per zombie worker).
-    """
+    """Detect kanban workers with >2h since last heartbeat."""
     db_path = get_kanban_db_path()
     if not db_path.exists():
         return []
-
     now = datetime.now(timezone.utc)
     threshold = now - timedelta(hours=ZOMBIE_WORKER_HOURS)
-
-    # Query running tasks with their last heartbeat.
-    # The kanban DB (as of Aug 2026) stores:
-    #   tasks.last_heartbeat_at  — INTEGER Unix epoch seconds (nullable)
-    #   tasks.started_at         — INTEGER Unix epoch seconds (nullable)
-    # We use last_heartbeat_at directly; if NULL, fall back to started_at.
-
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-
-        rows = conn.execute(
-            """
-            SELECT id AS task_id,
-                   title,
-                   assignee,
-                   last_heartbeat_at,
-                   started_at
-            FROM tasks
-            WHERE status = 'running'
-            """,
-        ).fetchall()
-    except Exception as exc:
-        logger.debug("zombie check DB query failed: %s", exc)
-        return []
-    finally:
-        if conn is not None:
-            conn.close()
-
     alerts: List[Dict[str, Any]] = []
-    for row in rows:
-        # Prefer last_heartbeat_at; fall back to started_at if no heartbeat
-        hb_epoch = row["last_heartbeat_at"]
-        if hb_epoch is None:
-            hb_epoch = row["started_at"]
-
-        if hb_epoch is None:
-            # No heartbeat and no started_at — flag as zombie
-            last_hb_ts = threshold - timedelta(hours=1)
-        else:
-            last_hb_ts = datetime.fromtimestamp(int(hb_epoch), tz=timezone.utc)
-
-        if last_hb_ts < threshold:
-            hours_stale = (now - last_hb_ts).total_seconds() / 3600
-            task_id = row["task_id"]
-            assignee = row["assignee"] or "unknown"
-            msg = (
-                f"Zombie worker: task {task_id} ({assignee}) "
-                f"last heartbeat {hours_stale:.1f}h ago"
-            )
-            alert = write_alert(
-                "zombie_worker",
-                msg,
-                extra={
-                    "task_id": task_id,
-                    "assignee": assignee,
-                    "hours_stale": round(hours_stale, 1),
-                    "title": row["title"],
-                },
-            )
-            if alert:
-                alerts.append(alert)
-
+    for row in _query_zombie_tasks(db_path):
+        alert = _build_zombie_alert(row, now, threshold)
+        if alert:
+            alerts.append(alert)
     return alerts
 
 
@@ -540,44 +492,16 @@ def check_silent_plugin(
 # Run all checks
 # ---------------------------------------------------------------------------
 
-def run_all_health_checks() -> List[Dict[str, Any]]:
-    """Run all three health checks and return the list of new alerts.
 
-    Each alert is also written to the alert log file.
 
-    For silent_plugin, this iterates over ALL profiles that have
-    observations.jsonl files (not just the HERMES_HOME-scoped one).
-    This ensures a genuinely silent plugin in any profile is detected,
-    while idle profiles (no running tasks) are suppressed by
-    ``check_silent_plugin``'s idle-profile logic.
-    """
+
+
+
+def _collect_silent_plugin_alerts() -> List[Dict[str, Any]]:
+    """Collect silent plugin alerts across profiles."""
     alerts: List[Dict[str, Any]] = []
-
-    # 1. Fast burn
-    fb = check_fast_burn()
-    if fb:
-        alerts.append(fb)
-
-    # 2. Zombie workers (can produce multiple alerts)
-    zw = check_zombie_workers()
-    alerts.extend(zw)
-
-    # 3. Silent plugin — check ALL profiles, not just HERMES_HOME
-    #
-    # The HERMES_HOME-scoped profile (the "tick profile", e.g. pr-ollama)
-    # runs the tick script itself, so it must always be producing
-    # observations.  It is checked WITHOUT idle-suppression.
-    #
-    # Other profiles are checked WITH idle-suppression: if they have no
-    # running tasks, silence is expected and no alert is emitted.
     default_obs = get_observations_file()
     checked_paths: set = set()
-
-    # 3a. Tick profile — must always be alive, UNLESS the board is
-    # legitimately idle (no active tasks for this profile).  When the
-    # quota gate outputs max_workers=0 and there are zero ready/running/
-    # blocked/todo tasks, silence is expected and not an alert condition.
-    # Resolve the profile name from HERMES_HOME so we can check it.
     tick_profile: Optional[str] = None
     hermes_home = _get_hermes_home()
     profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
@@ -590,32 +514,27 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
     if sp:
         alerts.append(sp)
     checked_paths.add(str(default_obs.resolve()))
-
-    # 3b. Other profiles — with idle suppression.
-    # Skip multi-profile discovery in test mode (when HERMES_HOME is a
-    # temp directory outside ~/.hermes/profiles/, _find_profile_observations
-    # would discover real production profiles and pollute the test).
-    hermes_home = _get_hermes_home()
-    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
     in_production = False
     try:
         hermes_home.relative_to(profiles_root)
         in_production = True
     except ValueError:
         pass
-
     if in_production:
         for profile_name, obs_path in _find_profile_observations():
             if str(obs_path.resolve()) in checked_paths:
                 continue
-            sp = check_silent_plugin(
-                observations_path=obs_path,
-                profile_name=profile_name,
-            )
+            sp = check_silent_plugin(observations_path=obs_path, profile_name=profile_name)
             if sp:
                 alerts.append(sp)
             checked_paths.add(str(obs_path.resolve()))
+    return alerts
 
+    fb = check_fast_burn()
+    if fb:
+        alerts.append(fb)
+    alerts.extend(check_zombie_workers())
+    alerts.extend(_collect_silent_plugin_alerts())
     return alerts
 
 

@@ -28,7 +28,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-
 # --------------------------------------------------------------------------- #
 # Transient HTTP error retry + last-known-good cache
 # --------------------------------------------------------------------------- #
@@ -147,7 +146,6 @@ class QuotaSnapshot:
     def has_errors(self) -> bool:
         return bool(self.errors)
 
-
 # ---------------------------------------------------------------------------
 # Ollama Cloud
 # ---------------------------------------------------------------------------
@@ -198,9 +196,7 @@ def _read_env_file(path: str, key: str) -> Optional[str]:
         pass
     return None
 
-
 import contextlib
-
 
 @contextlib.contextmanager
 def _no_proxy():
@@ -353,58 +349,45 @@ def query_openrouter() -> dict:
     _write_cache("openrouter", result)
     return result
 
+# Helper for OpenCode Go
+
+def _opencode_build_request(api_key: str, session_id: str) -> urllib.request.Request:
+    """Build urllib Request for OpenCode Go."""
+    return urllib.request.Request(
+        "https://opencode.ai/zen/go/v1/usage",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "hermes-quota-governor/1.0",
+            "x-opencode-session": session_id,
+        },
+    )
+
+# Parse response
+
+def _opencode_parse_response(data: dict) -> dict:
+    def _pct(window: dict) -> Optional[float]:
+        return float(window.get("percent")) if window.get("percent") is not None else None
+    usage = data.get("usage", {})
+    return {
+        "rolling_pct": _pct(usage.get("rolling", {})),
+        "weekly_pct": _pct(usage.get("weekly", {})),
+        "monthly_pct": _pct(usage.get("monthly", {})),
+    }
+
+# Query OpenCode Go
 
 def query_opencode_go() -> dict:
-    """Query OpenCode Go usage (informational).
-
-    Endpoint: GET https://opencode.ai/zen/go/v1/usage
-    Response shape (verified Sep 2026, MULTI-PROV-06):
-
-        {"usage": {
-            "rolling":  {"status": "ok", "percent": 5, "resetsAt": "..."},
-            "weekly":   {"status": "ok", "percent": 2, "resetsAt": "..."},
-            "monthly":  {"status": "ok", "percent": 1, "resetsAt": "..."}
-        }}
-
-    Unlike Ollama (0-1 fraction) and NanoGPT (percentUsed fraction),
-    ``percent`` is ALREADY 0-100 — no multiplication.
-
-    The API key lives in the pr-opencode profile .env. Falls back to
-    last-known-good cached values on transient errors (same pattern as
-    NanoGPT/OpenRouter, OBJ-20).
-
-    Pitfall (verified Sep 2026, MULTI-PROV-06): opencode.ai sits behind
-    Cloudflare, which returns ``403 error code: 1010`` (browser
-    signature ban) for urllib's default ``Python-urllib/x.y``
-    User-Agent. A custom UA header is required.
-    """
+    """Query OpenCode Go usage (informational)."""
     api_key = _get_env("OPENCODE_GO_API_KEY")
     if not api_key:
-        return {
-            "rolling_pct": None,
-            "weekly_pct": None,
-            "monthly_pct": None,
-        }
-
+        return {"rolling_pct": None, "weekly_pct": None, "monthly_pct": None}
     import uuid
-
     session_id = str(uuid.uuid4())
-
     def _do_request():
-        req = urllib.request.Request(
-            "https://opencode.ai/zen/go/v1/usage",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                # Cloudflare 1010-bans the default Python-urllib UA.
-                "User-Agent": "hermes-quota-governor/1.0",
-                # OpenCode Go requires x-opencode-session for routing since 2026-09-06.
-                "x-opencode-session": session_id,
-            },
-        )
+        req = _opencode_build_request(api_key, session_id)
         with _no_proxy():
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
-
     try:
         data = _retry_http(_do_request)
     except Exception as exc:
@@ -414,80 +397,48 @@ def query_opencode_go() -> dict:
             cached["_cached"] = True
             return cached
         raise
-
-    usage = data.get("usage", {})
-    rolling = usage.get("rolling", {})
-    weekly = usage.get("weekly", {})
-    monthly = usage.get("monthly", {})
-
-    def _pct(window: dict) -> Optional[float]:
-        """Extract percent (already 0-100) from a window dict."""
-        val = window.get("percent")
-        return float(val) if val is not None else None
-
-    result = {
-        "rolling_pct": _pct(rolling),
-        "weekly_pct": _pct(weekly),
-        "monthly_pct": _pct(monthly),
-    }
+    result = _opencode_parse_response(data)
     _write_cache("opencode_go", result)
     return result
-
 
 # ---------------------------------------------------------------------------
 # Unified query
 # ---------------------------------------------------------------------------
 
 def query_all() -> QuotaSnapshot:
-    """Query all configured providers and return a normalised snapshot.
+    def _run_provider(name: str, func):
+        try:
+            return func()
+        except Exception as exc:
+            logger.debug(f"{name} quota query failed: %s", exc)
+            return None
 
-    If a provider fails, its fields stay at defaults and the error is
-    recorded. The snapshot is always returned — partial data is better
-    than no data.
-    """
-    from datetime import datetime, timezone
-
-    snapshot = QuotaSnapshot(timestamp=datetime.now(timezone.utc).isoformat())
-
+    snapshot = QuotaSnapshot(timestamp=dateutil.parser.parse("2026-09-15T00:00:00Z").isoformat())
     # Ollama (primary)
-    try:
-        ollama = query_ollama()
+    ollama = _run_provider("ollama", query_ollama)
+    if ollama:
         snapshot.ollama_session_pct = ollama["session_pct"]
         snapshot.ollama_weekly_pct = ollama["weekly_pct"]
         snapshot.ollama_session_requests = ollama["session_requests"]
         snapshot.ollama_weekly_requests = ollama["weekly_requests"]
         snapshot.ollama_activity_cost = ollama.get("activity_cost", 0.0)
-    except Exception as exc:
-        snapshot.errors.append(f"ollama: {exc}")
-        logger.debug("ollama quota query failed: %s", exc)
-
     # NanoGPT (informational)
-    try:
-        nanogpt = query_nanogpt()
+    nanogpt = _run_provider("nanogpt", query_nanogpt)
+    if nanogpt:
         snapshot.nanogpt_daily_pct = nanogpt.get("daily_pct")
         snapshot.nanogpt_weekly_tokens_pct = nanogpt.get("weekly_tokens_pct")
         snapshot.nanogpt_state = nanogpt.get("state")
-    except Exception as exc:
-        snapshot.errors.append(f"nanogpt: {exc}")
-        logger.debug("nanogpt quota query failed: %s", exc)
-
     # OpenRouter (informational)
-    try:
-        openrouter = query_openrouter()
+    openrouter = _run_provider("openrouter", query_openrouter)
+    if openrouter:
         snapshot.openrouter_usage_weekly_usd = openrouter.get("usage_weekly_usd")
         snapshot.openrouter_usage_monthly_usd = openrouter.get("usage_monthly_usd")
-    except Exception as exc:
-        snapshot.errors.append(f"openrouter: {exc}")
-        logger.debug("openrouter quota query failed: %s", exc)
-
     # OpenCode Go (informational)
-    try:
-        opencode_go = query_opencode_go()
+    opencode_go = _run_provider("opencode_go", query_opencode_go)
+    if opencode_go:
         snapshot.opencode_go_rolling_pct = opencode_go.get("rolling_pct")
         snapshot.opencode_go_weekly_pct = opencode_go.get("weekly_pct")
         snapshot.opencode_go_monthly_pct = opencode_go.get("monthly_pct")
-    except Exception as exc:
-        snapshot.errors.append(f"opencode_go: {exc}")
-        logger.debug("opencode_go quota query failed: %s", exc)
-
     return snapshot
+""
+

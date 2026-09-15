@@ -1591,22 +1591,8 @@ def _parse_privacy_tag_raw(text):
     return None
 
 
-def compute_privacy_summary(kanban_db_path=None, warnings=None):
-    """Census the privacy: tags of active tasks in kanban.db (OBJ-18 S1).
-
-    Counts every non-terminal task's ``privacy:<level>`` tag into the
-    OBJ-18 alias buckets {"high", "medium", "low", "none"}.  Tasks with no
-    tag count as none; malformed tags count as none AND emit a warning.
-    Read-only census — it never affects recommendation or routing.
-
-    Args:
-        kanban_db_path: Defaults to ``$HERMES_KANBAN_DB``, then
-            ``~/.hermes/kanban.db``.
-        warnings: Optional list to append warning strings to.
-
-    Returns:
-        dict {"high", "medium", "low", "none"} (all ints >= 0).
-    """
+def _compute_privacy_summary_core(kanban_db_path=None, warnings=None):
+    """Helper that builds the privacy summary dict."""
     summary = {"high": 0, "medium": 0, "low": 0, "none": 0}
     if warnings is None:
         warnings = []
@@ -1618,7 +1604,6 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
         kanban_db_path = os.path.expanduser("~/.hermes/kanban.db")
 
     if not os.path.isfile(kanban_db_path):
-        # No kanban.db — nothing to census.  Not an error.
         return summary
 
     try:
@@ -1634,14 +1619,17 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
         rows = cursor.fetchall()
         conn.close()
     except Exception as exc:
-        # DB error — fail open: return empty summary + warning.
         warnings.append(f"privacy_summary: kanban.db read failed: {exc}")
         return summary
 
     _tally_privacy_rows(rows, summary, warnings)
-
     return summary
 
+
+
+def compute_privacy_summary(kanban_db_path=None, warnings=None):
+    """Census the privacy: tags of active tasks in kanban.db (OBJ-18 S1)."""
+    return _compute_privacy_summary_core(kanban_db_path, warnings)
 
 def _tally_privacy_rows(rows, summary, warnings):
     """Increment *summary* buckets from the tasks' privacy tags.
