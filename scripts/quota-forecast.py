@@ -10,7 +10,7 @@ reset de los 3 providers (lunes ~02:00 CEST).
 Entrada:  metrics-history.jsonl (filas de quota-metrics.py)
 Salida:   forecast.json
             {providers: {provider: {pct_now, burn_rate_pct_per_min,
-                                    eta_90_iso, eta_100_iso, confidence}}}
+                                    eta_90_iso, eta_100_iso, confidence}}
 Stdout:   SOLO en anomalia (patron watchdog). Silencio = forecast OK.
 
 Reglas de decision (consumidas por el gate vía --suggest):
@@ -138,10 +138,11 @@ def _conf(n, burn):
     return 3 if n >= 8 else 2
 
 
-def main():
+def load_filas(path: Path):
+    """Lee metrics-history.jsonl -> lista de dicts con 'ts'. Corruptas se omiten."""
     filas = []
     try:
-        for line in HISTORY.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             try:
                 d = json.loads(line)
                 if isinstance(d, dict) and d.get("ts"):
@@ -150,70 +151,96 @@ def main():
                 continue
     except OSError:
         filas = []
+    return filas
 
-    now_epoch = time.time()
-    corte = now_epoch - VENTANA_SEG
-    # dedupe por ts (cron puede solaparse): última fila por ts
+
+def dedupe_by_ts(filas, corte):
+    """Filtra la ventana y dedupe por ts (cron puede solaparse): última por ts.
+
+    Devuelve (puntos_ts ordenados, por_ts dict epoch->fila).
+    """
     por_ts = {}
     for d in filas:
         e = _parse_iso(d["ts"])
         if e is None or e < corte:
             continue
         por_ts[e] = d
-    puntos_ts = sorted(por_ts)
+    return sorted(por_ts), por_ts
 
+
+def build_forecast(now_epoch, puntos_ts):
+    """Esqueleto de forecast.json: cabecera, ventana y próximo reset semanal."""
     forecast = {"generated_at": _iso(now_epoch),
                 "window_hours": VENTANA_SEG // 3600,
                 "alpha": ALFA,
                 "enabled": bool(puntos_ts),
                 "providers": {}}
-
     reset_epoch = next_weekly_reset_epoch(now_epoch)
     horas_hasta_reset = (reset_epoch - now_epoch) / 3600.0
     forecast["next_weekly_reset_iso"] = _iso(reset_epoch)
     forecast["hours_to_reset"] = round(horas_hasta_reset, 2)
+    return forecast
 
+
+def provider_forecast(now_epoch, pct_now, burn, eta90, eta100, n, samples):
+    """Bloque por provider: pct, burn EMA, ETAs 90/100, confianza, muestras."""
+    return {
+        "pct_now": round(pct_now, 2),
+        "burn_rate_pct_per_min": (round(burn, 6) if burn is not None else None),
+        "eta_90_iso": (_iso(now_epoch + eta90 * 3600)
+                       if eta90 is not None else None),
+        "eta_100_iso": (_iso(now_epoch + eta100 * 3600)
+                        if eta100 is not None else None),
+        "eta_90_hours": (round(eta90, 2) if eta90 is not None else None),
+        "eta_100_hours": (round(eta100, 2) if eta100 is not None else None),
+        "confidence": _conf(n, burn),
+        "samples": samples,
+        "pairs_used": n,
+    }
+
+
+def write_forecast(path: Path, forecast):
+    """Escribe forecast.json atómicamente (tmp + replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(forecast, ensure_ascii=False, indent=1))
+    tmp.replace(path)
+
+
+def finish(forecast, ok) -> int:
+    """Persiste el informe y reporta degradación. Siempre exit 0."""
+    try:
+        write_forecast(OUT, forecast)
+    except OSError as e:
+        print(f"quota-forecast: no se pudo escribir {OUT}: {e}")
+        return 0
+    if ok == 0:
+        print("quota-forecast: sin muestras suficientes en la ventana 6h "
+              "(history vacia) — forecast.json con enabled:false")
+    return 0
+
+
+def main() -> int:
+    filas = load_filas(HISTORY)
+    now_epoch = time.time()
+    corte = now_epoch - VENTANA_SEG
+    puntos_ts, por_ts = dedupe_by_ts(filas, corte)
+    forecast = build_forecast(now_epoch, puntos_ts)
     ok = 0
     for prov, key in METRICAS_WEEKLY.items():
         pares = [(e, por_ts[e].get(key)) for e in puntos_ts
                  if por_ts[e].get(key) is not None]
         if not pares:
             continue
-        pct_now = pares[-1][1]
-        pct_now = min(float(pct_now), HITO_FIN)
+        pct_now = min(float(pares[-1][1]), HITO_FIN)
         burn, n = ema_burn(pares)
         eta90 = eta_horas(pct_now, HITO_STOP, burn)
         eta100 = eta_horas(pct_now, HITO_FIN, burn)
-        fprov = {
-            "pct_now": round(pct_now, 2),
-            "burn_rate_pct_per_min": (round(burn, 6) if burn is not None else None),
-            "eta_90_iso": (_iso(now_epoch + eta90 * 3600)
-                           if eta90 is not None else None),
-            "eta_100_iso": (_iso(now_epoch + eta100 * 3600)
-                            if eta100 is not None else None),
-            "eta_90_hours": (round(eta90, 2) if eta90 is not None else None),
-            "eta_100_hours": (round(eta100, 2) if eta100 is not None else None),
-            "confidence": _conf(n, burn),
-            "samples": len(pares),
-            "pairs_used": n,
-        }
-        forecast["providers"][prov] = fprov
+        forecast["providers"][prov] = provider_forecast(
+            now_epoch, pct_now, burn, eta90, eta100, n, len(pares))
         ok += 1
-
     forecast["providers_ok"] = ok
-    try:
-        OUT.parent.mkdir(parents=True, exist_ok=True)
-        tmp = OUT.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(forecast, ensure_ascii=False, indent=1))
-        tmp.replace(OUT)
-    except OSError as e:
-        print(f"quota-forecast: no se pudo escribir {OUT}: {e}")
-        return 0
-
-    if ok == 0:
-        print("quota-forecast: sin muestras suficientes en la ventana 6h "
-              "(history vacia) — forecast.json con enabled:false")
-    return 0
+    return finish(forecast, ok)
 
 
 if __name__ == "__main__":
