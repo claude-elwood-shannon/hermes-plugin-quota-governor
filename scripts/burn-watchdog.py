@@ -99,8 +99,15 @@ from typing import Any, Dict, List, Optional
 HERMES_HOME = os.environ.get(
     "HERMES_HOME", os.path.expanduser("~/.hermes/profiles/pr-ollama")
 )
+# Single state directory: co-located under <HERMES_HOME>/quota-governor, the
+# SAME convention used by the gate (_cache_dir), the balance ledger, and the
+# weekly tracker. This was historically split — the watchdog defaulted to
+# the top-level ~/.hermes/quota-governor while the ledger/gate resolved
+# <HERMES_HOME>/quota-governor — so nanogpt-balance-ledger.jsonl lived in a
+# DIFFERENT dir than the watchdog could see, and burn-warnings wrote to a
+# place the gate never read. BURN_STATE_DIR remains a test override.
 STATE_DIR = os.environ.get(
-    "BURN_STATE_DIR", os.path.expanduser("~/.hermes/quota-governor")
+    "BURN_STATE_DIR", os.path.join(HERMES_HOME, "quota-governor")
 )
 LEDGER_FILE = os.path.join(STATE_DIR, "burn-ledger.jsonl")
 STATE_FILE = os.path.join(STATE_DIR, "burn-state.json")
@@ -109,6 +116,16 @@ CONFIG_FILE = os.path.join(STATE_DIR, "burn-watchdog.json")
 
 STOP_FILE = os.path.join(HERMES_HOME, "quota-governor", "STOP")
 PIDFILE = os.path.join(HERMES_HOME, "quota-governor-daemon.pid")
+
+# Gap detection (OBJ-39/t_cce2a554): the watchdog cron interval is 10m. A
+# tick that slips > GAP_MULTIPLIER x that interval means the per-tick
+# balance-delta couldn't see burn that happened in the hole — a 90s gate
+# timeout produced a 16:46→18:33Z hole on 14-sep that hid a $7.52 balance
+# spike. During a gap the watchdog covers retroactively from the INDEPENDENT
+# balance ledger written by nanogpt-balance-ledger.py every ~3 min.
+LEDGER_INTERVAL_S = 10 * 60          # watchdog cron interval (10m)
+GAP_MULTIPLIER = 2.0                 # >2x interval = a skipped tick
+BALANCE_LEDGER_FILE = os.path.join(STATE_DIR, "nanogpt-balance-ledger.jsonl")
 
 DEFAULT_GATE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "quota-gate.py"
@@ -443,17 +460,41 @@ def analyze_provider(
     bottleneck = max(windows, key=lambda w: w["pct"], default=None)
 
     cost_now, tick_cost = _estimate_tick_cost(provider, prior, cfg, bottleneck, burning)
+
+    # Retroactive cover over a >2x-interval hole: the watchdog was not running
+    # (gate timeout, cron gap), so the per-tick delta below is only partial.
+    # Fold in the balance-ledger burn the watchdog missed BEFORE the current
+    # delta accumulates, so a burst that fell entirely in the hole still trips
+    # WARN/STOP.
+    cover = read_balance_ledger(provider, prior, now)
+    if cover["gap"]:
+        tick_cost += cover["covered_usd"]
+
+    # Accumulate the real-meter burn regardless of the qualitative `burning`
+    # flag. `burning` was designed for CUMULATIVE-SPEND meters (opencode-go
+    # percent-delta + cost meter) where a recovered window resets the episode.
+    # A DECREASING balance meter (nanogpt prepaid) never flips `burning`
+    # (state stays "active"), yet its balance drop IS real burn — so a
+    # `if burning: cum += tick_cost` gate kept cum_cost_usd pinned at 0 and
+    # made the WARN/STOP thresholds unreachable for balance meters
+    # (OBJ-39/t_cce2a554). Only the pure percent-delta ESTIMATE (no real
+    # meter) stays gated on `burning`, so non-burning window creep never
+    # counts as spend.
     cum = float(prior.get("cum_cost_usd", 0.0))
-    if burning:
+    if cost_now is not None:
+        # First observation of a balance meter has no last_cost, so the
+        # per-tick delta is 0 — seed cum from the authoritative spent amount
+        # the watchdog missed before it started running (window_spent_usd).
+        if prior.get("last_cost") is None and meter_is_balance(provider):
+            cum = seed_balance_cum(provider, prior)
         cum += tick_cost
-    elif cost_now is None:
-        # Not burning and no real meter — don't accumulate estimates.
-        cum = float(prior.get("cum_cost_usd", 0.0))
+    elif burning and tick_cost > 0:
+        cum += tick_cost
 
     # Derived burn rate = cost consumed over the last tick interval (USD/min).
     # Needs at least one prior observation (tick_elapsed reflects the gap);
     # on the very first observation we cannot yet derive a rate.
-    if burning and tick_elapsed > 0 and prior.get("last_ts"):
+    if tick_elapsed > 0 and prior.get("last_ts") and tick_cost > 0:
         rate = tick_cost / max(tick_elapsed, 0.001)
     else:
         rate = 0.0
@@ -466,6 +507,8 @@ def analyze_provider(
         "bottleneck_pct": bottleneck["pct"] if bottleneck else None,
         "cost_now": cost_now,
         "tick_cost_usd": tick_cost,
+        "gap_covered_usd": cover["covered_usd"] if cover["gap"] else 0.0,
+        "gap": cover["gap"],
     }
 
 
@@ -479,7 +522,7 @@ def run_tick(gate_path: Optional[str] = None, now: Optional[float] = None) -> Li
     active_warnings: Dict[str, Any] = {}
 
     for provider in providers_from_snapshot(snapshot or {}):
-        alerts, active_warnings, state = _handle_provider(provider, state, config, now_t, active_warnings)
+        alerts, active_warnings, state = _handle_provider(provider, state, config, now_t, active_warnings, alerts)
 
     save_state(state)
     if active_warnings:
@@ -489,21 +532,128 @@ def run_tick(gate_path: Optional[str] = None, now: Optional[float] = None) -> Li
 # --- Helper functions below ----------------------------------------------
 
 
-def _handle_provider(provider: Dict[str, Any], state: Dict[str, Any], config: Dict[str, Any], now_ts: float, active_warnings: Dict[str, Any]):
+def _handle_provider(provider: Dict[str, Any], state: Dict[str, Any], config: Dict[str, Any], now_ts: float, active_warnings: Dict[str, Any], alerts: List[str]):
     """Process one provider and return updated alerts, active_warnings, state."""
     prov = provider.get("provider")
     if not prov:
-        return [], active_warnings, state
+        return alerts, active_warnings, state
     cfg = _prov_cfg(config, prov)
     pstate = state.get(prov, {})
     res = _analyze_provider_state(provider, pstate, cfg, now_ts)
     _persist_provider_observation(state, prov, pstate, res, now_ts)
-    alerts: List[str] = []
     if not cfg.get("enabled"):
         return alerts, active_warnings, state
     return _decide_provider_actions(
         state, prov, pstate, res, cfg, now_ts, alerts, active_warnings
     )
+
+
+# --------------------------------------------------------------------------
+# Balance-ledger retroactive cover + gap detection (OBJ-39/t_cce2a554)
+# --------------------------------------------------------------------------
+
+def read_balance_ledger(provider: Dict[str, Any], pstate: Dict[str, Any], now_ts: float) -> Dict[str, Any]:
+    """Return {covered_usd, covered_since, gap} from the independent balance ledger.
+
+    Reads nanogpt-balance-ledger.jsonl (the *other*, every-3-min source) and
+    accumulates the positive balance drops since the watchdog's last_ts (or
+    since the current balance was seeded). This covers burn the watchdog
+    missed while it was not running (a >2x-interval hole). Falls back to
+    {0.0, None, False} when the ledger is absent or the provider is not a
+    balance meter.
+    """
+    if not (provider_cost(provider) is not None and meter_is_balance(provider)):
+        return {"covered_usd": 0.0, "covered_since": None, "gap": False}
+    last_ts = pstate.get("last_ts")
+    if last_ts is None:
+        return {"covered_usd": 0.0, "covered_since": None, "gap": False}
+    gap = float(now_ts) - float(last_ts) > LEDGER_INTERVAL_S * GAP_MULTIPLIER
+    if not gap:
+        return {"covered_usd": 0.0, "covered_since": None, "gap": False}
+    covered = 0.0
+    covered_since: Optional[float] = None
+    try:
+        with open(BALANCE_LEDGER_FILE, "r", encoding="utf-8") as fh:
+            prev: Optional[float] = None
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    row = json.loads(ln)
+                except ValueError:
+                    continue
+                ts = _parse_ledger_ts(row.get("ts"))
+                bal = row.get("usd_balance")
+                if ts is None or bal is None or ts < float(last_ts):
+                    continue
+                bal = float(bal)
+                if prev is not None and bal < prev:
+                    covered += prev - bal
+                    covered_since = covered_since if covered_since is not None else ts
+                prev = bal
+    except OSError:
+        pass
+    return {"covered_usd": round(covered, 6), "covered_since": covered_since, "gap": gap}
+
+
+def seed_balance_cum(provider: Dict[str, Any], prior: Dict[str, Any]) -> float:
+    """Retroactive cumulative for a balance meter's FIRST observation.
+
+    The first time the watchdog sees a DECREASING balance meter it has no
+    ``last_cost``, so per-tick delta would be 0 and cum would seed at 0 — the
+    balance the watchdog has missed since the window started (or since it was
+    last running) would never register, so WARN/STOP would stay unreachable
+    even after $6+ overspent. Mirror the budget ledger: its trailing
+    ``window_spent_usd`` is the authoritative sum of balance drops in the
+    current weekly window. Seed ``cum`` from it so enforcement starts from the
+    real already-burned amount, not from zero (OBJ-39/t_cce2a554).
+    """
+    if not (provider_cost(provider) is not None and meter_is_balance(provider)):
+        return 0.0
+    if prior.get("last_cost") is not None:
+        return float(prior.get("cum_cost_usd", 0.0))
+    try:
+        with open(BALANCE_LEDGER_FILE, "r", encoding="utf-8") as fh:
+            spend = 0.0
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    row = json.loads(ln)
+                except ValueError:
+                    continue
+                v = row.get("window_spent_usd")
+                if v is not None:
+                    spend = float(v)
+            return round(spend, 6)
+    except OSError:
+        return float(prior.get("cum_cost_usd", 0.0))
+
+
+def _parse_ledger_ts(raw) -> Optional[float]:
+    """Epoch from the ledger's ISO or numeric timestamp; None if unparseable."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    s = str(raw)
+    s = s.rstrip("Z").replace("+00:00", "")
+    if " " in s:
+        s = s.replace(" ", "T")
+    try:
+        import datetime as _dt
+        dt = _dt.datetime.fromisoformat(s)
+        return dt.replace(tzinfo=_dt.timezone.utc if dt.tzinfo is None else dt.tzinfo).timestamp()
+    except (ValueError, TypeError):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
 
 
 def _analyze_provider_state(provider: Dict[str, Any], pstate: Dict[str, Any], cfg: Dict[str, Any], now_ts: float):
@@ -550,7 +700,28 @@ def _decide_provider_actions(state: Dict[str, Any], prov: str, pstate: Dict[str,
     warn_rate = float(cfg.get("burn_rate_warn_usd_per_min", 0.05))
     warn_total = float(cfg.get("burn_total_warn_usd", 0.20))
     stop_total = float(cfg.get("burn_total_stop_usd", 1.00))
-    if res["burning"]:
+    # Coverage gap: the watchdog was not running for >2x its interval, so it
+    # back-filled burn from the independent balance ledger. Surface it so the
+    # hole is traceable even when the retro-cover didn't itself cross a
+    # threshold. Ledger entry carries action=GAP for the audit trail.
+    if res.get("gap"):
+        alerted = f"BURN-COVERAGE-GAP {prov}: watchdog missed "
+        alerted += (
+            f"{res['gap_covered_usd']:.2f} during a >{LEDGER_INTERVAL_S // 60 * int(GAP_MULTIPLIER)}m hole; "
+            f"recovered from balance ledger (cum ${cum:.2f})"
+        )
+        alerts.append(alerted)
+        append_ledger({
+            "provider": prov,
+            "action": "GAP",
+            "gap_covered_usd": round(res.get("gap_covered_usd", 0.0), 6),
+            "cum_cost_usd": round(cum, 6),
+        })
+    # WARN also fires for a DECREASING balance meter, which never flips
+    # `burning` yet burns real prepaid spend. A real cost meter present
+    # (cost_now is not None) is sufficient to consider an accumulated WARN;
+    # only the pure percent-delta ESTIMATE stays gated on `burning`.
+    if res["burning"] or res["cost_now"] is not None:
         _maybe_provider_warn(prov, res, cum, rate, warn_rate, warn_total, stop_total, now_ts, alerts, active_warnings)
     _maybe_provider_stop(state, prov, pstate, res, cum, rate, stop_total, alerts)
     return alerts, active_warnings, state

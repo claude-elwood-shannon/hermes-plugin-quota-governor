@@ -107,6 +107,10 @@ class BaseWatchdogTest(unittest.TestCase):
         wd.CONFIG_FILE = os.path.join(self.state_dir, "burn-watchdog.json")
         wd.STOP_FILE = os.path.join(self.hermes_home, "quota-governor", "STOP")
         wd.PIDFILE = os.path.join(self.hermes_home, "quota-governor-daemon.pid")
+        # The independent balance ledger is the retroactive-cover/seed source;
+        # sandbox it (empty = no pre-existing spend) so tests are hermetic.
+        wd.BALANCE_LEDGER_FILE = os.path.join(self.state_dir,
+                                              "nanogpt-balance-ledger.jsonl")
 
     def tearDown(self):
         for p in self._patchers:
@@ -431,6 +435,154 @@ class TestStopFileKill(BaseWatchdogTest):
         self.assertEqual(len(alerts), 1)
         self.assertIn("daemon not running", alerts[0])
         self.assertTrue(os.path.exists(wd.STOP_FILE))
+
+
+class TestObj39NonBurningBalanceMeter(BaseWatchdogTest):
+    """OBJ-39/t_cce2a554: nanogpt NEVER reports burning (state ``active``,
+    weekly window without a status) yet its prepaid balance drops are real
+    burn. The watchdog must accumulate and WARN/STOP on that drop even when
+    ``is_burning()`` is False — the old ``if burning: cum += tick_cost`` gate
+    pinned cum_cost_usd at 0.0 forever, so the $6.98/$5.00 overspend never
+    alerted. Uses the PRODUCTION meter shape (no burning_balance, no *_status).
+    """
+
+    CONFIG = {
+        "nanogpt": {
+            "enabled": True,
+            "burn_total_warn_usd": 1.0,
+            "burn_total_stop_usd": 3.0,   # OBJ-26 production thresholds
+            "window_usd_cap": None,
+        }
+    }
+
+    @staticmethod
+    def _prod_nanogpt(balance):
+        """Exact production shape: state active, no burning flag, no status."""
+        return {
+            "profile": "pr-nanogpt", "provider": "nanogpt",
+            "model": "z-ai/glm-5.3-flash", "availability": 0.0,
+            "bottleneck_pct": 100.0, "bottleneck_window": "weekly_tokens+balance",
+            "error": "",
+            "raw": {"weekly_tokens_pct": 100.033175, "state": "active",
+                    "covered_first": True},
+            "balance": {"usd_balance": balance, "weekly_tokens_pct": 100.033175,
+                        "state": "active", "policy_allows_balance": True,
+                        "level": "stop"},
+        }
+
+    def test_seed_from_window_spent_fires_stop_on_first_tick(self):
+        """First observation has no last_cost, so per-tick delta is 0; the
+        watchdog must seed cum from the authoritative ``window_spent_usd``
+        (already $7.79) and STOP on the very first tick against the current
+        state — this is exactly the closure criterion (current spent >= stop).
+        """
+        self.write_config(self.CONFIG)
+        # Independent balance ledger carries the trailing window_spent_usd.
+        with open(wd.BALANCE_LEDGER_FILE, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-15T11:43:21+00:00", "usd_balance": 19.33577715,
+                "window_spent_usd": 7.786909, "source": "probe",
+            }) + "\n")
+        gate = self.stub_gate(_mk_snapshot([self._prod_nanogpt(19.33577715)]))
+        alerts = wd.run_tick(gate_path=gate, now=1_700_000_000)
+        self.assertTrue(any("BURN-STOP nanogpt" in a for a in alerts), alerts)
+        self.assertTrue(os.path.exists(wd.STOP_FILE))
+        state = self.read_state()
+        self.assertGreaterEqual(state["nanogpt"]["cum_cost_usd"], 7.7)
+
+    def test_seeded_spend_from_real_ledger(self):
+        """seed_balance_cum reads the trailing window_spent_usd when no real
+        fixture, mirroring the independent budget ledger."""
+        self.write_config(self.CONFIG)
+        # empty sandbox ledger -> seed 0, then no burn (no last_cost) -> WARN
+        # threshold 1.0 not hit, no alert. Guard: seed is 0 when ledger absent.
+        gate = self.stub_gate(_mk_snapshot([self._prod_nanogpt(19.33)]))
+        self.assertEqual(wd.run_tick(gate_path=gate, now=1_700_000_000), [])
+        state = self.read_state()
+        self.assertEqual(state["nanogpt"]["cum_cost_usd"], 0.0)
+
+    def test_non_burning_balance_drop_accumulates(self):
+        """A 0.40 drop with burning=False (production: never burning) still
+        accumulates against the WARN/STOP thresholds."""
+        self.write_config(self.CONFIG)
+        gate = self.stub_gate(_mk_snapshot([self._prod_nanogpt(19.33)]))
+        # First tick must have a last_cost to measure a delta; seed by running
+        # once with an empty ledger (cum 0, last_cost 19.33), then drain.
+        wd.run_tick(gate_path=gate, now=1_700_000_000)
+        self.write_gate(gate, _mk_snapshot([self._prod_nanogpt(18.93)]))
+        # 0.40 drop < warn 1.0 and < stop 3.0 -> warn rate (0.05/min) not set,
+        # so silent but still accumulated in state.
+        alerts = wd.run_tick(gate_path=gate, now=1_700_000_600)
+        self.assertEqual(alerts, [])
+        state = self.read_state()
+        self.assertGreaterEqual(state["nanogpt"]["cum_cost_usd"], 0.39)
+
+
+class TestObj39GapDetection(BaseWatchdogTest):
+    """OBJ-39/t_cce2a554 item 3: when a tick arrives >2x the ledger interval
+    after the last one (a skipped tick — e.g. the 14-sep 16:46->18:33Z gate
+    timeout hole), the watchdog must surface a coverage-gap alert AND fold the
+    burn that fell entirely in the hole (from the independent every-3-min
+    balance ledger) into the cumulative, so an over-threshold hole still
+    produces BURN-STOP retroactively.
+    """
+
+    CONFIG = {
+        "nanogpt": {
+            "enabled": True,
+            "burn_total_warn_usd": 1.0,
+            "burn_total_stop_usd": 1.0,   # small stop so the hole trips it
+            "window_usd_cap": None,
+        }
+    }
+
+    FIXTURE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures",
+        "nanogpt-balance-ledger-sep14-gap.jsonl")
+
+    @staticmethod
+    def _prod_nanogpt(balance):
+        return TestObj39NonBurningBalanceMeter._prod_nanogpt(balance)
+
+    def test_gap_hole_fires_coverage_alert_and_stop(self):
+        self.write_config(self.CONFIG)
+        # Use the real 14-sep fixture as the independent balance ledger.
+        with open(self.FIXTURE, encoding="utf-8") as fh:
+            rows = [json.loads(ln) for ln in fh if ln.strip()]
+        self.assertTrue(rows)
+        with open(wd.BALANCE_LEDGER_FILE, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        last_ts = _epoch(rows[-1]["ts"])
+        # Watchdog's last observation before the hole: balance 8.7498 at
+        # 16:46:48Z. It resumes well after (e.g. 18:35Z) with a DROPPED balance.
+        gate = self.stub_gate(_mk_snapshot([self._prod_nanogpt(7.95903088)]))
+        now = last_ts + 5  # >2x the interval after the last ledger row
+        # Seed prior last_ts in the hole to exercise the >2x gap path.
+        with open(wd.STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({
+                "nanogpt": {
+                    "provider": "nanogpt", "last_ts": _epoch(
+                        "2026-09-14T16:46:48.767557+00:00"),
+                    "burning": False, "cum_cost_usd": 0.0,
+                    "last_cost": 8.74979789, "last_pct": 100.033175,
+                }
+            }, fh)
+        alerts = wd.run_tick(gate_path=gate, now=now)
+        self.assertTrue(any("BURN-COVERAGE-GAP" in a for a in alerts),
+                        f"expected coverage alert, got {alerts}")
+        self.assertTrue(any("BURN-STOP nanogpt" in a for a in alerts),
+                        f"expected STOP after retro hole cover, got {alerts}")
+
+
+def _epoch(iso):
+    """ISO ts from the fixture ledger -> epoch seconds."""
+    import datetime as _dt
+    s = str(iso).rstrip("Z").replace("+00:00", "")
+    if " " in s:
+        s = s.replace(" ", "T")
+    dt = _dt.datetime.fromisoformat(s)
+    return dt.replace(tzinfo=_dt.timezone.utc).timestamp()
 
 
 if __name__ == "__main__":
