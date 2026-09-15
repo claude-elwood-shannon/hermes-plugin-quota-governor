@@ -45,10 +45,12 @@ Usage:
   python3 repo-sync-check.py --verbose    # verbose output (debug)
 
 Deploy-drift (OBJ-06 / t_b8511377):
-  Every run also md5-compares each repo scripts/ file against its deployed
-  copies in ~/.hermes/scripts/ and ~/.hermes/profiles/*/scripts/. A repo-only
-  script (never deployed) is NOT an alert. Divergence prints a DEPLOY_DRIFT
-  alert on stdout (cron delivery) — alert-only, never auto-deploys.
+  Every run also md5-compares every deployable file under scripts/
+  (recursively — subdirectories like scripts/obs/ included) against its
+  deployed copies in ~/.hermes/scripts/ and ~/.hermes/profiles/*/scripts/.
+  A repo-only script (never deployed) is NOT an alert. Divergence prints a
+  DEPLOY_DRIFT alert on stdout (cron delivery) — alert-only, never
+  auto-deploys.
 """
 
 import glob
@@ -314,13 +316,23 @@ def md5_of_file(path):
 def check_deploy_drift(repo_dir=None, deploy_dirs=None):
     """Compare each repo scripts/ file against its deployed copies.
 
-    Returns a list of drift dicts. Semantics:
+    Recursively scans scripts/ (subdirectory scripts count too, e.g.
+    scripts/obs/morning-screen.py). Deploy dirs are flat, so a subdir
+    script maps to the deployed copy with its bare basename.
+
+    Returns a list of drift dicts; 'script' is the repo-relative name
+    with '/', e.g. 'obs/morning-screen.py'. Semantics:
       - file deployed in >= 1 DEPLOY_DIRS and every deployed md5 == repo md5
             → in sync, not reported.
       - file deployed but at least one deployed md5 differs from repo md5
             → drift (stale deployed copy).
       - file present ONLY in the repo (no deployed copy anywhere)
             → no-deployed, NOT reported (explicit acceptance criterion).
+      - duplicated basename (same name at several repo paths, e.g.
+            top-level and obs/ copies): a deployed copy whose md5 matches
+            any same-basename repo file exactly is attributed to that file
+            (not drift for the rest); a copy matching none is reported
+            once, under the first same-basename file in sorted order.
       - repo file unreadable → skipped with a WARN (fail-safe).
     """
     if repo_dir is None:
@@ -332,18 +344,42 @@ def check_deploy_drift(repo_dir=None, deploy_dirs=None):
         log(f"No scripts/ dir under {repo_dir} — deploy-drift check skipped", "WARN")
         return []
 
-    drift = []
-    for name in sorted(os.listdir(scripts_dir)):
-        repo_path = os.path.join(scripts_dir, name)
-        if not os.path.isfile(repo_path):
-            continue  # subdirs (__pycache__ etc.) are not deployable scripts
-        repo_md5 = md5_of_file(repo_path)
-        if repo_md5 is None:
-            continue
+    # Recursive candidate scan (rglob of scripts/**): subdirectory scripts
+    # (scripts/obs/*.py, ...) are deployable too; only __pycache__ dirs are
+    # excluded. Names are repo-relative with '/', e.g. 'obs/morning-screen.py'.
+    candidates = []  # (name, repo_path, repo_md5), sorted by name
+    for root, dirs, files in os.walk(scripts_dir):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for fname in sorted(files):
+            repo_path = os.path.join(root, fname)
+            if not os.path.isfile(repo_path):
+                continue
+            name = os.path.relpath(repo_path, scripts_dir).replace(os.sep, "/")
+            repo_md5 = md5_of_file(repo_path)
+            if repo_md5 is None:
+                continue  # unreadable repo file: skipped with a WARN (fail-safe)
+            candidates.append((name, repo_path, repo_md5))
+    candidates.sort(key=lambda c: c[0])
 
-        deployed = []
-        for d in deploy_dirs:
-            dep_path = os.path.join(d, name)
+    md5_by_name = {name: md5 for name, _, md5 in candidates}
+    names_by_base = {}  # basename -> [repo-relative names, sorted]
+    for name, _, _ in candidates:
+        names_by_base.setdefault(os.path.basename(name), []).append(name)
+
+    # Deploy dirs are flat: collect each deployed copy once, keyed by its
+    # basename. Only copies whose basename exists in the repo are compared
+    # (a deployed file with no repo counterpart is not this check's scope).
+    copies_by_base = {}
+    for d in deploy_dirs:
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError as e:
+            log(f"deploy dir {d} unreadable: {e}", "WARN")
+            continue
+        for base in entries:
+            if base not in names_by_base:
+                continue
+            dep_path = os.path.join(d, base)
             if not os.path.isfile(dep_path):
                 continue
             dep_md5 = md5_of_file(dep_path)
@@ -353,17 +389,35 @@ def check_deploy_drift(repo_dir=None, deploy_dirs=None):
                 mtime = os.path.getmtime(dep_path)
             except OSError:
                 mtime = None
-            deployed.append({
+            copies_by_base.setdefault(base, []).append({
                 "dir": d,
                 "path": dep_path,
                 "md5": dep_md5,
                 "mtime": mtime,
             })
 
+    drift = []
+    for name, repo_path, repo_md5 in candidates:
+        base = os.path.basename(name)
+        group = names_by_base[base]
+        deployed = copies_by_base.get(base, [])
+
         if not deployed:
             continue  # no-deployed: script exists only in the repo — OK
 
-        stale = [d for d in deployed if d["md5"] != repo_md5]
+        stale = []
+        for dcp in deployed:
+            if dcp["md5"] == repo_md5:
+                continue
+            # Basename collision: the copy may belong to another repo file
+            # with the same name (md5-exact match) — not this file's drift.
+            # A copy matching none is genuinely stale: report it once, under
+            # the first same-basename file in sorted order (group[0]).
+            owners = [n for n in group if md5_by_name[n] == dcp["md5"]]
+            owner = owners[0] if owners else group[0]
+            if owner != name:
+                continue
+            stale.append(dcp)
         if stale:
             drift.append({
                 "script": name,

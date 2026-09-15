@@ -1089,11 +1089,84 @@ class TestCheckDeployDrift(_LogIsolationMixin, unittest.TestCase):
             drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
         self.assertEqual(drift, [])
 
-    def test_subdirs_ignored(self):
+    def test_pycache_ignored(self):
+        """__pycache__ dirs are not deployable, even with a same-basename copy."""
         tmp, repo_scripts = self._sandbox()
-        os.makedirs(os.path.join(repo_scripts, "__pycache__"))
-        with patch("repo_sync_check.DEPLOY_DIRS", []):
+        pc = os.path.join(repo_scripts, "__pycache__")
+        os.makedirs(pc)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(pc, "a.py"), "w").write("stale-pyc")
+        open(os.path.join(dep, "a.py"), "w").write("other")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
             self.assertEqual(_mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts)), [])
+
+    def test_subdir_script_stale_reported(self):
+        """Subdir script (scripts/obs/*.py) with stale flat deployed copy → drift."""
+        tmp, repo_scripts = self._sandbox()
+        obs = os.path.join(repo_scripts, "obs")
+        os.makedirs(obs)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(obs, "morning-screen.py"), "w").write("v2")
+        open(os.path.join(dep, "morning-screen.py"), "w").write("v1")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0]["script"], "obs/morning-screen.py")
+        self.assertEqual(drift[0]["repo_path"], os.path.join(obs, "morning-screen.py"))
+        self.assertEqual(len(drift[0]["stale_copies"]), 1)
+        self.assertEqual(drift[0]["stale_copies"][0]["path"], os.path.join(dep, "morning-screen.py"))
+
+    def test_subdir_script_synced_not_reported(self):
+        tmp, repo_scripts = self._sandbox()
+        obs = os.path.join(repo_scripts, "obs")
+        os.makedirs(obs)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(obs, "portal-build.py"), "w").write("v1")
+        open(os.path.join(dep, "portal-build.py"), "w").write("v1")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            self.assertEqual(_mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts)), [])
+
+    def test_subdir_no_deployed_not_reported(self):
+        """Subdir script never deployed → no-deployed, NOT stale (criterion)."""
+        tmp, repo_scripts = self._sandbox()
+        obs = os.path.join(repo_scripts, "obs")
+        os.makedirs(obs)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(obs, "generate_dashboard.py"), "w").write("x")
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            self.assertEqual(_mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts)), [])
+
+    def test_basename_collision_copy_attributed_by_md5(self):
+        """A deployed copy matching a same-basename repo file exactly is
+        attributed to that file — no false drift for the other one."""
+        tmp, repo_scripts = self._sandbox()
+        obs = os.path.join(repo_scripts, "obs")
+        os.makedirs(obs)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(repo_scripts, "serve.sh"), "w").write("top-v1")
+        open(os.path.join(obs, "serve.sh"), "w").write("obs-v2")
+        open(os.path.join(dep, "serve.sh"), "w").write("top-v1")  # matches top-level only
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
+        self.assertEqual(drift, [])
+
+    def test_basename_collision_unmatched_copy_reported_once(self):
+        """A deployed copy matching NO same-basename repo file is stale:
+        reported exactly once, under the first same-basename file."""
+        tmp, repo_scripts = self._sandbox()
+        obs = os.path.join(repo_scripts, "obs")
+        os.makedirs(obs)
+        dep = os.path.join(tmp, "deploy"); os.makedirs(dep)
+        open(os.path.join(repo_scripts, "serve.sh"), "w").write("top-v2")
+        open(os.path.join(obs, "serve.sh"), "w").write("obs-v2")
+        open(os.path.join(dep, "serve.sh"), "w").write("deploy-v1")  # matches neither
+        with patch("repo_sync_check.DEPLOY_DIRS", [dep]):
+            drift = _mod.check_deploy_drift(repo_dir=os.path.dirname(repo_scripts))
+        self.assertEqual(len(drift), 1)
+        # 'obs/serve.sh' < 'serve.sh' in sorted order → reported under the
+        # subdir name, exactly once, with the single unmatched copy.
+        self.assertEqual(drift[0]["script"], "obs/serve.sh")
+        self.assertEqual(len(drift[0]["stale_copies"]), 1)
 
     def test_missing_scripts_dir_returns_empty(self):
         with patch("repo_sync_check.DEPLOY_DIRS", []):
