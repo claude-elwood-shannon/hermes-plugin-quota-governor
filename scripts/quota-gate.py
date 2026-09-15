@@ -1193,7 +1193,15 @@ def _nanogpt_availability(weekly_pct, budget):
             balance_slice = 0.0
         availability = min(weekly_left + balance_slice, 100.0)
         bottleneck_window = "weekly_tokens+balance"
-        bottleneck_pct = max(weekly_pct or 0.0, 100.0 - availability)
+        # OBJ-26 fix (2026-09-16): bottleneck must reflect the CONCILIATED
+        # availability. The old max(weekly_pct, 100-availability) re-counted
+        # the token window that the balance blend already absorbed, so the
+        # bottleneck pinned at ~100 and bottleneck_to_max_workers returned 0
+        # even with an open budget — the governor never blended workers in
+        # past the guardrail. Mirror the healthy branch instead
+        # (bottleneck == 100 - availability): budget stop keeps slice=0, so
+        # availability collapses back to the sub remainder and workers to 0.
+        bottleneck_pct = round(100.0 - availability, 1)
 
     return availability, bottleneck_window, bottleneck_pct
 
