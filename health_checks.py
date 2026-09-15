@@ -229,73 +229,55 @@ def _read_recent_observations(max_age_minutes: int = 30) -> List[Dict[str, Any]]
     return results
 
 
-def check_fast_burn() -> Optional[Dict[str, Any]]:
-    """Detect if session_usage rose >30% in <5 min.
-
-    Reads recent observations and compares the latest session_pct
-    against the one recorded ~5 min before it.
-
-    Returns an alert dict if the threshold is exceeded, else None.
-    """
-    observations = _read_recent_observations(max_age_minutes=15)
-    if len(observations) < 2:
-        return None
-
-    # Sort by timestamp (oldest first)
-    observations.sort(key=lambda e: e.get("timestamp", ""))
-
-    latest = observations[-1]
-    latest_ts = _parse_iso(latest.get("timestamp", ""))
-    latest_quota = latest.get("quota", {})
-    latest_session = latest_quota.get("ollama_session_pct")
-    if latest_session is None:
-        return None
-    latest_session = float(latest_session)
-
-    if latest_ts is None:
-        return None
-
-    # Find an observation ~5 min before the latest one
-    window_start = latest_ts - timedelta(minutes=FAST_BURN_WINDOW_MIN)
-
-    # Pick the oldest observation within the 5-min window
-    earlier_session: Optional[float] = None
-    earlier_ts: Optional[datetime] = None
+def _find_earlier_session(observations, latest_ts, window_start):
+    earlier_session = None
+    earliest_ts = None
     for obs in observations:
         ts = _parse_iso(obs.get("timestamp", ""))
         if ts is None or ts >= latest_ts:
             continue
         if ts >= window_start:
-            quota = obs.get("quota", {})
-            sp = quota.get("ollama_session_pct")
-            if sp is not None:
-                sp = float(sp)
-                if earlier_ts is None or ts < earlier_ts:
-                    earlier_session = sp
-                    earlier_ts = ts
-
-    # If no observation inside the 5-min window, try the closest one before
+            sp = obs.get("quota", {}).get("ollama_session_pct")
+            if sp is None:
+                continue
+            sp = float(sp)
+            if earliest_ts is None or ts < earliest_ts:
+                earlier_session = sp
+                earliest_ts = ts
     if earlier_session is None:
         for obs in reversed(observations[:-1]):
             ts = _parse_iso(obs.get("timestamp", ""))
             if ts is None or ts >= latest_ts:
                 continue
-            quota = obs.get("quota", {})
-            sp = quota.get("ollama_session_pct")
-            if sp is not None:
-                earlier_session = float(sp)
-                earlier_ts = ts
-                break
+            sp = obs.get("quota", {}).get("ollama_session_pct")
+            if sp is None:
+                continue
+            earlier_session = float(sp)
+            break
+    return earlier_session
 
-    if earlier_session is None:
+
+def check_fast_burn() -> Optional[Dict[str, Any]]:
+    observations = _read_recent_observations(max_age_minutes=15)
+    if len(observations) < 2:
         return None
 
+    observations.sort(key=lambda e: e.get("timestamp", ""))
+    latest = observations[-1]
+    latest_ts = _parse_iso(latest.get("timestamp", ""))
+    if latest_ts is None:
+        return None
+    latest_session = latest.get("quota", {}).get("ollama_session_pct")
+    if latest_session is None:
+        return None
+    latest_session = float(latest_session)
+    window_start = latest_ts - timedelta(minutes=FAST_BURN_WINDOW_MIN)
+    earlier_session = _find_earlier_session(observations, latest_ts, window_start)
+    if earlier_session is None:
+        return None
     delta = latest_session - earlier_session
     if delta > FAST_BURN_DELTA_PCT:
-        msg = (
-            f"Fast burn: session_usage rose {delta:.1f}pp in "
-            f"<{FAST_BURN_WINDOW_MIN}min ({earlier_session:.1f}% -> {latest_session:.1f}%)"
-        )
+        msg = f"Fast burn: session_usage rose {delta:.1f}pp in <{FAST_BURN_WINDOW_MIN}min ({earlier_session:.1f}% -> {latest_session:.1f}%)"
         return write_alert(
             "fast_burn",
             msg,
@@ -304,9 +286,8 @@ def check_fast_burn() -> Optional[Dict[str, Any]]:
                 "from_pct": round(earlier_session, 1),
                 "to_pct": round(latest_session, 1),
                 "window_minutes": FAST_BURN_WINDOW_MIN,
-            },
+            }
         )
-
     return None
 
 
