@@ -1106,9 +1106,7 @@ _VERDICT_LABEL = {"ok": ("ok", "OK"), "reduce": ("warn", "REDUCIR"),
                   "unknown": ("mut", "SIN PROYECCIÓN")}
 
 
-def page_providers(data: dict, query: dict = None) -> str:
-    fc = data["forecast"]
-    series = data["series"]
+def _providers_kpis(fc: dict) -> list:
     out = ['<section class="kpis">']
     n_ok = fc.get("providers_ok")
     out.append(_kpi("Providers OK", str(n_ok if n_ok is not None else "n/d"),
@@ -1122,10 +1120,12 @@ def page_providers(data: dict, query: dict = None) -> str:
                     f"{fc.get('window_hours', '-')}h",
                     f"EMA α={fc.get('alpha', '-')}"))
     out.append("</section>")
+    return out
 
-    out.append('<section class="card"><h2>Ventanas — burn y veredicto '
-               "(gate)</h2>")
-    verdicts = data["verdicts"]
+
+def _providers_verdicts(verdicts: list) -> list:
+    out = ['<section class="card"><h2>Ventanas — burn y veredicto '
+           "(gate)</h2>"]
     if verdicts:
         rows = []
         for v in verdicts:
@@ -1148,10 +1148,12 @@ def page_providers(data: dict, query: dict = None) -> str:
         out.append(empty_state("sin forecast todavía — el EMA necesita "
                                "algunas muestras de burn"))
     out.append("</section>")
+    return out
 
-    out.append('<div class="grid">')
-    out.append('<section class="card"><h2>Burn por provider — '
-               "% semanal histórico</h2>")
+
+def _providers_burn_card(series: dict) -> list:
+    out = ['<section class="card"><h2>Burn por provider — '
+           "% semanal histórico</h2>"]
     prov_series = [
         ("ollama", "ollama_weekly_pct", "ollama-cloud"),
         ("nanogpt", "nanogpt_weekly_pct", "nanogpt"),
@@ -1166,13 +1168,16 @@ def page_providers(data: dict, query: dict = None) -> str:
         last_v = pts[-1][1]
         rows.append(spark_row(label, [v for _, v in pts],
                               f"{last_v:.1f}%"))
-    out.append(("<table><tr><th>provider</th><th class=num>último</th>"
-                "<th>30d</th></tr>" + "".join(rows) + "</table>")
-               if rows else empty_state("sin métricas de providers todavía"))
+    out.append((("<table><tr><th>provider</th><th class=num>último</th>"
+                 "<th>30d</th></tr>" + "".join(rows) + "</table>")
+                if rows else empty_state("sin métricas de providers todavía")))
     out.append("</section>")
+    return out
 
+
+def _providers_balance_card(series: dict) -> list:
     bal = series["balance"]
-    out.append('<section class="card"><h2>Saldo NanoGPT — histórico</h2>')
+    out = ['<section class="card"><h2>Saldo NanoGPT — histórico</h2>']
     if bal:
         out.append(line_chart([v for _, v in bal], color="#d29922",
                               label_every=6))
@@ -1181,11 +1186,12 @@ def page_providers(data: dict, query: dict = None) -> str:
     else:
         out.append(empty_state("sin muestras de saldo"))
     out.append("</section>")
-    out.append("</div>")
+    return out
 
-    ledger = data["weekly_ledger"]
-    out.append('<section class="card"><h2>Histórico de ventanas cerradas / '
-               "calibraciones</h2>")
+
+def _providers_ledger(ledger: list) -> list:
+    out = ['<section class="card"><h2>Histórico de ventanas cerradas / '
+           "calibraciones</h2>"]
     if ledger:
         rows = []
         for row in reversed(ledger[-30:]):
@@ -1207,6 +1213,20 @@ def page_providers(data: dict, query: dict = None) -> str:
     else:
         out.append(empty_state("sin ledger de resets todavía"))
     out.append("</section>")
+    return out
+
+
+def page_providers(data: dict, query: dict = None) -> str:
+    fc = data["forecast"]
+    series = data["series"]
+    out = []
+    out.extend(_providers_kpis(fc))
+    out.extend(_providers_verdicts(data["verdicts"]))
+    out.append('<div class="grid">')
+    out.extend(_providers_burn_card(series))
+    out.extend(_providers_balance_card(series))
+    out.append("</div>")
+    out.extend(_providers_ledger(data["weekly_ledger"]))
     return "\n".join(out)
 
 
