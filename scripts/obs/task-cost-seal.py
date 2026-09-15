@@ -46,7 +46,41 @@ _train = _load("obj35_seal_train", _HERE / "task-cost-train.py")
 
 
 def ledger_path() -> Path:
+    """Path of the shared training ledger (QUOTA_TASK_COST_LEDGER aware)."""
     return _train.ledger_path()
+
+
+def seal_one(task_id: str, body: str, model: str | None = None,
+             now: float | None = None) -> dict:
+    """Compute the estimate for one task body and append its ledger row.
+
+    Shared by the creation-time CLI below and task-cost-seal-open.py
+    (the deferred pass for still-open tasks). Returns the estimator
+    result dict ({stage, p50, p90, ...}). Raises only on ledger I/O
+    errors — callers on cron paths must degrade, not crash.
+    """
+    rows = _est.load_rows()
+    res = _est.estimate_for_body(rows, body, model)
+    line = {
+        "kind": "estimate",
+        "task_id": task_id,
+        "ts": now if now is not None else time.time(),
+        "estimate": {
+            "p50": res.get("p50"),
+            "p90": res.get("p90"),
+            "n": res.get("n"),
+            "stage": res.get("stage"),
+            "model": res.get("model"),
+            "objective": res.get("objective"),
+            "cost_class": res.get("cost_class"),
+        },
+    }
+    ledger = ledger_path()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with open(ledger, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(line, separators=(",", ":"),
+                            sort_keys=True) + "\n")
+    return res
 
 
 def main(argv=None) -> int:
@@ -63,27 +97,7 @@ def main(argv=None) -> int:
         else:
             body = Path(args.body_file).read_text(encoding="utf-8")
 
-        rows = _est.load_rows()
-        res = _est.estimate_for_body(rows, body, args.model)
-        line = {
-            "kind": "estimate",
-            "task_id": args.task_id,
-            "ts": time.time(),
-            "estimate": {
-                "p50": res.get("p50"),
-                "p90": res.get("p90"),
-                "n": res.get("n"),
-                "stage": res.get("stage"),
-                "model": res.get("model"),
-                "objective": res.get("objective"),
-                "cost_class": res.get("cost_class"),
-            },
-        }
-        ledger = ledger_path()
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-        with open(ledger, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(line, separators=(",", ":"),
-                                sort_keys=True) + "\n")
+        res = seal_one(args.task_id, body, args.model)
         print("task-cost-seal: %s stage=%s p50=%s p90=%s" % (
             args.task_id, res.get("stage"), res.get("p50"), res.get("p90")))
     except Exception as e:
