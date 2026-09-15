@@ -77,6 +77,7 @@ import argparse
 import json
 import os
 import time
+
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -273,57 +274,79 @@ def variance_breach(actual_usd, est_pct, usd_per_window_pct=None):
 # ---------------------------------------------------------------------------
 
 def rollup(rows, window_days=None, now=None) -> dict:
-    """Aggregate trace rows -> rollup document. No I/O, no mutation.
-
-    Cost-bearing lines ALL lack a task_id today, so every cent lands in
-    the explicit ``unattributed_cost`` bucket and per-objective
-    ``spent_usd`` stays 0.0 — the honest observer. The report shows the
-    gap instead of fabricating an attribution.
-    """
+    """Aggregate trace rows -> rollup document. No I/O, no mutation."""
     now = now if now is not None else time.time()
-    flow = {}            # objective -> {kind: count}
-    tasks = {}           # objective -> set of task_ids
-    done_tasks = {}      # objective -> set of completed task_ids
-    tagged_spend = {}    # objective -> spent_usd (cost lines WITH the stamp)
-    unattr_cost = 0.0
-    unattr_cost_lines = 0
-    unattr_cost_by_provider = {}
-    tagged_events = 0
-    untagged_events = 0
-    cost_tagged_lines = 0  # cost lines that DO carry an objective (0 today)
+    data = _process_rows(rows)
+    objectives = _build_objectives(data['flow'], data['tasks'], data['done_tasks'], data['tagged_spend'])
+    doc = _build_doc(now, window_days, len(rows), data, objectives)
+    _update_status(doc)
+    return doc
 
+
+def _process_rows(rows):
+    flow = {}
+    tasks = {}
+    done_tasks = {}
+    tagged_spend = {}
+    acc = {
+        "unattr_cost": 0.0,
+        "unattr_cost_lines": 0,
+        "unattr_cost_by_provider": {},
+        "tagged_events": 0,
+        "untagged_events": 0,
+        "cost_tagged_lines": 0
+    }
     for r in rows:
         obj = r.get("objective") or UNATTRIBUTED
         source = r.get("source")
         if source == "task-events":
-            bucket = flow.setdefault(obj, {k: 0 for k in FLOW_KINDS})
-            kind = r.get("cause")
-            if kind in bucket:
-                bucket[kind] += 1
-            tid = r.get("consumer_id")
-            if tid:
-                tasks.setdefault(obj, set()).add(tid)
-                if kind == "completed":
-                    done_tasks.setdefault(obj, set()).add(tid)
-            if obj == UNATTRIBUTED:
-                untagged_events += 1
-            else:
-                tagged_events += 1
+            _handle_task_event(r, obj, flow, tasks, done_tasks, acc)
         elif source in COST_SOURCES:
-            cost = float(r.get("costUsd") or 0.0)
-            provider = r.get("provider") or "unknown"
-            if obj == UNATTRIBUTED:
-                unattr_cost += cost
-                unattr_cost_lines += 1
-                unattr_cost_by_provider[provider] = (
-                    unattr_cost_by_provider.get(provider, 0.0) + cost)
-            else:
-                # forward-compatible: when a source starts carrying the
-                # stamp, its spend lands on the objective (dual-currency
-                # rule intact: per-provider buckets, costUsd aggregates).
-                cost_tagged_lines += 1
-                tagged_spend[obj] = tagged_spend.get(obj, 0.0) + cost
+            _handle_cost_event(r, obj, tagged_spend, acc)
+    return {
+        "flow": flow,
+        "tasks": tasks,
+        "done_tasks": done_tasks,
+        "tagged_spend": tagged_spend,
+        "unattr_cost": acc["unattr_cost"],
+        "unattr_cost_lines": acc["unattr_cost_lines"],
+        "unattr_cost_by_provider": acc["unattr_cost_by_provider"],
+        "tagged_events": acc["tagged_events"],
+        "untagged_events": acc["untagged_events"],
+        "cost_tagged_lines": acc["cost_tagged_lines"]
+    }
 
+
+def _handle_task_event(r, obj, flow, tasks, done_tasks, acc):
+    bucket = flow.setdefault(obj, {k: 0 for k in FLOW_KINDS})
+    kind = r.get("cause")
+    if kind in bucket:
+        bucket[kind] += 1
+    tid = r.get("consumer_id")
+    if tid:
+        tasks.setdefault(obj, set()).add(tid)
+        if kind == "completed":
+            done_tasks.setdefault(obj, set()).add(tid)
+    if obj == UNATTRIBUTED:
+        acc["untagged_events"] += 1
+    else:
+        acc["tagged_events"] += 1
+
+
+def _handle_cost_event(r, obj, tagged_spend, acc):
+    cost = float(r.get("costUsd") or 0.0)
+    provider = r.get("provider") or "unknown"
+    if obj == UNATTRIBUTED:
+        acc["unattr_cost"] += cost
+        acc["unattr_cost_lines"] += 1
+        acc["unattr_cost_by_provider"][provider] = (
+            acc["unattr_cost_by_provider"].get(provider, 0.0) + cost)
+    else:
+        acc["cost_tagged_lines"] += 1
+        tagged_spend[obj] = tagged_spend.get(obj, 0.0) + cost
+
+
+def _build_objectives(flow, tasks, done_tasks, tagged_spend):
     objectives = {}
     for obj in sorted(set(tasks) | set(flow) | set(tagged_spend)):
         f = flow.get(obj, {k: 0 for k in FLOW_KINDS})
@@ -342,49 +365,60 @@ def rollup(rows, window_days=None, now=None) -> dict:
             "tasks_active": len({t for t in tids
                                  if t not in done_tasks.get(obj, set())}),
             "variance_breach": None,
-            "notes": [],
+            "notes": []
         }
+    return objectives
 
+
+def _build_doc(now, window_days, trace_len, data, objectives):
+    meta = {
+        "version": SCHEMA_VERSION,
+        "generated_epoch": round(float(now), 3),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "window_days": window_days,
+        "trace_lines": trace_len,
+        "mode": "observer",
+        "note": (
+            "Auto-managed by objective-budgets.py (OBJ-28 phase 0, "
+            "observer-only). spent_* come from the trace rollup; "
+            "manual edits are overwritten. Budgets stay null until "
+            "the user approves defaults (design §4)."
+        ),
+        "variance_rule": (
+            "armed but unexercisable in phase 0: cost lines carry no task_id, "
+            "so no per-task actual exists to compare"
+        )
+    }
     doc = {
-        "_meta": {
-            "version": SCHEMA_VERSION,
-            "generated_epoch": round(float(now), 3),
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                          time.gmtime(now)),
-            "window_days": window_days,
-            "trace_lines": len(rows),
-            "mode": "observer",
-            "note": ("Auto-managed by objective-budgets.py (OBJ-28 phase 0, "
-                     "observer-only). spent_* come from the trace rollup; "
-                     "manual edits are overwritten. Budgets stay null until "
-                     "the user approves defaults (design §4)."),
-            "variance_rule": ("armed but unexercisable in phase 0: cost "
-                              "lines carry no task_id, so no per-task "
-                              "actual exists to compare"),
-        },
+        "_meta": meta,
         "unattributed_cost": {
-            "spent_usd": round(unattr_cost, 6),
-            "lines": unattr_cost_lines,
-            "by_provider": {p: round(v, 6) for p, v
-                            in sorted(unattr_cost_by_provider.items())},
-            "note": ("cost-bearing sources (nanogpt-requests, usage-audit, "
-                     "model-cost-ledger) carry no task_id today; this bucket "
-                     "is the visible gap, never hidden (design §1.3)."),
+            "spent_usd": round(data["unattr_cost"], 6),
+            "lines": data["unattr_cost_lines"],
+            "by_provider": {
+                p: round(v, 6)
+                for p, v in sorted(data["unattr_cost_by_provider"].items())
+            },
+            "note": (
+                "cost-bearing sources (nanogpt-requests, usage-audit, "
+                "model-cost-ledger) carry no task_id today; this bucket "
+                "is the visible gap, never hidden (design §1.3)."
+            )
         },
         "unattributed_events": {
-            "lines": untagged_events,
-            "note": "task events whose body carries no objective: stamp.",
+            "lines": data["untagged_events"],
+            "note": "task events whose body carries no objective: stamp."
         },
-        "cost_lines_attributed": cost_tagged_lines,
-        "tagged_events": tagged_events,
-        "objectives": objectives,
+        "cost_lines_attributed": data["cost_tagged_lines"],
+        "tagged_events": data["tagged_events"],
+        "objectives": objectives
     }
+    return doc
 
-    # Status ladder pass (phase 0: budgets are null -> all "open").
+
+def _update_status(doc):
     for obj, o in doc["objectives"].items():
         o["status"] = compute_status(o["spent_usd"], o["budget_usd"],
                                      o["tasks_total"], o["tasks_done"])
-    return doc
 
 
 def doc_fingerprint(doc) -> str:
