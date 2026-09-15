@@ -70,6 +70,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -89,21 +90,25 @@ DEFAULT_WARN_FRACTION = 0.5
 _LAST_PROBE = {"ts": 0.0, "data": None}
 
 
-def state_dir(hermes_home=None):
+def state_dir(hermes_home: Optional[str] = None) -> str:
+    """Return the state directory for ledger files, honoring overrides."""
     base = hermes_home or os.environ.get("HERMES_HOME", HERMES_HOME_DEFAULT)
     return os.environ.get("QUOTA_GOVERNOR_DIR",
                           os.path.join(base, "quota-governor"))
 
 
-def ledger_path(hermes_home=None):
+def ledger_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the balance ledger JSONL file."""
     return os.path.join(state_dir(hermes_home), "nanogpt-balance-ledger.jsonl")
 
 
-def cache_path(hermes_home=None):
+def cache_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the last-good balance snapshot cache."""
     return os.path.join(state_dir(hermes_home), "nanogpt-balance-last-good.json")
 
 
-def budget_path(hermes_home=None):
+def budget_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the weekly budget-state JSON file."""
     return os.path.join(state_dir(hermes_home), "nanogpt-budget-state.json")
 
 
@@ -171,7 +176,7 @@ def _post(url, key, payload=None):
 # Probe + cache
 # ---------------------------------------------------------------------------
 
-def fetch_snapshot(key=None, force=False):
+def fetch_snapshot(key: Optional[str] = None, force: bool = False) -> dict:
     """Exact probe of balance + subscription state. Cached 60 s.
 
     Returns dict:
@@ -230,7 +235,8 @@ def _write_cache(data):
         pass
 
 
-def read_cache(hermes_home=None):
+def read_cache(hermes_home: Optional[str] = None) -> Optional[dict]:
+    """Return the cached last-good snapshot, or None when unreadable."""
     try:
         with open(cache_path(hermes_home), encoding="utf-8") as fh:
             return json.load(fh)
@@ -242,7 +248,8 @@ def read_cache(hermes_home=None):
 # Covered-model set (exact list from the provider)
 # ---------------------------------------------------------------------------
 
-def fetch_covered_models(key=None, ttl_s=3600.0):
+def fetch_covered_models(key: Optional[str] = None,
+                         ttl_s: float = 3600.0) -> Tuple[Optional[set], Optional[str]]:
     """Set of subscription-covered model ids (exact API list).
 
     Cached on disk for an hour. Returns (set_or_None, err_or_None); the set
@@ -279,7 +286,7 @@ def fetch_covered_models(key=None, ttl_s=3600.0):
         return None, str(exc)
 
 
-def is_covered(model, covered_set):
+def is_covered(model: Optional[str], covered_set: Optional[set]) -> bool:
     """Exact match, else bare-segment match (zai-org/glm-5.2 ~ z-ai/glm-5.2).
 
     Verified live 2026-09-08: covered list has z-ai/glm-5.2 but NOT
@@ -298,7 +305,8 @@ def is_covered(model, covered_set):
 # Ledger + weekly budget window
 # ---------------------------------------------------------------------------
 
-def append_ledger(row, hermes_home=None):
+def append_ledger(row: dict, hermes_home: Optional[str] = None) -> None:
+    """Append one row to the balance ledger, never raising."""
     try:
         os.makedirs(os.path.dirname(ledger_path(hermes_home)), exist_ok=True)
         with open(ledger_path(hermes_home), "a", encoding="utf-8") as fh:
@@ -324,14 +332,16 @@ def _save_budget(path, state):
         pass
 
 
-def week_start(now=None):
+def week_start(now: Optional[dt.datetime] = None) -> dt.datetime:
     """ISO-week Monday 00:00 UTC — fallback budget window anchor."""
     now = now or dt.datetime.now(dt.timezone.utc)
     monday = now - dt.timedelta(days=now.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def window_start_from_period(period_end_str, now=None):
+def window_start_from_period(
+        period_end_str: Optional[str], now: Optional[dt.datetime] = None
+) -> dt.datetime:
     """Subscription period start = currentPeriodEnd - 7 days.
 
     The budget window follows the subscription period when known (the plan
@@ -351,8 +361,10 @@ def window_start_from_period(period_end_str, now=None):
     return week_start(now)
 
 
-def update_budget(snapshot, max_spend_usd=None, warn_fraction=None,
-                  hermes_home=None, now=None):
+def update_budget(snapshot: dict, max_spend_usd: Optional[float] = None,
+                  warn_fraction: Optional[float] = None,
+                  hermes_home: Optional[str] = None,
+                  now: Optional[dt.datetime] = None) -> dict:
     """Track window spend from observed balance deltas.
 
     window semantics: see module docstring. Returns the budget dict:
@@ -420,11 +432,12 @@ def _parse_dt(s):
 # capture (agent/nanogpt_pricing_capture.py) — one line per API request.
 # ---------------------------------------------------------------------------
 
-def requests_path(hermes_home=None):
+def requests_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the per-request billing JSONL file."""
     return os.path.join(state_dir(hermes_home), "nanogpt-requests.jsonl")
 
 
-def append_request_row(row, hermes_home=None):
+def append_request_row(row: dict, hermes_home: Optional[str] = None) -> None:
     """Append one per-request billing row (costUsd>0 drains balance; =0 covered)."""
     try:
         os.makedirs(os.path.dirname(requests_path(hermes_home)), exist_ok=True)
@@ -457,7 +470,8 @@ def _budget_window_start(hermes_home=None):
     return window_start_from_period(cached.get("period_end"))
 
 
-def request_window_totals(since=None, hermes_home=None):
+def request_window_totals(since: Optional[dt.datetime] = None,
+                          hermes_home: Optional[str] = None) -> Optional[dict]:
     """Window accumulators from per-request rows: covered_usd, balance_usd,
     plus request counts. Rows outside the window (ts < since or before the
     budget window anchor) are excluded. Never raises.
@@ -540,7 +554,9 @@ def _profile_homes():
     return homes or _DEFAULT_PROFILE_HOMES
 
 
-def request_window_totals_all_homes(since=None, hermes_home=None):
+def request_window_totals_all_homes(
+        since: Optional[dt.datetime] = None,
+        hermes_home: Optional[str] = None) -> Optional[dict]:
     """Merge request_window_totals() across every profile home.
 
     Rows are written under the CAPTURING process's HERMES_HOME (pr-nanogpt
@@ -590,7 +606,9 @@ def request_window_totals_all_homes(since=None, hermes_home=None):
         return None
 
 
-def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
+def budget_context(max_spend_usd: Optional[float] = None,
+                   warn_fraction: Optional[float] = None,
+                   hermes_home: Optional[str] = None) -> Tuple[Optional[dict], Optional[str]]:
     """One call for quota-gate.py. Never raises; degrades gracefully.
 
     Returns (context_dict_or_None, warning_string_or_None).
@@ -676,7 +694,8 @@ def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
 # CLI (manual reconciliation)
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def main(argv: Optional[list] = None) -> int:
+    """CLI entry point for manual reconciliation."""
     import argparse
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     p.add_argument("cmd", choices=["status", "report", "covered"],

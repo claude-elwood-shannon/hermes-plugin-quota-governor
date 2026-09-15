@@ -92,6 +92,7 @@ import re
 import sqlite3
 import sys
 import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -100,21 +101,25 @@ import time
 HERMES_HOME_DEFAULT = os.path.expanduser("~/.hermes")
 
 
-def state_dir(hermes_home=None):
+def state_dir(hermes_home: Optional[str] = None) -> str:
+    """Return the state directory for ledger files, honoring overrides."""
     base = hermes_home or HERMES_HOME_DEFAULT
     return os.environ.get("QUOTA_GOVERNOR_DIR",
                           os.path.join(base, "quota-governor"))
 
 
-def ledger_path(hermes_home=None):
+def ledger_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the model-cost ledger JSONL file."""
     return os.path.join(state_dir(hermes_home), "model-cost-ledger.jsonl")
 
 
-def cursor_path(hermes_home=None):
+def cursor_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the sync cursor JSON file."""
     return os.path.join(state_dir(hermes_home), "model-cost-ledger.cursor.json")
 
 
-def config_path(hermes_home=None):
+def config_path(hermes_home: Optional[str] = None) -> str:
+    """Return the path to the model-cost config JSON file."""
     return os.path.join(state_dir(hermes_home), "model-cost.json")
 
 
@@ -144,8 +149,9 @@ MODEL_PRICES = {
 PEAK_AFFECTED = {"deepseek-v4-flash"}  # x2 mono-fr 01-04 & 06-10 UTC
 
 
-def load_config(hermes_home=None):
-    cfg = {
+def load_config(hermes_home: Optional[str] = None) -> dict:
+    """Return the merged model-price + window config, with defaults."""
+    cfg: dict = {
         "prices": MODEL_PRICES,
         "window_usd": DEFAULT_WINDOW_BUDGET_USD,
         "warn_fraction": DEFAULT_WARN_FRACTION,
@@ -169,15 +175,17 @@ def load_config(hermes_home=None):
     return cfg
 
 
-def is_peak(utc_dt):
+def is_peak(utc_dt: dt.datetime) -> bool:
     """Peak pricing hours (mirrors quota-gate.py MULTI-PROV-07)."""
     if utc_dt.weekday() >= 5:
         return False
     return (1 <= utc_dt.hour < 4) or (6 <= utc_dt.hour < 10)
 
 
-def estimate_cost(model, input_tokens, output_tokens, cache_read,
-                  reasoning_tokens=0, at_ts=None, prices=None):
+def estimate_cost(model: str, input_tokens: int, output_tokens: int,
+                  cache_read: int, reasoning_tokens: int = 0,
+                  at_ts: Optional[float] = None,
+                  prices: Optional[dict] = None) -> float:
     """USD estimate for one usage delta (see ESTIMATION RULE above)."""
     prices = prices if prices is not None else MODEL_PRICES
     p = prices.get(model)
@@ -196,7 +204,7 @@ def estimate_cost(model, input_tokens, output_tokens, cache_read,
 # Window anchoring
 # ---------------------------------------------------------------------------
 
-def iso_to_epoch(s):
+def iso_to_epoch(s: Union[str, int, float, None]) -> Optional[float]:
     """ISO timestamp (possibly Z-suffixed) or epoch number -> epoch seconds.
 
     state.db stores last_seen as ISO strings in Hermes but numeric epoch in
@@ -213,7 +221,8 @@ def iso_to_epoch(s):
         return None
 
 
-def anchor_from_resets_at(s, now=None):
+def anchor_from_resets_at(s: Union[str, int, float, None],
+                          now: Optional[float] = None) -> Optional[float]:
     """Window anchor (= resetsAt - 5h) from rolling.resetsAt. None if untrustworthy.
 
     resetsAt is ALWAYS the END of the current rolling window — both while
@@ -235,7 +244,7 @@ def anchor_from_resets_at(s, now=None):
     return reset - WINDOW_SECONDS
 
 
-def window_key(ts_epoch, anchor=None):
+def window_key(ts_epoch: float, anchor: Optional[float] = None) -> str:
     """Deterministic ISO start-of-window for an event timestamp (UTC).
 
     With anchor: windows are [anchor + k*5h).  Without anchor: 5h floors
@@ -254,7 +263,7 @@ def window_key(ts_epoch, anchor=None):
 # State-DB scan
 # ---------------------------------------------------------------------------
 
-def scan_opencode_go_usage(hermes_home=None):
+def scan_opencode_go_usage(hermes_home: Optional[str] = None) -> list:
     """List of session_model_usage rows (dicts) with provider opencode-go,
     scanned read-only from every profile state.db.  Never raises."""
     base = hermes_home or HERMES_HOME_DEFAULT
@@ -311,7 +320,8 @@ def _save_json(path, data):
     os.replace(tmp, path)
 
 
-def sync_ledger(hermes_home=None, now=None):
+def sync_ledger(hermes_home: Optional[str] = None,
+                now: Optional[float] = None) -> int:
     """Append usage DELTAS since the cursor to the ledger.
 
     Returns number of rows appended (0 = nothing new — cron-silent safe).
@@ -411,7 +421,8 @@ def sync_ledger(hermes_home=None, now=None):
 # Anchor resolution (best-effort, never raises)
 # ---------------------------------------------------------------------------
 
-def resolve_anchor(hermes_home=None, now=None):
+def resolve_anchor(hermes_home: Optional[str] = None,
+                   now: Optional[float] = None) -> Tuple[Optional[float], str]:
     """(anchor, source) for window bucketing.
 
     Tries the live usage endpoint via quota-gate's query helper (same dir);
@@ -456,7 +467,8 @@ def resolve_anchor(hermes_home=None, now=None):
 # Summaries / warnings (consumed by report CLI and quota-gate.py)
 # ---------------------------------------------------------------------------
 
-def load_ledger(hermes_home=None):
+def load_ledger(hermes_home: Optional[str] = None) -> list:
+    """Return all ledger rows as dicts, skipping unparseable lines."""
     rows = []
     try:
         with open(ledger_path(hermes_home), "r", encoding="utf-8") as fh:
@@ -472,10 +484,11 @@ def load_ledger(hermes_home=None):
     return rows
 
 
-def summarize(rows, hermes_home=None, now=None):
+def summarize(rows: list, hermes_home: Optional[str] = None,
+              now: Optional[float] = None) -> Tuple[dict, dict]:
     """{window: {model: {cost_usd, requests, tokens_in/out/cache, profiles}}}."""
     cfg = load_config(hermes_home)
-    out = {}
+    out: dict = {}
     for r in rows:
         w = r.get("window", "?")
         m = r.get("model", "?")
@@ -498,7 +511,9 @@ def summarize(rows, hermes_home=None, now=None):
     return out, cfg
 
 
-def model_window_warnings(hermes_home=None, now=None, reset_at=None):
+def model_window_warnings(hermes_home: Optional[str] = None,
+                          now: Optional[float] = None,
+                          reset_at: Optional[float] = None) -> list:
     """Warning strings for any model > warn_fraction of the current window.
 
     Used by quota-gate.py per tick.  reset_at: the live rolling_resets_at
@@ -530,7 +545,9 @@ def model_window_warnings(hermes_home=None, now=None, reset_at=None):
         return []
 
 
-def current_window_shares(hermes_home=None, now=None, reset_at=None):
+def current_window_shares(hermes_home: Optional[str] = None,
+                          now: Optional[float] = None,
+                          reset_at: Optional[float] = None) -> dict:
     """{window, budget, per-model shares} for the gate context. {} on error."""
     try:
         now = now if now is not None else time.time()
@@ -556,7 +573,8 @@ def current_window_shares(hermes_home=None, now=None, reset_at=None):
         return {}
 
 
-def sync_model_cost_ledger_if_due(hermes_home=None, now=None):
+def sync_model_cost_ledger_if_due(hermes_home: Optional[str] = None,
+                                  now: Optional[float] = None) -> int:
     """Opportunistic sync for the gate: at most one sync per SYNC_MIN_INTERVAL.
 
     Returns rows appended (0 when skipped/not-due/error).  Never raises.
@@ -583,7 +601,9 @@ def sync_model_cost_ledger_if_due(hermes_home=None, now=None):
 # CLI
 # ---------------------------------------------------------------------------
 
-def cmd_report(as_json=False, since_hours=None, hermes_home=None):
+def cmd_report(as_json: bool = False, since_hours: Optional[float] = None,
+               hermes_home: Optional[str] = None) -> dict:
+    """Build and print a per-model cost report for the current window."""
     rows = load_ledger(hermes_home)
     now = time.time()
     anchor, src = resolve_anchor(hermes_home, now)
@@ -632,7 +652,8 @@ def cmd_report(as_json=False, since_hours=None, hermes_home=None):
     return result
 
 
-def main(argv=None):
+def main(argv: Optional[list] = None) -> int:
+    """CLI entry point: sync or report subcommand."""
     ap = argparse.ArgumentParser(description="OpenCode Go per-model cost ledger")
     ap.add_argument("command", choices=["sync", "report"])
     ap.add_argument("--json", action="store_true", help="machine-readable report")
