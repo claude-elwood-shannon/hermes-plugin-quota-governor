@@ -378,29 +378,18 @@ def _clamp(v: float, lo: float = 0.0) -> float:
     return lo if v < lo else v
 
 
-def analyze_provider(
+def _estimate_tick_cost(
     provider: Dict[str, Any],
     prior: Dict[str, Any],
     cfg: Dict[str, Any],
-    now: float,
-    tick_elapsed: float,
-) -> Dict[str, Any]:
-    """Analyze one provider against its previous state.
+    bottleneck: Optional[Dict[str, Any]],
+    burning: bool,
+):
+    """Estimate USD burned over this tick.
 
-    ``prior`` is the saved per-provider state for this tick interval
-    (dict keyed by window name with last_pct/last_cost/cum_cost/baseline).
-    ``tick_elapsed`` = minutes since the previous observation (used to
-    derive USD/min burn rate from percent deltas / cost deltas).
-
-    Returns {"rate": ..., "cum": ..., "burning": bool, "window_pct": {...}}
+    Priority: real cost meter (calibrated), else percent-delta x
+    window_usd_cap.
     """
-    burning = is_burning(provider)
-    windows = window_fields(provider)
-    # Pick the bottleneck (max pct) window for reporting.
-    bottleneck = max(windows, key=lambda w: w["pct"], default=None)
-
-    # --- Estimate USD cost accumulated over this tick ---
-    # Priority: real cost meter (calibrated), else percent-delta x window_usd_cap.
     cost_now = provider_cost(provider)
     cost_delta = 0.0
     if cost_now is not None:
@@ -429,7 +418,31 @@ def analyze_provider(
 
     # Use the real cost meter when available; otherwise the estimate.
     tick_cost = cost_delta if cost_now is not None else pct_delta_usd
+    return cost_now, tick_cost
 
+
+def analyze_provider(
+    provider: Dict[str, Any],
+    prior: Dict[str, Any],
+    cfg: Dict[str, Any],
+    now: float,
+    tick_elapsed: float,
+) -> Dict[str, Any]:
+    """Analyze one provider against its previous state.
+
+    ``prior`` is the saved per-provider state for this tick interval
+    (dict keyed by window name with last_pct/last_cost/cum_cost/baseline).
+    ``tick_elapsed`` = minutes since the previous observation (used to
+    derive USD/min burn rate from percent deltas / cost deltas).
+
+    Returns {"rate": ..., "cum": ..., "burning": bool, "window_pct": {...}}
+    """
+    burning = is_burning(provider)
+    windows = window_fields(provider)
+    # Pick the bottleneck (max pct) window for reporting.
+    bottleneck = max(windows, key=lambda w: w["pct"], default=None)
+
+    cost_now, tick_cost = _estimate_tick_cost(provider, prior, cfg, bottleneck, burning)
     cum = float(prior.get("cum_cost_usd", 0.0))
     if burning:
         cum += tick_cost
@@ -483,17 +496,29 @@ def _handle_provider(provider: Dict[str, Any], state: Dict[str, Any], config: Di
         return [], active_warnings, state
     cfg = _prov_cfg(config, prov)
     pstate = state.get(prov, {})
+    res = _analyze_provider_state(provider, pstate, cfg, now_ts)
+    _persist_provider_observation(state, prov, pstate, res, now_ts)
+    alerts: List[str] = []
+    if not cfg.get("enabled"):
+        return alerts, active_warnings, state
+    return _decide_provider_actions(
+        state, prov, pstate, res, cfg, now_ts, alerts, active_warnings
+    )
+
+
+def _analyze_provider_state(provider: Dict[str, Any], pstate: Dict[str, Any], cfg: Dict[str, Any], now_ts: float):
+    """Run the analyzer and reset cumulative counters on an episode boundary."""
     tick_elapsed = max((now_ts - float(pstate.get("last_ts", now_ts))) / 60.0, 0.0) if pstate else 0.0
-
     res = analyze_provider(provider, pstate, cfg, now_ts, tick_elapsed)
-
-    # Episode boundary
     if pstate.get("burning") and not res["burning"]:
         res["cum_cost_usd"] = 0.0
         res.pop("last_pct", None)
         res.pop("last_cost", None)
+    return res
 
-    # Persist observation
+
+def _persist_provider_observation(state: Dict[str, Any], prov: str, pstate: Dict[str, Any], res: Dict[str, Any], now_ts: float):
+    """Persist the provider's observation into state and append the ledger entry."""
     nstate = dict(pstate)
     nstate.update({
         "provider": prov,
@@ -506,8 +531,6 @@ def _handle_provider(provider: Dict[str, Any], state: Dict[str, Any], config: Di
         nstate["last_cost"] = res["cost_now"]
     nstate["cum_cost_usd"] = res["cum_cost_usd"]
     state[prov] = nstate
-
-    # Ledger entry
     append_ledger({
         "provider": prov,
         "burning": res["burning"],
@@ -519,68 +542,73 @@ def _handle_provider(provider: Dict[str, Any], state: Dict[str, Any], config: Di
         "cost_meter": res["cost_now"],
     })
 
-    alerts: List[str] = []
-    if not cfg.get("enabled"):
-        return alerts, active_warnings, state
 
+def _decide_provider_actions(state: Dict[str, Any], prov: str, pstate: Dict[str, Any], res: Dict[str, Any], cfg: Dict[str, Any], now_ts: float, alerts: List[str], active_warnings: Dict[str, Any]):
+    """Apply warning and stop thresholds; return the tuples the caller expects."""
     cum = res["cum_cost_usd"]
     rate = res["rate_usd_per_min"]
     warn_rate = float(cfg.get("burn_rate_warn_usd_per_min", 0.05))
     warn_total = float(cfg.get("burn_total_warn_usd", 0.20))
     stop_total = float(cfg.get("burn_total_stop_usd", 1.00))
-
     if res["burning"]:
-        warn_hit = (cum >= warn_total) or (rate >= warn_rate and cum > 0)
-        if warn_hit and cum < stop_total:
-            msg = (
-                f"BURN-WARN {prov}: burning paid balance — "
-                f"cumulative ${cum:.2f} (rate ${rate:.3f}/min, "
-                f"window {res['bottleneck_window']} @ {res['bottleneck_pct']}%)"
-            )
-            active_warnings[prov] = {
-                "ts": int(now_ts),
-                "cum_cost_usd": round(cum, 4),
-                "rate_usd_per_min": round(rate, 4),
-                "window": res["bottleneck_window"],
-            }
-            alerts.append(msg)
-            append_ledger({
-                "provider": prov,
-                "action": "WARN",
-                "cum_cost_usd": round(cum, 6),
-                "rate_usd_per_min": round(rate, 6),
-                "window": res["bottleneck_window"],
-            })
-
-    if cum >= stop_total:
-        if not pstate.get("stopped"):
-            evidence = (
-                f"provider={prov} rate_usd_per_min={rate:.4f} "
-                f"cumulative_usd={cum:.4f} window={res['bottleneck_window']}"
-            )
-            write_stop_file(
-                f"burn-watchdog STOP for {prov} at "
-                f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
-                + evidence + "\n(manual clear required)"
-            )
-            killed = kill_daemon()
-            msg = (
-                f"BURN-STOP {prov}: burned ${cum:.2f} >= stop ${stop_total:.2f} "
-                f"(rate ${rate:.3f}/min, window {res['bottleneck_window']} "
-                f"@ {res['bottleneck_pct']}%) — wrote STOP file, "
-                + (f"killed daemon (pid {killed})" if killed else "daemon not running")
-            )
-            alerts.append(msg)
-            append_ledger({
-                "provider": prov,
-                "action": "STOP",
-                "cum_cost_usd": round(cum, 6),
-                "rate_usd_per_min": round(rate, 6),
-                "window": res["bottleneck_window"],
-            })
-        nstate["stopped"] = True
-
+        _maybe_provider_warn(prov, res, cum, rate, warn_rate, warn_total, stop_total, now_ts, alerts, active_warnings)
+    _maybe_provider_stop(state, prov, pstate, res, cum, rate, stop_total, alerts)
     return alerts, active_warnings, state
+
+
+def _maybe_provider_warn(prov, res, cum, rate, warn_rate, warn_total, stop_total, now_ts, alerts, active_warnings):
+    """Emit a BURN-WARN alert and ledger entry when warn thresholds are crossed."""
+    warn_hit = (cum >= warn_total) or (rate >= warn_rate and cum > 0)
+    if not warn_hit or cum >= stop_total:
+        return
+    active_warnings[prov] = {
+        "ts": int(now_ts),
+        "cum_cost_usd": round(cum, 4),
+        "rate_usd_per_min": round(rate, 4),
+        "window": res["bottleneck_window"],
+    }
+    alerts.append(
+        f"BURN-WARN {prov}: burning paid balance — "
+        f"cumulative ${cum:.2f} (rate ${rate:.3f}/min, "
+        f"window {res['bottleneck_window']} @ {res['bottleneck_pct']}%)"
+    )
+    append_ledger({
+        "provider": prov,
+        "action": "WARN",
+        "cum_cost_usd": round(cum, 6),
+        "rate_usd_per_min": round(rate, 6),
+        "window": res["bottleneck_window"],
+    })
+
+
+def _maybe_provider_stop(state: Dict[str, Any], prov: str, pstate: Dict[str, Any], res: Dict[str, Any], cum: float, rate: float, stop_total: float, alerts: List[str]):
+    """Write a STOP file and kill the daemon when cumulative burn crosses the stop threshold."""
+    if cum < stop_total or pstate.get("stopped"):
+        return
+    evidence = (
+        f"provider={prov} rate_usd_per_min={rate:.4f} "
+        f"cumulative_usd={cum:.4f} window={res['bottleneck_window']}"
+    )
+    write_stop_file(
+        f"burn-watchdog STOP for {prov} at "
+        f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+        + evidence + "\n(manual clear required)"
+    )
+    killed = kill_daemon()
+    alerts.append(
+        f"BURN-STOP {prov}: burned ${cum:.2f} >= stop ${stop_total:.2f} "
+        f"(rate ${rate:.3f}/min, window {res['bottleneck_window']} "
+        f"@ {res['bottleneck_pct']}%) — wrote STOP file, "
+        + (f"killed daemon (pid {killed})" if killed else "daemon not running")
+    )
+    append_ledger({
+        "provider": prov,
+        "action": "STOP",
+        "cum_cost_usd": round(cum, 6),
+        "rate_usd_per_min": round(rate, 6),
+        "window": res["bottleneck_window"],
+    })
+    state[prov]["stopped"] = True
 
 # Note: _handle_provider keeps each function well under 50 lines.
 
