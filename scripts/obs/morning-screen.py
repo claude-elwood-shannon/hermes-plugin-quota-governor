@@ -32,6 +32,7 @@ import re
 import sqlite3
 import sys
 import time
+import types
 from collections import Counter
 from pathlib import Path
 
@@ -360,7 +361,7 @@ def _read_backlog_guard(hermes_home=None, now=None) -> tuple:
     return None, None
 
 
-def _collect_board_state(hermes_home=None) -> tuple:
+def _collect_board_state(hermes_home: str | Path | None = None) -> tuple:
     """Query the board db: status counts, active tasks, done in last 24h.
 
     Returns (ok, counts, active, done24). ``ok`` is False when the db is
@@ -485,7 +486,7 @@ def gpu_alerts(hermes_home=None, now=None) -> list:
     return alerts
 
 
-def _unattributed_alert(hermes_home=None) -> str | None:
+def _unattributed_alert(hermes_home: str | Path | None = None) -> str | None:
     """Alert if unattributed spend > UNATTRIBUTED_SPEND_PCT of the trace spend."""
     total = 0.0
     unatt = 0.0
@@ -499,7 +500,7 @@ def _unattributed_alert(hermes_home=None) -> str | None:
     return None
 
 
-def _crash_loop_alert(hermes_home=None) -> str | None:
+def _crash_loop_alert(hermes_home: str | Path | None = None) -> str | None:
     """Alert if >= CRASH_LOOP_MIN failing task_runs in the last 24h."""
     db = kanban_db_path(hermes_home)
     if not db.exists():
@@ -522,7 +523,7 @@ def _crash_loop_alert(hermes_home=None) -> str | None:
     return None
 
 
-def _burn_alerts(hermes_home=None) -> list:
+def _burn_alerts(hermes_home: str | Path | None = None) -> list:
     """list of burn-threshold alerts (one per provider with eta_90)."""
     fc = _read_json(forecast_path(hermes_home))
     provs = fc.get("providers", {})
@@ -591,7 +592,8 @@ def _fmt_dur(hours: float) -> str:
     return f"{hours:.1f}h"
 
 
-def _flight_rows(hermes_home=None, now=None) -> list | None:
+def _flight_rows(hermes_home: str | Path | None = None,
+                 now: float | None = None) -> list | None:
     """done tasks in the last 7 days from kanban.db, else None (no db)."""
     now = time.time() if now is None else float(now)
     db = kanban_db_path(hermes_home)
@@ -629,7 +631,8 @@ def _group_closures_by_objective(rows: list) -> dict:
     return by_obj
 
 
-def _balance_spent_since(hermes_home=None, week_start: float = 0.0) -> float:
+def _balance_spent_since(hermes_home: str | Path | None = None,
+                         week_start: float = 0.0) -> float:
     """Balance-billed USD from the trace after ``week_start`` (costUsd > 0)."""
     trace_rows = _read_jsonl(trace_path(hermes_home))
     return sum(r.get("costUsd") or 0 for r in trace_rows
@@ -775,7 +778,7 @@ def _free_quota_line(hermes_home=None) -> str:
     return f"  Cuota gratis:            {', '.join(parts)} ({estado})"
 
 
-def _approved_objectives_rows(hermes_home=None) -> list | None:
+def _approved_objectives_rows(hermes_home: str | Path | None = None) -> list | None:
     """approved_objectives TABLE rows from the root kanban.db, else None."""
     base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
     db = base / "kanban.db"
@@ -839,7 +842,7 @@ def build_objectives_screen(hermes_home=None) -> str:
     return "\n".join(lines)
 
 
-def _load_approval_gate():
+def _load_approval_gate() -> types.ModuleType | None:
     """Import approval_gate.py from the script dir or ~/.hermes/scripts."""
     here = Path(__file__).resolve().parent
     for cand in (here / "approval_gate.py",
@@ -860,7 +863,7 @@ def _load_approval_gate():
     return None
 
 
-def _render_approval_lines(pend: list, gate) -> str:
+def _render_approval_lines(pend: list, gate: types.ModuleType) -> str:
     """Render APPROVAL-READY pending list with package-gap annotations."""
     lines = ["APPROVAL-READY (pendientes de tu ok):"]
     n = 0
