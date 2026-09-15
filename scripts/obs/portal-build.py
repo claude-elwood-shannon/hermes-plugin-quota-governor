@@ -906,6 +906,73 @@ def _request_table(reqs: list, limit: int = 40, anchor: bool = True) -> str:
             + "".join(rows) + "</table>")
 
 
+# --- page_consumo helpers (each <50 lines)
+
+def _search_section(query: dict) -> str:
+    note = query.get("note", "")
+    return ('<section class="card"><h2>Búsqueda</h2>'
+            '<form class="search" method="get" action="consumo.html">'
+            '<input type="text" name="q" placeholder="requestId, modelo, objetivo…" value="">'
+            '<input type="text" name="date" placeholder="YYYY-MM-DD" style="min-width:120px">'
+            '<button type="submit">buscar</button></form>'
+            f'<div class="mut" style="font-size:11px">búsqueda completa '
+            f'en el servidor local (http://localhost:8917/consumo); en el '
+            f'fichero estático usa el buscador del navegador sobre la '
+            f'tabla.{_esc(note)}</div></section>')
+
+def _exact_section(req: dict, q_exact: str) -> str:
+    if not req:
+        return ""
+    otel = req.get("otel") or {}
+    otel_s = "".join(f'<div class="mono mut">{_esc(k)}: { _esc(v) }</div>'
+                     for k, v in sorted(otel.items()))
+    rows = [
+        f'<tr><th>fecha</th><td class=mono>{_esc(_fmt_ts(req.get("ts_epoch_utc")))}',
+        '</td></tr>',
+        f'<tr><th>modelo</th><td>{_esc(req.get("model"))}</td></tr>',
+        f'<tr><th>proveedor</th><td>{_esc(req.get("provider") or "-")}</td></tr>',
+        f'<tr><th>clase</th><td>{_esc(req.get("consumer_class"))}</td></tr>',
+        f'<tr><th>objetivo</th><td>{_esc(req.get("objective"))}</td></tr>',
+        f'<tr><th>tokens in/out</th><td class=num>{_esc(req.get("tokens_in"))} / { _esc(req.get("tokens_out")) }</td></tr>',
+        f'<tr><th>coste</th><td class=num>{_esc(_usd(req.get("usd")))}',  # added closing brace
+        f'</td></tr>',
+        f'<tr><th>fuente</th><td>{_esc(req.get("source"))}</td></tr>',
+    ]
+    table = '<table>' + ''.join(rows) + '</table>'
+    return f'<section class="card"><h2>Request individual — { _esc(q_exact) }</h2>' + table + otel_s + '</section>'
+
+
+def _dims_section(dims: dict, total: float) -> list[str]:
+    labels = {"obj": "objetivo", "cls": "clase", "model": "modelo", "prov": "proveedor"}
+    return [f'<section class="card" id="agg-{dim}"><h2>Por {labels[dim]}</h2>'
+            + _dim_table(dim, dims[dim][:12], total) + '</section>'
+            for dim in ("obj", "cls", "model", "prov")]
+
+def _drilldown_section(reqs_all: list, dims: dict) -> list[str]:
+    toc = []
+    sections = []
+    dim_specs = (("obj", "objective", "objetivo"), ("cls", "consumer_class", "clase"), ("model", "model", "modelo"), ("prov", "provider", "proveedor"))
+    for dim, key, cap in dim_specs:
+        picked = [n for n, _ in dims[dim][:12]]
+        if "unattributed" in dict(dims[dim]) and "unattributed" not in picked:
+            picked.append("unattributed")
+        for name in picked:
+            sid = f"d-{dim}-{_slug(name)}"
+            sub_reqs = [r for r in reqs_all if (r.get(key) or "unattributed") == name]
+            usd = dict(dims[dim]).get(name, {}).get("usd", 0.0)
+            toc.append(f'<a href="#{sid}">{_esc(cap)}:{_esc(name)}</a>')
+            sections.append(f'<div class="detail-block" id="{sid}"><h3>{_esc(cap)} { _esc(name)} · { _esc(_usd(usd)) } · {len(sub_reqs)} requests</h3>' + _request_table(sub_reqs, limit=30) + '</div>')
+    return [f'<div class="toc">' + ''.join(toc) + '</div>'] + sections
+
+def _requests_section(filtered: list) -> str:
+    return '<section class="card"><h2>Requests individuales (' + f'últimos {min(len(filtered), 60)} de {len(filtered)} en el filtro)</h2>' + _request_table(filtered, limit=60) + '</section>'
+
+def _footer() -> str:
+    return ('<div class="mut" style="font-size:11px">coste '
+            '<span class="badge acc">real</span> = USD cobrado a saldo '
+            '(nanogpt-requests) · <span class="badge mut">est</span> = ')
+
+
 def page_consumo(data: dict, query: dict = None) -> str:
     agg = data["agg"]
     total = agg["total_usd"]
@@ -915,102 +982,20 @@ def page_consumo(data: dict, query: dict = None) -> str:
     q_exact = (query or {}).get("q", "").strip()
 
     out = []
-    out.append('<section class="card"><h2>Búsqueda</h2>'
-               '<form class="search" method="get" action="consumo.html">'
-               '<input type="text" name="q" placeholder="requestId, modelo, '
-               'objetivo…" value="">'
-               '<input type="text" name="date" placeholder="YYYY-MM-DD" '
-               'style="min-width:120px">'
-               "<button type=\"submit\">buscar</button></form>"
-               f'<div class="mut" style="font-size:11px">búsqueda completa '
-               f"en el servidor local (http://localhost:8917/consumo); en el "
-               f"fichero estático usa el buscador del navegador sobre la "
-               f"tabla.{_esc(note)}</div></section>")
-
-    if q_exact:
-        exact = [r for r in reqs_all
-                 if (r.get("requestId") or "").lower() == q_exact.lower()]
-        if exact:
-            r = exact[0]
-            otel = r.get("otel") or {}
-            otel_s = "".join(f'<div class="mono mut">{_esc(k)}: '
-                             f"{_esc(v)}</div>" for k, v in sorted(
-                                 otel.items()))
-            out.append('<section class="card"><h2>Request individual — '
-                       f"{_esc(q_exact)}</h2>"
-                       '<table>'
-                       f"<tr><th>fecha</th><td class=mono>"
-                       f"{_esc(_fmt_ts(r.get('ts_epoch_utc')))}</td></tr>"
-                       f"<tr><th>modelo</th><td>{_esc(r.get('model'))}</td>"
-                       f"</tr>"
-                       f"<tr><th>proveedor</th><td>"
-                       f"{_esc(r.get('provider') or '-')}</td></tr>"
-                       f"<tr><th>clase</th><td>"
-                       f"{_esc(r.get('consumer_class'))}</td></tr>"
-                       f"<tr><th>objetivo</th><td>"
-                       f"{_esc(r.get('objective'))}</td></tr>"
-                       f"<tr><th>tokens in/out</th><td class=num>"
-                       f"{_esc(r.get('tokens_in'))} / "
-                       f"{_esc(r.get('tokens_out'))}</td></tr>"
-                       f"<tr><th>coste</th><td class=num>"
-                       f"{_esc(_usd(r.get('usd')))}</td></tr>"
-                       f"<tr><th>fuente</th><td>"
-                       f"{_esc(r.get('source'))}</td></tr>"
-                       "</table>" + otel_s + "</section>")
-
+    out.append(_search_section(query))
+    out.append(_exact_section(next((r for r in reqs_all if (r.get("requestId") or "").lower() == q_exact.lower()), None), q_exact))
     out.append('<div class="grid">')
-    labels = {"obj": "objetivo", "cls": "clase", "model": "modelo",
-              "prov": "proveedor"}
-    for i, dim in enumerate(("obj", "cls", "model", "prov")):
-        out.append(f'<section class="card" id="agg-{dim}"><h2>Por '
-                   f"{labels[dim]}</h2>"
-                   + _dim_table(dim, dims[dim][:12], total) + "</section>")
-    out.append("</div>")
-
-    out.append('<section class="card"><h2>Drill-down — requests por '
-               "objetivo</h2>")
+    out.extend(_dims_section(dims, total))
+    out.append('</div>')
+    out.append('<section class="card"><h2>Drill-down — requests por objetivo</h2>')
     if not data["requests"]:
-        out.append(empty_state("el trace no tiene líneas con coste todavía — "
-                               "el backfill le dará el pasado"))
+        out.append(empty_state("el trace no tiene líneas con coste todavía — el backfill le dará el pasado"))
     else:
-        toc = []
-        sections = []
-        # every DIMENSION gets drill-down blocks (the index/consumo tables
-        # link to them); objetivo first, then clase/modelo/proveedor.
-        dim_specs = (("obj", "objective", "objetivo"), ("cls",
-                      "consumer_class", "clase"), ("model", "model",
-                                                   "modelo"),
-                     ("prov", "provider", "proveedor"))
-        for dim, key, cap in dim_specs:
-            picked = [n for n, _ in dims[dim][:12]]
-            if "unattributed" in dict(dims[dim]) and \
-                    "unattributed" not in picked:
-                picked.append("unattributed")
-            for name in picked:
-                sid = f"d-{dim}-{_slug(name)}"
-                sub_reqs = [r for r in reqs_all
-                            if (r.get(key) or "unattributed") == name]
-                usd = dict(dims[dim]).get(name, {}).get("usd", 0.0)
-                toc.append(f'<a href="#{sid}">{_esc(cap)}:{_esc(name)}</a>')
-                sections.append(
-                    f'<div class="detail-block" id="{sid}">'
-                    f'<h3>{_esc(cap)} {_esc(name)} · {_esc(_usd(usd))} · '
-                    f'{len(sub_reqs)} requests</h3>'
-                    + _request_table(sub_reqs, limit=30) + "</div>")
-        out.append('<div class="toc">' + "".join(toc) + "</div>")
-        out.extend(sections)
-    out.append("</section>")
-
-    out.append('<section class="card"><h2>Requests individuales '
-               f'(últimos {min(len(filtered), 60)} de {len(filtered)} en '
-               "el filtro)</h2>" + _request_table(filtered, limit=60)
-               + "</section>")
-    out.append('<div class="mut" style="font-size:11px">coste '
-               '<span class="badge acc">real</span> = USD cobrado a saldo '
-               "(nanogpt-requests) · <span class=\"badge mut\">est</span> = "
-               "estimación (precios catálogo / ledger; cota superior "
-               "conservadora, nunca verdad de facturación)</div>")
-    return "\n".join(out)
+        out.extend(_drilldown_section(reqs_all, dims))
+    out.append('</section>')
+    out.append(_requests_section(filtered))
+    out.append(_footer() + 'estimación (precios catálogo / ledger; cota superior ' + 'conservadora, nunca verdad de facturación)</div>')
+    return '\n'.join(out)
 
 
 # --- board ------------------------------------------------------------------
