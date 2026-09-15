@@ -129,4 +129,5 @@ check("x16 logs/tick 200", code == 200 and len(body.get("content", "")) > 0, f"c
 print(f"\n== {len(passed)} PASS, {len(failed)} FAIL ==")
 if failed:
     print("FAILED:", ", ".join(failed))
-sys.exit(1 if failed else 0)
+if __name__ == "__main__":
+    sys.exit(1 if failed else 0)
