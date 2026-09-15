@@ -19,6 +19,7 @@ Run:  /usr/bin/python3.12 test_otlp_exporter.py  (or pytest)
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -60,6 +61,7 @@ class _FixtureHTTPServer(ThreadingHTTPServer):
     fail: bool
     status: dict
     attempts: dict
+    auth: dict
     daemon_threads = True
 
 
@@ -74,6 +76,7 @@ class FixtureServer:
     def __init__(self):
         self.received = {"traces": [], "metrics": []}
         self.attempts = {}
+        self.auth = {"traces": None, "metrics": None}
         self.status = {}
         self._fail = False
 
@@ -81,6 +84,9 @@ class FixtureServer:
             def do_POST(self):
                 self.server.attempts[self.path] = \
                     self.server.attempts.get(self.path, 0) + 1
+                self.server.auth[
+                    "traces" if self.path == "/v1/traces" else "metrics"
+                ] = self.headers.get("Authorization")
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
                 if self.server.fail:
@@ -112,6 +118,7 @@ class FixtureServer:
         self.httpd.fail = self._fail
         self.httpd.status = self.status
         self.httpd.attempts = self.attempts
+        self.httpd.auth = self.auth
         self.thread = threading.Thread(target=self.httpd.serve_forever,
                                        daemon=True)
         self.thread.start()
@@ -185,7 +192,8 @@ class MappingTest(Base):
         self.assertEqual(attrs["house.consumer_class"]["stringValue"], "worker")
         self.assertEqual(attrs["house.consumer_id"]["stringValue"], "t_abc")
         self.assertEqual(attrs["house.objective"]["stringValue"], "OBJ-27")
-        self.assertEqual(attrs["house.cost_usd"]["doubleValue"], 1.25)
+        self.assertEqual(attrs["house.cost_usd"]["stringValue"],
+                         repr(1.25))  # doubleValue: OO ingester rejects it
         self.assertEqual(attrs["house.provider"]["stringValue"], "ollama-cloud")
         self.assertEqual(attrs["house.source"]["stringValue"], "task-events")
         self.assertEqual(attrs["house.cause"]["stringValue"], "claimed")
@@ -389,6 +397,77 @@ class PrivacyTest(Base):
         self.assertNotIn("/home/", src)
         self.assertNotIn("/data/", src)
         self.assertNotIn(Path.home().name, src)
+
+
+class AuthTest(Base):
+    """Basic-auth support (t_88753960): OBS_OTLP_AUTH / OBS_OTLP_AUTH_FILE."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(os.environ.pop, "OBS_OTLP_AUTH", None)
+        self.addCleanup(os.environ.pop, "OBS_OTLP_AUTH_FILE", None)
+
+    def test_inline_auth_sends_basic_header(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        os.environ["OBS_OTLP_AUTH"] = "user:pass"
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=0)
+        self.assertTrue(rep["ok"])
+        self.assertTrue(rep["auth"])
+        token = base64.b64encode(b"user:pass").decode("ascii")
+        self.assertEqual(srv.auth["traces"], "Basic " + token)
+        self.assertEqual(srv.auth["metrics"], "Basic " + token)
+
+    def test_auth_file_keyvalue_format(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        envfile = Path(self.tmp) / "oo.env"
+        envfile.write_text("ZO_ROOT_USER_EMAIL=ops@x.local\n"
+                           "ZO_ROOT_USER_PASSWORD=s3cret-px\n")
+        os.environ["OBS_OTLP_AUTH_FILE"] = str(envfile)
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=0)
+        self.assertTrue(rep["ok"])
+        token = base64.b64encode(b"ops@x.local:s3cret-px").decode("ascii")
+        self.assertEqual(srv.auth["traces"], "Basic " + token)
+
+    def test_auth_file_bare_userpass_line(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        envfile = Path(self.tmp) / "auth.txt"
+        envfile.write_text("user2:pass2\n")
+        os.environ["OBS_OTLP_AUTH_FILE"] = str(envfile)
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=0)
+        self.assertTrue(rep["ok"])
+        token = base64.b64encode(b"user2:pass2").decode("ascii")
+        self.assertEqual(srv.auth["traces"], "Basic " + token)
+
+    def test_missing_auth_file_degrades_to_no_auth(self):
+        # fail-open: an unreadable/absent auth file degrades to no auth
+        # (rep["auth"] False) and never raises into the caller.
+        os.environ["OBS_OTLP_AUTH_FILE"] = "/nonexistent/oo.env"
+        self.assertIsNone(exp.resolve_auth())
+
+    def test_no_auth_sources_means_no_header(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=0)
+        self.assertTrue(rep["ok"])
+        self.assertFalse(rep["auth"])
+        self.assertIsNone(srv.auth["traces"])
+
+    def test_401_on_traces_is_a_hard_failure(self):
+        srv = FixtureServer()
+        self.addCleanup(srv.stop)
+        srv.status["/v1/traces"] = 401  # auth wall: wrong credentials
+        self._write_trace([_row(100.0, cid="t_a")])
+        rep = exp.run_export(endpoint=srv.endpoint, max_retries=0)
+        self.assertFalse(rep["ok"])
+        self.assertEqual(self._cursor(), {})
+        self.assertEqual(srv.attempts.get("/v1/traces"), 1)  # no retries
 
 
 if __name__ == "__main__":

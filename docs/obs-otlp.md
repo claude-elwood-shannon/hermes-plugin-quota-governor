@@ -103,11 +103,35 @@ Set `OBS_OTLP_ENDPOINT` to the base URL of the collector:
 | **Langfuse**   | `https://cloud.langfuse.com/api/public/otel` | OTLP ingest endpoint; add `Authorization: Bearer <pk-lf-...>` |
 | **OpenTelemetry Collector** | `http://<collector>:4318` | The standard OTLP/HTTP receiver; both endpoints expected |
 
-> **Auth headers.** The exporter sends only `Content-Type: application/json`
-> (the OTLP/HTTP JSON contract). Backends that require auth (Grafana Cloud,
-> Langfuse) expect extra headers — put a small reverse proxy in front of the
-> exporter that injects them, or extend `_post()` in the module. The exporter
-> stays dependency-free and auth-agnostic by design.
+> **Auth (t_88753960).** The exporter sends Basic auth when configured:
+> `OBS_OTLP_AUTH=user:pass` (inline) or `OBS_OTLP_AUTH_FILE=<path>` pointing
+> to a chmod-600 file holding either a bare `user:pass` line or the
+> OpenObserve root-env format (`ZO_ROOT_USER_EMAIL=` / `ZO_ROOT_USER_PASSWORD=`
+> KEY=VALUE lines — the blind-copied `oo.env` shared with the log shipper).
+> Unset/absent sources degrade to no auth (fail-open); a `401`/`403` from
+> the backend is deterministic (no retries). The house credential lives in
+> ONE file, never versioned, never printed.
+
+## OpenObserve ingester quirks (verified live, image 2026-09-11)
+
+- **Span attributes reject `doubleValue` maps** ("invalid type: map,
+  expected f64") while `intValue`/`stringValue`/`boolValue` maps and
+  metric `asDouble` dataPoints are accepted. `_attr()` therefore
+  normalizes float attributes: integral floats → `intValue`, anything
+  else → full-precision `stringValue`. Numeric doubles for aggregation
+  ride the `house.consumption.cost_usd` gauge metric.
+- **Backfill horizon**: by default the ingester discards events older
+  than 5 hours (`ZO_INGEST_ALLOWED_UPTO=<hours>` raises it). HTTP still
+  answers 200 with `status[].failed` — at-least-once shippers must check
+  the body, not just the status code, before advancing offsets.
+- **Traces stream**: OTLP spans land in the org's `default` traces
+  stream (`/api/default/v1/traces`), cost gauges in the
+  `house_consumption_cost_usd` metrics stream.
+- **Native dashboard**: `scripts/obs/oo-dashboard/generate_dashboard.py`
+  emits the v8 dashboard JSON (17 panels). Wire-format casing is per
+  level (Dashboard/Tab/Panel/Query/AxisItem camelCase; PanelFields/
+  PanelConfig/QueryConfig snake_case); update = `PUT /api/<org>/
+  dashboards/<id>?hash=<current hash>` (hash as query param, not header).
 
 ## Failure semantics
 
@@ -117,19 +141,24 @@ Set `OBS_OTLP_ENDPOINT` to the base URL of the collector:
 - **Never degrades the JSONL.** The trace is the source of truth; OTLP is
   output. A failed export leaves the trace and cursor byte-identical.
 - **Retries with backoff.** Each leg is retried up to 3 times with
-  exponential backoff (`0.5s * 2^attempt`). A `404` is deterministic and
-  is never retried: on `/v1/metrics` it means "tracing-only backend"
-  (metrics skipped, cursor advances on traces success); on `/v1/traces`
-  it is a hard failure. Every other failure on either leg fails the run.
+  exponential backoff (`0.5s * 2^attempt`). A `404` — or a `401`/`403`
+  auth wall — is deterministic and is never retried: on `/v1/metrics`
+  it means "tracing-only backend" (metrics skipped, cursor advances on
+  traces success); on `/v1/traces` it is a hard failure. Every other
+  failure on either leg fails the run.
 
 ## Tests
 
-`scripts/obs/test_otlp_exporter.py` — 14 tests, fixtures only, no external
+`scripts/obs/test_otlp_exporter.py` — 20 tests, fixtures only, no external
 network, `/usr/bin/python3.12`: silent no-op when the endpoint is unset,
-house.*/gen_ai.* namespace mapping with zero collision, payload shape and
-stable span IDs, batch export against a local HTTP fixture server,
-incremental cursor (only new lines), `--export-once` backfill idempotency,
-failure keeps trace + cursor untouched, rotation resets a stale cursor,
-privacy (no absolute host paths in the module), and the tracing-only
-backend contract (metrics 404 → `ok:true` + cursor advances + no retry on
-the 404; traces 404 and non-404 metrics failures stay hard failures).
+house.*/gen_ai.* namespace mapping with zero collision (float attributes
+normalized), payload shape and stable span IDs, batch export against a
+local HTTP fixture server, incremental cursor (only new lines),
+`--export-once` backfill idempotency, failure keeps trace + cursor
+untouched, rotation resets a stale cursor, privacy (no absolute host
+paths in the module), the tracing-only backend contract (metrics 404 →
+`ok:true` + cursor advances + no retry on the 404; traces 404 and
+non-404 metrics failures stay hard failures), and the auth suite
+(Basic header from inline env and from the `oo.env`-style file, bare
+`user:pass` files, fail-open on missing file, no header without
+sources, 401 on traces as a hard failure with no retries).

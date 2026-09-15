@@ -37,6 +37,9 @@ CRONS=(
   "obs-serve|${HERMES_HOME_DIR}/profiles/pr-ollama/logs/obs-serve.heartbeat|300|480|bash ${HERMES_HOME_DIR}/scripts/obs-serve-cron.sh"
   # P4: efficiency ratio (hourly; wrapper deja linea timestamped por tick).
   "efficiency-ratio|${HERMES_HOME_DIR}/logs/efficiency-ratio.log|3600|5400|bash ${HERMES_HOME_DIR}/scripts/obs/efficiency-ratio-cron.sh"
+  # t_88753960: OTLP export a OpenObserve (spans+cost metric cada 5 min;
+  # wrapper deja tick timestamped — liveness por log-mtime).
+  "otlp-export|${HERMES_HOME_DIR}/logs/otlp-export.log|300|480|bash ${HERMES_HOME_DIR}/scripts/obs/otlp-cron.sh"
   # P3: bridge Open WebUI (daemon HTTP en el puerto 9120, NO es cron). Es un
   # servicio silencioso: su log solo crece en respawn, así que log-mtime no
   # es señal de vida — el wrapper sondea GET /openapi.json (200 esperado) y

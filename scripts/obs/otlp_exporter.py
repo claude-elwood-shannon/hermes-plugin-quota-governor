@@ -68,6 +68,7 @@ failure returns ok=False and leaves the trace and cursor untouched.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -96,8 +97,48 @@ HOUSE_ATTRS = {
 }
 
 _ENV_ENDPOINT = "OBS_OTLP_ENDPOINT"
+_ENV_AUTH = "OBS_OTLP_AUTH"          # inline "user:pass" (Basic auth)
+_ENV_AUTH_FILE = "OBS_OTLP_AUTH_FILE"  # chmod-600 file: "user:pass" or
+                                       # KEY=VALUE lines (KEY Zo_ROOT_USER_*)
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_BASE_DELAY = 0.5  # seconds; backoff = base * 2**attempt
+
+
+def resolve_auth() -> str | None:
+    """Basic-auth credential for the OTLP endpoint, or None.
+
+    Sources, in order (first hit wins):
+      1. OBS_OTLP_AUTH            — inline "user:pass"
+      2. OBS_OTLP_AUTH_FILE       — a chmod-600 file holding either a bare
+        "user:pass" line or KEY=VALUE lines with ZO_ROOT_USER_EMAIL /
+        ZO_ROOT_USER_PASSWORD (the OpenObserve root-env format).
+    Fail-open: any unreadable/malformed source degrades to None (no auth),
+    never into the caller — the house never trades availability for auth.
+    """
+    inline = os.environ.get(_ENV_AUTH, "").strip()
+    if inline:
+        return inline
+    path = os.environ.get(_ENV_AUTH_FILE, "").strip()
+    if not path:
+        return None
+    email = password = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("ZO_ROOT_USER_EMAIL="):
+                    email = line.split("=", 1)[1].strip()
+                elif line.startswith("ZO_ROOT_USER_PASSWORD="):
+                    password = line.split("=", 1)[1].strip()
+                elif ":" in line:
+                    return line
+    except OSError:
+        return None
+    if email and password:
+        return f"{email}:{password}"
+    return None
 
 
 def get_hermes_home() -> Path:
@@ -143,13 +184,26 @@ def _save_cursor(cursor: dict, hermes_home=None) -> None:
 # ---------------------------------------------------------------------------
 
 def _attr(key: str, value):
-    """OTLP AnyValue: bool / int / double / string. Never raises."""
+    """OTLP AnyValue for span/dataPoint attributes: bool / int / double /
+    string. Never raises.
+
+    FLOAT NORMALIZATION (t_88753960, verified live): the OpenObserve trace
+    ingester (image pulled 2026-09-11) rejects AnyValue `doubleValue` maps
+    in span attributes ("invalid type: map, expected f64") while accepting
+    int/string/bool maps — and accepts `asDouble` on metric dataPoints.
+    So float attributes are normalized: integral floats become `intValue`,
+    anything else a full-precision `stringValue`. This is valid OTLP/JSON
+    on every backend (Jaeger, SigNoz, Collector included); numeric doubles
+    for aggregation ride the `house.consumption.cost_usd` metric instead.
+    """
     if isinstance(value, bool):
         return {"key": key, "value": {"boolValue": value}}
     if isinstance(value, int):
         return {"key": key, "value": {"intValue": value}}
     if isinstance(value, float):
-        return {"key": key, "value": {"doubleValue": value}}
+        if value.is_integer():
+            return {"key": key, "value": {"intValue": int(value)}}
+        return {"key": key, "value": {"stringValue": repr(value)}}
     return {"key": key, "value": {"stringValue": str(value)}}
 
 
@@ -273,11 +327,14 @@ def build_payload(rows: list) -> dict:
 # Transport (batch + retries with backoff; never raises)
 # ---------------------------------------------------------------------------
 
-def _post(url: str, payload: dict) -> int:
+def _post(url: str, payload: dict, auth: str | None = None) -> int:
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = "Basic " + base64.b64encode(
+            auth.encode("utf-8")).decode("ascii")
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers=headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.status
 
@@ -287,19 +344,19 @@ class _Endpoint404(Exception):
 
 
 def _post_retry(url: str, payload: dict, max_retries: int,
-                base_delay: float) -> bool:
+                base_delay: float, auth: str | None = None) -> bool:
     """POST with exponential backoff. False when retries are exhausted.
 
-    A 404 answer is a *deterministic* no (the path does not exist on this
-    backend): it raises `_Endpoint404` immediately, without retrying.
-    Never raises anything else into the caller.
+    A 401/403 from a Basic-auth-protected backend is treated like a 404:
+    deterministic, no retries (wrong or missing credentials will not fix
+    themselves between attempts).
     """
     for attempt in range(max_retries + 1):
         try:
-            _post(url, payload)
+            _post(url, payload, auth=auth)
             return True
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+            if exc.code in (401, 403, 404):
                 raise _Endpoint404(url) from exc
             if attempt < max_retries:
                 time.sleep(base_delay * (2 ** attempt))
@@ -309,7 +366,7 @@ def _post_retry(url: str, payload: dict, max_retries: int,
     return False
 
 
-def _post_payload(payload: dict, endpoint: str,
+def _post_payload(payload: dict, endpoint: str, auth: str | None = None,
                   max_retries: int = _DEFAULT_MAX_RETRIES,
                   base_delay: float = _DEFAULT_BASE_DELAY) -> dict:
     """POST to /v1/traces and /v1/metrics with exponential backoff.
@@ -318,8 +375,9 @@ def _post_payload(payload: dict, endpoint: str,
     "metrics": bool | "skipped-404"}``. A 404 on /v1/metrics is the
     tracing-only-backend contract (Jaeger): the metrics leg is skipped
     (no retries — the 404 is deterministic) and the run counts as ok
-    when /v1/traces succeeded. A 404 on /v1/traces is a real failure
-    (a backend that takes no traces is no backend at all). On any other
+    when /v1/traces succeeded. A 404 — or 401/403 (auth wall) — on
+    /v1/traces is a real failure (a backend that takes no traces, or
+    that refuses our credentials, is no backend at all). On any other
     failure the cursor is NOT advanced, so the next run re-exports
     (idempotent via stable span IDs). Never raises.
     """
@@ -327,18 +385,18 @@ def _post_payload(payload: dict, endpoint: str,
     out: dict = {"traces": False, "metrics": False}
     try:
         out["traces"] = _post_retry(base + "/v1/traces", payload,
-                                    max_retries, base_delay)
+                                    max_retries, base_delay, auth=auth)
     except _Endpoint404:
-        # A backend that answers 404 for traces cannot take the trace:
-        # that is a hard failure, not a degraded one.
+        # A backend that answers 404 (or 401/403) for traces cannot take
+        # the trace: that is a hard failure, not a degraded one.
         return out
     try:
         leg = _post_retry(base + "/v1/metrics", payload,
-                          max_retries, base_delay)
+                          max_retries, base_delay, auth=auth)
         out["metrics"] = leg
     except _Endpoint404:
-        # Tracing-only backend (Jaeger): /v1/metrics does not exist.
-        # Not a failure — degrade to a metrics no-op and let the
+        # Tracing-only backend (Jaeger) OR an auth wall on the metrics
+        # leg: deterministic no — degrade to a metrics no-op and let the
         # traces success carry the cursor.
         out["metrics"] = "skipped-404"
     return out
@@ -403,7 +461,8 @@ def run_export(hermes_home=None, endpoint=None, export_once=False,
                 "offset": offset}
 
     payload = build_payload(rows)
-    legs = _post_payload(payload, endpoint,
+    auth = resolve_auth()
+    legs = _post_payload(payload, endpoint, auth=auth,
                          max_retries=max_retries if max_retries is not None
                          else _DEFAULT_MAX_RETRIES,
                          base_delay=base_delay if base_delay is not None
@@ -420,6 +479,7 @@ def run_export(hermes_home=None, endpoint=None, export_once=False,
         "exported": len(rows),
         "offset": size if ok else offset,
         "endpoint": endpoint,
+        "auth": bool(auth),
         "export_once": bool(export_once),
         "legs": legs,
     }
