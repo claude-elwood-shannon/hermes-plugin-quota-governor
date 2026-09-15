@@ -115,19 +115,37 @@ def cleanup_pids(pids):
 print("=" * 60)
 
 def main():
+    """Run all concurrency-guard tests and print summary."""
+    _print_header()
+    now_epoch = int(time.time())
+    _test_live_worker_count(now_epoch)
+    _test_null_pid_counted(now_epoch)
+    _test_soft_cap(now_epoch)
+    _test_hard_cap(now_epoch)
+    _test_hard_limit_env_var(now_epoch)
+    _test_default_hard_limit(now_epoch)
+    _test_kill_worker_real_pid(now_epoch)
+    _test_kill_worker_none_pid(now_epoch)
+    _test_empty_db(now_epoch)
+    _test_nonexistent_db(now_epoch)
+    _test_sort_by_age(now_epoch)
+    _print_summary()
+
+# ── Private helpers (split from main for OBJ-CODEQUALITY) ──────────────────
+
+def _print_header():
+    """Print test banner and isolation info."""
     print("OBJ-06 Concurrency Guard Test")
     print(f"Test HERMES_HOME: {TEST_HOME}")
     print("=" * 60)
 
-    # -----------------------------------------------------------------------
-    # Test 1: Live worker count with alive PIDs
-    # -----------------------------------------------------------------------
+def _test_live_worker_count(now_epoch):
+    """Test 1: Live worker count with alive PIDs."""
     print("\n--- Test 1: Live worker count with alive PIDs ---")
 
     test_pids = spawn_test_pids(3)
     time.sleep(0.2)  # let children start
 
-    now_epoch = int(time.time())
     setup_kanban_db([
         ("t_alive_01", "Alive worker 1", "pr-ollama", "running", test_pids[0], now_epoch - 300, now_epoch - 10),
         ("t_alive_02", "Alive worker 2", "pr-nanogpt", "running", test_pids[1], now_epoch - 200, now_epoch - 5),
@@ -142,7 +160,6 @@ def main():
     else:
         fail(f"Live worker count: {len(workers)} (expected 3)")
 
-    # Verify dead PID was not counted
     worker_ids = [w.task_id for w in workers]
     if "t_dead_01" not in worker_ids:
         ok("Dead PID task correctly excluded from live workers")
@@ -162,9 +179,8 @@ def main():
 
     cleanup_pids(test_pids)
 
-    # -----------------------------------------------------------------------
-    # Test 2: Running task with NULL worker_pid is counted as live
-    # -----------------------------------------------------------------------
+def _test_null_pid_counted(now_epoch):
+    """Test 2: Running task with NULL worker_pid is counted as live."""
     print("\n--- Test 2: NULL worker_pid counted as live ---")
 
     setup_kanban_db([
@@ -177,9 +193,8 @@ def main():
     else:
         fail(f"NULL PID task count: {len(workers)} (expected 1)")
 
-    # -----------------------------------------------------------------------
-    # Test 3: Soft cap — live >= desired_max → should_spawn=False
-    # -----------------------------------------------------------------------
+def _test_soft_cap(now_epoch):
+    """Test 3: Soft cap — live >= desired_max → should_spawn=False."""
     print("\n--- Test 3: Soft cap ---")
 
     # 3 live workers, desired_max=2 → should_spawn=False
@@ -205,6 +220,10 @@ def main():
     else:
         fail(f"Unexpected kills: {len(decision.workers_to_kill)}")
 
+    _test_soft_cap_spawn(now_epoch)
+
+def _test_soft_cap_spawn(now_epoch):
+    """Sub-check: 1 live worker, desired_max=2 → should_spawn=True."""
     # 1 live worker, desired_max=2 → should_spawn=True
     setup_kanban_db([
         ("t_null_01", "Worker 1", "pr-ollama", "running", None, now_epoch - 300, now_epoch - 10),
@@ -215,9 +234,8 @@ def main():
     else:
         fail(f"Soft cap: should_spawn={decision.should_spawn} (expected True)")
 
-    # -----------------------------------------------------------------------
-    # Test 4: Hard cap — live > hard_limit → oldest workers killed
-    # -----------------------------------------------------------------------
+def _test_hard_cap(now_epoch):
+    """Test 4: Hard cap — live > hard_limit → oldest workers killed."""
     print("\n--- Test 4: Hard cap ---")
 
     # 5 workers, desired_max=2, hard_limit=3 → kill 2 oldest
@@ -235,22 +253,23 @@ def main():
     else:
         fail(f"Hard cap: kill count={len(decision.workers_to_kill)} (expected 2)")
 
-    # Verify the oldest are selected
+    _assert_hard_cap_kill_selection(decision)
+
+def _assert_hard_cap_kill_selection(decision):
+    """Verify oldest are selected and newest are NOT selected for kill."""
     kill_ids = [w.task_id for w in decision.workers_to_kill]
     if "t_old_01" in kill_ids and "t_old_02" in kill_ids:
         ok(f"Correctly selected oldest: {kill_ids}")
     else:
         fail(f"Wrong workers selected for kill: {kill_ids}")
 
-    # Verify the newest are NOT selected
     if "t_new_04" not in kill_ids and "t_new_05" not in kill_ids:
         ok("Newest workers correctly NOT selected for kill")
     else:
         fail("Newest workers incorrectly selected for kill")
 
-    # -----------------------------------------------------------------------
-    # Test 5: Hard limit via env var
-    # -----------------------------------------------------------------------
+def _test_hard_limit_env_var(now_epoch):
+    """Test 5: Hard limit via env var."""
     print("\n--- Test 5: Hard limit via env var ---")
 
     os.environ["QUOTA_GOVERNOR_HARD_LIMIT"] = "4"
@@ -274,9 +293,8 @@ def main():
 
     del os.environ["QUOTA_GOVERNOR_HARD_LIMIT"]
 
-    # -----------------------------------------------------------------------
-    # Test 6: Default hard limit = desired_max + 2
-    # -----------------------------------------------------------------------
+def _test_default_hard_limit(now_epoch):
+    """Test 6: Default hard limit = desired_max + 2."""
     print("\n--- Test 6: Default hard limit ---")
 
     setup_kanban_db([
@@ -289,9 +307,8 @@ def main():
     else:
         fail(f"Default hard limit: {decision.hard_limit} (expected 5)")
 
-    # -----------------------------------------------------------------------
-    # Test 7: Kill worker with real PID
-    # -----------------------------------------------------------------------
+def _test_kill_worker_real_pid(now_epoch):
+    """Test 7: Kill worker with real PID."""
     print("\n--- Test 7: Kill worker (real PID) ---")
 
     test_pids = spawn_test_pids(1)
@@ -310,13 +327,15 @@ def main():
     else:
         fail("kill_worker returned False")
 
-    # Verify process is dead — wait for it with os.waitpid (blocking, 2s timeout)
-    import subprocess
+    _assert_pid_terminated(test_pids[0])
+
+def _assert_pid_terminated(pid):
+    """Wait for process termination and verify, force-kill on failure."""
     deadline = time.time() + 2
     terminated = False
     while time.time() < deadline:
         try:
-            pid_result, status = os.waitpid(test_pids[0], os.WNOHANG)
+            pid_result, status = os.waitpid(pid, os.WNOHANG)
             if pid_result != 0:
                 terminated = True
                 break
@@ -328,23 +347,20 @@ def main():
     if terminated:
         ok("Process terminated after kill_worker")
     else:
-        # Force kill if still alive
         try:
-            os.kill(test_pids[0], signal.SIGKILL)
-            os.waitpid(test_pids[0], 0)
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
         except OSError:
             pass
         fail("Process still alive after kill_worker (SIGTERM may not interrupt sleep)")
 
-    # Clean up
     try:
-        os.waitpid(test_pids[0], 0)
+        os.waitpid(pid, 0)
     except OSError:
         pass
 
-    # -----------------------------------------------------------------------
-    # Test 8: kill_worker with None PID
-    # -----------------------------------------------------------------------
+def _test_kill_worker_none_pid(now_epoch):
+    """Test 8: kill_worker with None PID."""
     print("\n--- Test 8: Kill worker (None PID) ---")
 
     worker = WorkerInfo(
@@ -360,9 +376,8 @@ def main():
     else:
         fail("kill_worker returned True for None PID (should not)")
 
-    # -----------------------------------------------------------------------
-    # Test 9: Empty DB / no running tasks
-    # -----------------------------------------------------------------------
+def _test_empty_db(now_epoch):
+    """Test 9: Empty DB / no running tasks."""
     print("\n--- Test 9: Empty DB ---")
 
     setup_kanban_db([])
@@ -378,9 +393,8 @@ def main():
     else:
         fail(f"Empty DB: live={decision.live_count} should_spawn={decision.should_spawn}")
 
-    # -----------------------------------------------------------------------
-    # Test 10: Non-existent DB
-    # -----------------------------------------------------------------------
+def _test_nonexistent_db(now_epoch):
+    """Test 10: Non-existent DB."""
     print("\n--- Test 10: Non-existent DB ---")
 
     os.environ["HERMES_KANBAN_DB"] = "/nonexistent/path/kanban.db"
@@ -396,9 +410,8 @@ def main():
     else:
         fail(f"Non-existent DB: should_spawn={decision.should_spawn} (expected True)")
 
-    # -----------------------------------------------------------------------
-    # Test 11: Sort by age
-    # -----------------------------------------------------------------------
+def _test_sort_by_age(now_epoch):
+    """Test 11: Sort by age."""
     print("\n--- Test 11: Sort by age ---")
 
     os.environ["HERMES_KANBAN_DB"] = os.path.join(TEST_HOME, "kanban.db")
@@ -414,15 +427,15 @@ def main():
     else:
         fail(f"Sort by age incorrect: {[w.task_id for w in sorted_workers]}")
 
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
+def _print_summary():
+    """Print results summary and clean up temp directory."""
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")
     print("=" * 60)
 
     # Cleanup
     shutil.rmtree(TEST_HOME, ignore_errors=True)
+
 
 # ── Tests: pytest wrapper (canonical batch) ─────────────────────────────────
 # The script-style checks above run in a SUBPROCESS: OBJ-06 concurrency-guard mutates
