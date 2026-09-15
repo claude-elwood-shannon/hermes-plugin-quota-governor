@@ -10,6 +10,11 @@ build/
 STOP
 *.pid
 
+# Runtime scratch / SQLite sidecars
+tmp/
+*.db-shm
+*.db-wal
+
 # Editor
 .vscode/
 .idea/
