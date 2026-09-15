@@ -393,25 +393,17 @@ def query_quota() -> QuotaSnapshot:
     return query_all()
 
 
-def format_status() -> str:
-    """Human-readable status for /quota-governor status."""
-    snapshot = query_quota()
-    spending_limit = get_spending_limit()
-    previous_cost = get_previous_cost()
-    decision = decide(snapshot, prev_activity_cost=previous_cost,
-                      spending_limit=spending_limit)
-
-    # Mode display per design §5.2
+def _format_ollama_block(snapshot: QuotaSnapshot,
+                        decision: GovernorDecision,
+                        cost_str: str,
+                        spending_limit: float) -> List[str]:
+    """Primary Ollama Cloud section, plus the combined cost/limit line."""
     mode_label = decision.mode.upper()
     mode_marker = ""
     if decision.mode == "paying":
         mode_marker = "  ⚠ spending pay-as-you-go balance"
     elif decision.mode == "stop" and has_stop_signal():
         mode_marker = "  ⚠ stop signal active"
-
-    # Cost (graceful when activity_cost is None — design §5.4 future-proofs)
-    cost_val = snapshot.ollama_activity_cost
-    cost_str = f"${cost_val:.2f}" if cost_val is not None else "N/A"
 
     lines = [
         "=== Quota Governor Status ===",
@@ -423,13 +415,16 @@ def format_status() -> str:
         f"({snapshot.ollama_weekly_requests} requests)",
         f"  Mode:     {mode_label}{mode_marker}",
     ]
-
-    # Cost + limit combined line (design §5.1)
     if spending_limit > 0:
         lines.append(f"  Cost:     {cost_str}  (limit: ${spending_limit:.2f})")
     else:
         lines.append(f"  Cost:     {cost_str}  (limit: unlimited)")
+    return lines
 
+
+def _format_informational_blocks(snapshot: QuotaSnapshot) -> List[str]:
+    """Informational provider sections: NanoGPT, OpenRouter, OpenCode Go."""
+    lines: List[str] = []
     if snapshot.nanogpt_daily_pct is not None or snapshot.nanogpt_state is not None:
         lines.append("")
         lines.append("NanoGPT (informational):")
@@ -453,7 +448,6 @@ def format_status() -> str:
         if snapshot.openrouter_usage_monthly_usd is not None:
             lines.append(f"  Monthly: ${snapshot.openrouter_usage_monthly_usd:.4f}")
 
-    # OpenCode Go (informational) — percent fields are already 0-100
     if (
         snapshot.opencode_go_rolling_pct is not None
         or snapshot.opencode_go_weekly_pct is not None
@@ -471,15 +465,19 @@ def format_status() -> str:
         lines.append("")
         lines.append("OpenCode Go (informational):")
         lines.append("  Not configured — set OPENCODE_GO_API_KEY in profile .env")
+    return lines
 
-    lines.append("")
-    lines.append(f"Decision: {decision.action.upper()}")
-    lines.append(f"  Workers:  {decision.max_workers}")
-    lines.append(f"  Max task: {decision.max_task_cost}")
-    lines.append(f"  Reason:  {decision.reason}")
 
-    # Detailed cost breakdown when paying (mode/cost already shown above
-    # in the Ollama Cloud section — this adds the warning line only).
+def _format_decision_tail(snapshot: QuotaSnapshot,
+                          decision: GovernorDecision) -> List[str]:
+    """Decision block, stop-signal warning, and any provider errors."""
+    lines = [
+        "",
+        f"Decision: {decision.action.upper()}",
+        f"  Workers:  {decision.max_workers}",
+        f"  Max task: {decision.max_task_cost}",
+        f"  Reason:  {decision.reason}",
+    ]
     if decision.mode == "paying" and decision.paying_warning:
         lines.append(f"  {decision.paying_warning}")
 
@@ -492,7 +490,24 @@ def format_status() -> str:
         lines.append("Provider errors:")
         for err in snapshot.errors:
             lines.append(f"  - {err}")
+    return lines
 
+
+def format_status() -> str:
+    """Human-readable status for /quota-governor status."""
+    snapshot = query_quota()
+    spending_limit = get_spending_limit()
+    previous_cost = get_previous_cost()
+    decision = decide(snapshot, prev_activity_cost=previous_cost,
+                      spending_limit=spending_limit)
+
+    # Cost (graceful when activity_cost is None — design §5.4 future-proofs)
+    cost_val = snapshot.ollama_activity_cost
+    cost_str = f"${cost_val:.2f}" if cost_val is not None else "N/A"
+
+    lines = _format_ollama_block(snapshot, decision, cost_str, spending_limit)
+    lines += _format_informational_blocks(snapshot)
+    lines += _format_decision_tail(snapshot, decision)
     return "\n".join(lines)
 
 
