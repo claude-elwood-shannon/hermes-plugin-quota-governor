@@ -825,9 +825,8 @@ def _gather_dirty_repos(configs, db_path):
             conn.close()
     return dirty
 
-def main():
-    global VERBOSE
-
+def _parse_arguments():
+    """Parse CLI flags and apply the REPO_SYNC_EXECUTE env override."""
     parser = argparse.ArgumentParser(
         description="OBJ-13: Automatic repo synchronization monitor"
     )
@@ -836,14 +835,14 @@ def main():
     parser.add_argument('--verbose', action='store_true',
                         help='Verbose output')
     args = parser.parse_args()
-
     # CRON_MODE env var enables --execute for no_agent cron jobs.
     if os.environ.get('REPO_SYNC_EXECUTE', '').strip() in ('1', 'true', 'yes'):
         args.execute = True
+    return args
 
-    VERBOSE = args.verbose
 
-    # Load repo configs. Corrupt config aborts safely with no tasks created.
+def _load_configurations():
+    """Load repo configs; abort safely on corrupt config or empty set."""
     try:
         configs = load_repo_configs()
     except ValueError as e:
@@ -852,18 +851,19 @@ def main():
     if not configs:
         log("No enabled repos configured — nothing to do", "INFO")
         sys.exit(0)
+    return configs
 
-    # Verify default-repo fallback still points at a valid checkout (legacy path).
+
+def _verify_default_repo(configs):
+    """Check the legacy single-config default fallback still points at a valid checkout."""
     if len(configs) == 1 and os.path.abspath(configs[0]["repo"]) == os.path.abspath(REPO_DIR):
         if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
             log(f"Repo not found at {REPO_DIR}", "ERROR")
             sys.exit(1)
 
-    db_path = get_db_path()
 
-    # Deploy-drift audit (alert-only, before the git sync sweep so a drift
-    # alert is delivered even if the sweep later exits early). Never fatal:
-    # any error here must not break the historic git-vs-origin behavior.
+def _run_deploy_drift_audit():
+    """Run the alert-only deploy-drift audit before the git sync sweep."""
     try:
         drift = check_deploy_drift(repo_dir=REPO_DIR)
         if drift:
@@ -872,106 +872,147 @@ def main():
     except Exception as e:
         log(f"Deploy-drift check failed (non-fatal): {e}", "WARN")
 
-    # Gather dirty repos (respecting enabled flag and per-repo pending state).
-    dirty = _gather_dirty_repos(configs, db_path)
 
-    if not dirty:
-        # All watched repos synced (or no eligible desync) — silent exit.
-        if VERBOSE:
-            print("All watched repos are synced. No action needed.")
-        sys.exit(0)
+def _handle_no_dirty(_args):
+    """All watched repos are synced (or no eligible desync) — silent exit."""
+    if VERBOSE:
+        print("All watched repos are synced. No action needed.")
+    sys.exit(0)
 
-    # A repo that already has a pending sync task for IT is not eligible to
-    # create a new one this tick; it's already covered. Sibling-WIP
-    # suppression and the dedupe window add two more skip reasons (computed
-    # per-repo in _gather_dirty_repos).
-    candidates = [d for d in dirty if d["eligible"]]
 
-    # Flood prevention: cap total new tasks at 1 per tick. Among eligible
-    # (non-pending) dirty repos, pick the one with the OLDEST desync.
-    if not candidates:
+def _handle_no_candidates(dirty, args):
+    """No eligible repo this tick: log skip reasons, then exit without new tasks."""
+    for d in dirty:
+        p = d.get("pending_id")
+        if p:
+            log(f"Repo {d['cfg']['repo']} already pending ({p}) — not creating duplicate", "INFO")
+            continue
+        if d.get("wip_suppressed"):
+            lw = d.get("live_workers") or []
+            ids = ", ".join(w["task_id"] for w in lw) or "?"
+            print(
+                f"SKIP_WIP: {repo_basename(d['cfg']['repo'])} uncommitted files are sibling-WIP "
+                f"of live task(s) {ids} — not creating a sync card (suppression re-evaluated every tick)"
+            )
+            continue
+        if d.get("recent_sync"):
+            rs = d["recent_sync"]
+            print(
+                f"SKIP_DEDUPE: {repo_basename(d['cfg']['repo'])} already alerted "
+                f"{rs['age_seconds']/60:.0f} min ago ({rs['task_id']}, status={rs['status']}) — "
+                f"within the {DEDUPE_WINDOW_SECONDS//60} min dedupe window"
+            )
+            continue
+        if d.get("live_workers"):
+            # No uncommitted files (else WIP would have matched) — pure
+            # unpushed-commits debt while workers happen to be live.
+            # Fallback guard: the ledger may still show a very recent
+            # creation that the board query missed (DB write lag).
+            if recently_synced_repo(d["cfg"]["repo"], d["cfg"]["remote"], window_seconds=DEDUPE_WINDOW_SECONDS):
+                print(
+                    f"SKIP_DEDUPE: {repo_basename(d['cfg']['repo'])} ledger records a sync card "
+                    f"created within the last {DEDUPE_WINDOW_SECONDS//60} min — not re-alerting"
+                )
+                continue
+    if args.verbose:
         for d in dirty:
-            p = d.get("pending_id")
-            if p:
-                log(f"Repo {d['cfg']['repo']} already pending ({p}) — not creating duplicate", "INFO")
-                continue
-            if d.get("wip_suppressed"):
-                lw = d.get("live_workers") or []
-                ids = ", ".join(w["task_id"] for w in lw) or "?"
-                print(
-                    f"SKIP_WIP: {repo_basename(d['cfg']['repo'])} uncommitted files are sibling-WIP "
-                    f"of live task(s) {ids} — not creating a sync card (suppression re-evaluated every tick)"
-                )
-                continue
-            if d.get("recent_sync"):
-                rs = d["recent_sync"]
-                print(
-                    f"SKIP_DEDUPE: {repo_basename(d['cfg']['repo'])} already alerted "
-                    f"{rs['age_seconds']/60:.0f} min ago ({rs['task_id']}, status={rs['status']}) — "
-                    f"within the {DEDUPE_WINDOW_SECONDS//60} min dedupe window"
-                )
-                continue
-            if d.get("live_workers"):
-                # No uncommitted files (else WIP would have matched) — pure
-                # unpushed-commits debt while workers happen to be live.
-                # Fallback guard: the ledger may still show a very recent
-                # creation that the board query missed (DB write lag).
-                if recently_synced_repo(d["cfg"]["repo"], d["cfg"]["remote"], window_seconds=DEDUPE_WINDOW_SECONDS):
-                    print(
-                        f"SKIP_DEDUPE: {repo_basename(d['cfg']['repo'])} ledger records a sync card "
-                        f"created within the last {DEDUPE_WINDOW_SECONDS//60} min — not re-alerting"
-                    )
-                    continue
-        if VERBOSE:
-            for d in dirty:
-                fu = d.get("fresh_untracked") or []
-                if fu:
-                    print(f"  fresh untracked (ignored, WIP): {', '.join(c['path'] for c in fu[:10])}")
-        sys.exit(0)
+            fu = d.get("fresh_untracked") or []
+            if fu:
+                print(f"  fresh untracked (ignored, WIP): {', '.join(c['path'] for c in fu[:10])}")
+    sys.exit(0)
 
-    candidates.sort(key=lambda d: d["desync_time"] if d["desync_time"] is not None else float("inf"))
-    target = candidates[0]
+
+def _process_target(target):
+    """Log the chosen target repo's pending sync need."""
+    cfg = target["cfg"]
+    uncommitted = target["uncommitted"]
+    ahead_commits = target["ahead_commits"]
+    log(f"Repo {cfg['repo']} needs sync: {len(uncommitted)} uncommitted files, "
+        f"{len(ahead_commits)} commits ahead of {cfg['remote']}/{cfg['branch']}", "INFO")
+
+
+def _execute_target(target):
+    """Create a sync task for the target repo and emit the SYNC_TASK_CREATED line."""
     cfg = target["cfg"]
     uncommitted = target["uncommitted"]
     ahead_commits = target["ahead_commits"]
     basename = repo_basename(cfg["repo"])
-
-    log(f"Repo {cfg['repo']} needs sync: {len(uncommitted)} uncommitted files, "
-        f"{len(ahead_commits)} commits ahead of {cfg['remote']}/{cfg['branch']}", "INFO")
-
-    if args.execute:
-        sync_id = create_sync_task(uncommitted, ahead_commits, cfg)
-        if sync_id:
-            record_sync(sync_id, uncommitted, ahead_commits, repo=cfg["repo"], remote=cfg["remote"], branch=cfg["branch"])
-            # Print to stdout for cron delivery
-            summary_parts = []
-            if uncommitted:
-                summary_parts.append(f"{len(uncommitted)} uncommitted files")
-            if ahead_commits:
-                summary_parts.append(f"{len(ahead_commits)} unpushed commits")
-            print(
-                f"SYNC_TASK_CREATED: {sync_id} — "
-                f"{' and '.join(summary_parts)} in {basename}"
-            )
-        else:
-            log("Failed to create sync task", "ERROR")
-            sys.exit(1)
-    else:
-        # Dry-run: report what would be done
+    sync_id = create_sync_task(uncommitted, ahead_commits, cfg)
+    if sync_id:
+        record_sync(sync_id, uncommitted, ahead_commits, repo=cfg["repo"], remote=cfg["remote"], branch=cfg["branch"])
+        # Print to stdout for cron delivery
         summary_parts = []
         if uncommitted:
             summary_parts.append(f"{len(uncommitted)} uncommitted files")
-            for c in uncommitted[:10]:
-                age = c.get("age_seconds")
-                age_s = f" (age {int(age)}s)" if age is not None else ""
-                print(f"  UNCOMMITTED: [{c['status']}] {c['path']}{age_s}")
         if ahead_commits:
             summary_parts.append(f"{len(ahead_commits)} unpushed commits")
-            for c in ahead_commits[:10]:
-                print(f"  UNPUSHED: {c['hash']} {c['message']}")
-        if len(candidates) > 1:
-            print(f"Note: {len(candidates)} eligible dirty repos this tick; choosing oldest desync first.")
-        print(f"DRY-RUN: would create sync task for {basename} ({', '.join(summary_parts)})")
+        print(
+            f"SYNC_TASK_CREATED: {sync_id} — "
+            f"{' and '.join(summary_parts)} in {basename}"
+        )
+    else:
+        log("Failed to create sync task", "ERROR")
+        sys.exit(1)
+
+
+def _dry_run(target, candidates):
+    """Report what a sync task would do (default mode)."""
+    cfg = target["cfg"]
+    uncommitted = target["uncommitted"]
+    ahead_commits = target["ahead_commits"]
+    basename = repo_basename(cfg["repo"])
+    summary_parts = []
+    if uncommitted:
+        summary_parts.append(f"{len(uncommitted)} uncommitted files")
+        for c in uncommitted[:10]:
+            age = c.get("age_seconds")
+            age_s = f" (age {int(age)}s)" if age is not None else ""
+            print(f"  UNCOMMITTED: [{c['status']}] {c['path']}{age_s}")
+    if ahead_commits:
+        summary_parts.append(f"{len(ahead_commits)} unpushed commits")
+        for c in ahead_commits[:10]:
+            print(f"  UNPUSHED: {c['hash']} {c['message']}")
+    if len(candidates) > 1:
+        print(f"Note: {len(candidates)} eligible dirty repos this tick; choosing oldest desync first.")
+    print(f"DRY-RUN: would create sync task for {basename} ({', '.join(summary_parts)})")
+
+
+def main():
+    """Entry point delegating to helper functions."""
+    global VERBOSE
+    args = _parse_arguments()
+    VERBOSE = args.verbose
+    configs = _load_configurations()
+    _verify_default_repo(configs)
+
+    db_path = get_db_path()
+
+    # Deploy-drift audit (alert-only, before the git sync sweep so a drift
+    # alert is delivered even if the sweep later exits early). Never fatal.
+    _run_deploy_drift_audit()
+
+    # Gather dirty repos (respecting enabled flag and per-repo pending state).
+    dirty = _gather_dirty_repos(configs, db_path)
+    if not dirty:
+        _handle_no_dirty(args)
+
+    # A repo that already has a pending sync task for IT is not eligible to
+    # create a new one this tick; it's already covered.
+    candidates = [d for d in dirty if d["eligible"]]
+    if not candidates:
+        _handle_no_candidates(dirty, args)
+
+    # Flood prevention: cap total new tasks at 1 per tick. Among eligible
+    # (non-pending) dirty repos, pick the one with the OLDEST desync.
+    candidates.sort(key=lambda d: d["desync_time"] if d["desync_time"] is not None else float("inf"))
+    target = candidates[0]
+    _process_target(target)
+
+    if args.execute:
+        _execute_target(target)
+    else:
+        _dry_run(target, candidates)
+
 
 if __name__ == "__main__":
     main()
