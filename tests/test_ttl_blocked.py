@@ -192,9 +192,9 @@ def _wire(monkeypatch):
 
 # ── T1: binario ausente -> FAILED, jamás REMEDIATED ─────────────────────────
 def test_missing_binary_reports_failed_never_rem(env):
-    ctx = make_blocked(env["db"], override="gpt-oss:20b")
+    ctx = make_blocked(env["db"], override="glm-5.2")  # glm-5.2 dead for workers
     res = run_one(env, FakeCLI(env["db"], "fail"), ctx["tid"], ctx["blocked_at"],
-                  ctx["now"], override="gpt-oss:20b")
+                  ctx["now"], override="glm-5.2")
     assert res.action == "failed"
     assert "R2" in res.detail
     # y la huella R6 quedó escrita como failed (el CLI falló, no hay comment)
@@ -204,19 +204,19 @@ def test_missing_binary_reports_failed_never_rem(env):
 
 # ── T2: set-model rc=0 que no persiste -> FAILED ────────────────────────────
 def test_rc0_liar_set_model_detected(env):
-    ctx = make_blocked(env["db"], override="gpt-oss:20b")
+    ctx = make_blocked(env["db"], override="glm-5.2")
     res = run_one(env, FakeCLI(env["db"], "rc0-liar"), ctx["tid"], ctx["blocked_at"],
-                  ctx["now"], override="gpt-oss:20b")
+                  ctx["now"], override="glm-5.2")
     assert res.action == "failed"
     assert "override sigue igual" in res.detail or "rc=" in res.detail
 
 
 # ── T3: R2 feliz ────────────────────────────────────────────────────────────
 def test_r2_happy_path(env):
-    ctx = make_blocked(env["db"], override="gpt-oss:20b")
+    ctx = make_blocked(env["db"], override="glm-5.2")
     fake = FakeCLI(env["db"], "ok")
     res = run_one(env, fake, ctx["tid"], ctx["blocked_at"], ctx["now"],
-                  override="gpt-oss:20b")
+                  override="glm-5.2")
     assert res.action == "remediated"
     con = sqlite3.connect(env["db"])
     mo = con.execute("SELECT model_override FROM tasks WHERE id=?",
@@ -224,7 +224,7 @@ def test_r2_happy_path(env):
     status = con.execute("SELECT status FROM tasks WHERE id=?",
                          (ctx["tid"],)).fetchone()[0]
     con.close()
-    assert mo == "deepseek-v4-flash"
+    assert mo == "gpt-oss:20b"  # canonical worker pin (Sep 15 2026, t_aa18eff8)
     assert status == "ready"
     # huella R6 con ok
     con = sqlite3.connect(env["db"])

@@ -923,20 +923,17 @@ PROFILE_MODELS = {
 # on ollama-cloud as a fallback.  minimax-m2.7 on OpenCode Go fails with
 # Internal server error — also not usable.
 PROFILE_WORKER_MODELS = {
-    # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.1 approved by the user in
-    # MULTI-PROV-10.5 (Sep 10 2026, matrix §6.1): gpt-oss:20b for cheap workers —
-    #    REVOKED Sep 12 2026 (user order, after 4 workers died with
-    #    rc=0/protocol-violation): gpt-oss:20b DOES NOT EXIST on this host's
-    #    ollama (no local inference — /api/tags only lists :cloud models).
-    #    The 10.5 probe hit ollama-cloud's catalog, not the local server.
-    #    Worker pin restored to deepseek-v4-flash:cloud (present in /api/tags,
-    #    free with session, tool-calling proven on 30+ kanban tasks).
-        "pr-ollama": "glm-5.2",                 # Sep 12 2026 21:15: deepseek-v4-flash:cloud REVOKED
-                                            # as kanban worker — present in /api/tags but does
-                                            # NOT call kanban_heartbeat (greps the FS instead, 3
-                                            # workers rc=0 without terminal call). glm-5.2:
-                                            # subscription-covered, tool-calling kanban proven
-                                            # (2344 reqs). deepseek stays callable for non-kanban.
+    # pr-ollama worker pin. RE-UNIFIED Sep 15 2026 (t_aa18eff8).
+    # The Sep-12 revocation premise was FALSE: /api/tags today lists
+    # gpt-oss:20b-cloud (remote_model gpt-oss:20b) — the model DOES
+    # exist on ollama-cloud. Ping OK + E2E kanban probe t_9a748a51
+    # closed done cleanly. Production record today: 8 tasks pinned
+    # gpt-oss:20b all closed done, zero blocked. Cheapest worker
+    # ($0.07/$0.30 vs glm-5.2 $1.40/$4.40; vs deepseek $0.22/$0.66),
+    # no peak pricing, free on Ollama Cloud Pro (does not bill balance).
+    # Canonical across all 4 layers: gate, config.yaml default, creator
+    # prompt, ttl DEAD_OVERRIDES. glm-5.2 reserved for interactive only.
+        "pr-ollama": "gpt-oss:20b",
     "pr-nanogpt": "z-ai/glm-5.3-flash",     # Sep 8 2026: subscription-COVERED (proven by
                                             # worker t_154b29f2, run 407 — no HTTP 402, real
                                             # artifacts in workspace).  Probe 8-sep 00:55 CEST:

@@ -292,5 +292,25 @@ class TestBottleneckToMaxWorkers(unittest.TestCase):
             prev = w
 
 
+# ── Test Group 5: worker-model map (canonical pins, pitfall 12/19) ───────────
+class TestWorkerModelMap(unittest.TestCase):
+    """Pins the PROFILE_WORKER_MODELS mapping. Each migration to a worker pin
+    must update the expected values in test_ttl_blocked.py AND here — a stale
+    mapping here fails the regression the layer-1 checklist (pitfall 19)."""
+
+    def test_pr_ollama_worker_is_gpt_oss_20b(self):
+        """Canonical cheap worker for pr-ollama (Sep 15 2026, t_aa18eff8).
+        gpt-oss:20b exists on ollama-cloud, no peak pricing, E2E-proven."""
+        self.assertEqual(qg.PROFILE_WORKER_MODELS["pr-ollama"], "gpt-oss:20b")
+
+    def test_pr_ollama_worker_is_cheap_not_interactive(self):
+        """The worker pin must NOT be the interactive glm-5.2 (caro)."""
+        self.assertNotEqual(qg.PROFILE_WORKER_MODELS["pr-ollama"],
+                            qg.PROFILE_MODELS["pr-ollama"])
+
+    def test_worker_model_for_maps(self):
+        self.assertEqual(qg.worker_model_for("pr-ollama"), "gpt-oss:20b")
+
+
 if __name__ == "__main__":
     unittest.main()

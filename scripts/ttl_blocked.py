@@ -87,8 +87,11 @@ _HERMES_DEFAULT = shutil.which("hermes") or "hermes"
 HERMES_BIN = os.environ.get("HERMES_BIN") or _HERMES_DEFAULT
 PLUGIN_DIR = os.environ.get("PLUGIN_DIR", "/data/git/hermes-plugin-quota-governor")
 
-# Overrides muertos conocidos (historia 12-sep): modelo no existe en el host
-DEAD_OVERRIDES = {"gpt-oss:20b", "glm-5.2"}  # glm-5.2 prohibido para workers (caro)
+# Dead overrides — worker pins known to be invalid (history). glm-5.2 stays
+# dead for WORKERS (interactive-only, too expensive: $1.40/$4.40 per M).
+# gpt-oss:20b was removed Sep 15 2026 (t_aa18eff8): the "model absent" premise
+# was FALSE — /api/tags lists gpt-oss:20b-cloud, E2E probe t_9a748a51 done.
+DEAD_OVERRIDES = {"glm-5.2"}
 
 # Motivos que el SISTEMA puede generar él solo (R1): la frase "user needed"
 # para un campo auto-generado es una contradicción — se repara re-spawneando.
@@ -220,10 +223,11 @@ def valid_override_for(provider: str | None, model: str | None,
     return m in offer.get(prov, set())
 
 
-# Oferta mínima verificada por /api/tags + gate (13-sep). No es un catálogo:
-# es la lista de pines que SABEMOS vivos; el resto se considera envenenado.
+# Oferta mínima verificada por /api/tags + gate (13-sep; gpt-oss:20b added
+# Sep 15 2026 t_aa18eff8 — present as gpt-oss:20b-cloud, E2E probe done).
+# No es un catálogo: es la lista de pines que SABEMOS vivos; el resto se considera envenenado.
 DEFAULT_OFFER: dict[str, set[str]] = {
-    "ollama-cloud": {"deepseek-v4-flash", "deepseek-v4-flash:cloud",
+    "ollama-cloud": {"gpt-oss:20b", "deepseek-v4-flash", "deepseek-v4-flash:cloud",
                      "gpt-oss:120b-cloud", "qwen3.8-flash", "kimi-k2.7-code"},
     "custom": {"liodon-ai/Qwen2.5-7B-Instruct-FP8"},
     "nanogpt": {"z-ai/glm-5.3-flash"},
@@ -369,7 +373,7 @@ def _override_in_db(db_path: Path, task_id: str) -> str:
 def _apply_override_and_unblock(db_path: Path, task_id: str, old: str) -> tuple[bool, str]:
     """R2: set-model al pin del gate + unblock. VERIFICA la persistencia
     releyendo la DB. Devuelve (ok, err)."""
-    setr = _cli("set-model", task_id, "deepseek-v4-flash", "--provider", "ollama-cloud")
+    setr = _cli("set-model", task_id, "gpt-oss:20b", "--provider", "ollama-cloud")
     if _cli_failed(setr):
         return False, f"set-model rc={setr.returncode}: {_first_err(setr)}"
     unp = _cli("unblock", task_id, "--reason",
@@ -382,7 +386,7 @@ def _apply_override_and_unblock(db_path: Path, task_id: str, old: str) -> tuple[
         return False, "set-model rc=0 pero el override sigue igual en la DB"
     _cli("comment", task_id,
          f"{TRIAGE_MARK} autorremediación R2 verificada: override '{old}' -> "
-         f"deepseek-v4-flash (persistencia comprobada en DB)")
+         f"gpt-oss:20b (persistencia comprobada en DB)")
     return True, ""
 
 
@@ -510,7 +514,7 @@ def _remediate_r2(db_path: Path, task_id: str, reason: str,
     """R2: override envenenado -> set-model al pin del gate + unblock + verify."""
     if not execute:
         return dry("remediate",
-                   f"R2 pendiente: set-model deepseek-v4-flash + unblock + verify")
+                   f"R2 pendiente: set-model gpt-oss:20b + unblock + verify")
     ok, err = _apply_override_and_unblock(db_path, task_id, model_override)
     record_remediation_attempt(db_path, task_id, "R2", reason, ok=ok)
     if not ok:
