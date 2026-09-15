@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from typing import Any
 """tick_cola_viva.py — importable alias de scripts/tick-cola-viva.py (OBJ-44).
 
 El modulo de runtime vive en un fichero con guiones (`tick-cola-viva.py`,

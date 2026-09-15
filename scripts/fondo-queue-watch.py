@@ -1,4 +1,5 @@
 #!/usr/bin/python3.12
+from typing import Any
 """fondo-queue-watch.py — OBJ-30b: anti-parada mechanism during budget windows.
 
 Watchdog (no_agent cron, zero tokens): while a FONDO WINDOW is active — a task
@@ -252,7 +253,7 @@ def header_of(body: str) -> str:
     return "\n".join(lines)
 
 
-def parse_cost(body: str):
+def parse_cost(body: str) -> Any:
     m = re.search(r"cost[eé]?\s*:\s*([A-Za-z]+)", header_of(body or ""), re.I)
     return m.group(1).lower() if m else None
 
@@ -453,7 +454,7 @@ def run(hermes_home=None, execute: bool = False, now=None) -> list:
 
     decisions: list[str] = []
 
-    def act(entry: dict, msg: str):
+    def act(entry: dict, msg: str) -> Any:
         _log(ledger, entry)
         if execute:
             decisions.append(msg)

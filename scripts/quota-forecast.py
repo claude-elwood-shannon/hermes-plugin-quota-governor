@@ -1,4 +1,5 @@
 #!/usr/bin/python3.12
+from typing import Any
 """quota-forecast.py — FASE 2 del sistema predictivo de cuota (OBJ-24).
 
 Predictor EMA no_agent: cada 15m (tras quota-metrics) calcula, por provider,
@@ -79,7 +80,7 @@ def _iso(epoch):
         epoch, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def next_weekly_reset_epoch(now_epoch=None):
+def next_weekly_reset_epoch(now_epoch: Any = None) -> Any:
     """Próximo reset semanal: lunes 02:00 CEST = 00:00 UTC del lunes."""
     import datetime
     now = datetime.datetime.fromtimestamp(
@@ -93,7 +94,7 @@ def next_weekly_reset_epoch(now_epoch=None):
     return reset.timestamp()
 
 
-def ema_burn(puntos, alfa=ALFA, dt_min=DT_MIN_SEG):
+def ema_burn(puntos: Any, alfa: Any = ALFA, dt_min: Any = DT_MIN_SEG) -> Any:
     """EMA del burn rate (%/min) sobre [(epoch, pct), ...] ordenado.
 
     Pares con dt < dt_min se descartan (muestreos casi simultáneos del
@@ -117,7 +118,7 @@ def ema_burn(puntos, alfa=ALFA, dt_min=DT_MIN_SEG):
     return ema, n
 
 
-def eta_horas(pct_now, hito, burn):
+def eta_horas(pct_now: Any, hito: Any, burn: Any) -> Any:
     """Horas hasta el hito con burn %/min (positivo=consume). None si no aplica."""
     if burn is None or burn <= 0:
         return None
@@ -138,7 +139,7 @@ def _conf(n, burn):
     return 3 if n >= 8 else 2
 
 
-def main():
+def main() -> Any:
     filas = []
     try:
         for line in HISTORY.read_text(encoding="utf-8").splitlines():

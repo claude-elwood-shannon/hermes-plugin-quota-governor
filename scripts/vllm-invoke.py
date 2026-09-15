@@ -1,4 +1,5 @@
 #!/usr/bin/env python3.12
+from typing import Any
 """vllm-invoke.py — vLLM hybrid-tool directive (2026-09-13).
 
 Workers cloud (pr-ollama/pr-nanogpt/pr-opencode) call this to delegate

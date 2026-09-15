@@ -1,4 +1,5 @@
 #!/usr/bin/python3.12
+from typing import Any
 """quota-metrics.py — FASE 1 del sistema predictivo de cuota (OBJ-24).
 
 Colector observador: cada tick muestrea cuota de todos los providers +
@@ -74,7 +75,7 @@ NANOGPT_LEDGER = os.path.join(_PLUGIN_ROOT, "scripts",
                               "nanogpt-balance-ledger.py")
 
 
-def board_counts():
+def board_counts() -> Any:
     con = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True)
     n = con.execute(
         "SELECT "
@@ -88,7 +89,7 @@ def board_counts():
 VENTANA_SUPPLY_SEG = 86400  # OBJ-29: ventana rodante 24h (UTC)
 
 
-def supply_counts(now_epoch=None, db_path=None):
+def supply_counts(now_epoch: Any = None, db_path: Any = None) -> Any:
     """OBJ-29: (creadas, cerradas) en la ventana rodante de 24h UTC.
 
     created: task_events kind='created' — exactamente una por tarea
@@ -112,7 +113,7 @@ def supply_counts(now_epoch=None, db_path=None):
     return int(created), int(closed)
 
 
-def supply_ratio(created, closed):
+def supply_ratio(created: Any, closed: Any) -> Any:
     """created/closed redondeado a 3 decimales; None si closed <= 0.
 
     None NO significa deficit: sin cierres el ratio es indefinido — los
@@ -123,7 +124,7 @@ def supply_ratio(created, closed):
     return round(created / closed, 3)
 
 
-def from_last_good(name):
+def from_last_good(name: Any) -> Any:
     try:
         d = json.load(open(LAST_GOOD_DIR / f"{name}-last-good.json"))
         return d
@@ -131,7 +132,7 @@ def from_last_good(name):
         return {}
 
 
-def main():
+def main() -> Any:
     row: dict = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     # board

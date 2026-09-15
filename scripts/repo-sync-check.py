@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from typing import Any
 """
 repo-sync-check.py — OBJ-13: Automatic repo synchronization monitor.
 
@@ -103,7 +104,7 @@ LIVE_TASK_STATUSES = ("running",)
 
 VERBOSE = False
 
-def log(msg, level="INFO"):
+def log(msg: Any, level: Any = "INFO") -> Any:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = f"[{ts}] [{level}] {msg}"
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -114,7 +115,7 @@ def log(msg, level="INFO"):
 
 # ── Config loading ───────────────────────────────────────────────────────────
 
-def load_repo_configs():
+def load_repo_configs() -> Any:
     """Return a list of repo config dicts.
 
     Priority:
@@ -160,12 +161,12 @@ def _normalize_config(entry):
         "enabled": entry.get("enabled", True),
     }
 
-def repo_basename(repo_dir):
+def repo_basename(repo_dir: Any) -> Any:
     return os.path.basename(os.path.normpath(repo_dir)) or repo_dir
 
 # ── Git Helpers ──────────────────────────────────────────────────────────────
 
-def git(args, cwd=REPO_DIR):
+def git(args: Any, cwd: Any = REPO_DIR) -> Any:
     """Run a git command, return (returncode, stdout, stderr).
 
     Note: stdout is NOT stripped of leading whitespace — git porcelain
@@ -183,7 +184,7 @@ def git(args, cwd=REPO_DIR):
         out = out[:-1]
     return result.returncode, out, result.stderr.strip()
 
-def get_uncommitted_changes(cwd=REPO_DIR, include_untracked=False):
+def get_uncommitted_changes(cwd: Any = REPO_DIR, include_untracked: Any = False) -> Any:
     """Return list of changed files (tracked by default; untracked opt-in).
 
     With include_untracked=True, '??' entries are returned too, each carrying
@@ -220,7 +221,7 @@ def get_uncommitted_changes(cwd=REPO_DIR, include_untracked=False):
         changes.append(entry)
     return changes
 
-def get_ahead_count(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+def get_ahead_count(cwd: Any = REPO_DIR, remote: Any = DEFAULT_REMOTE, branch: Any = DEFAULT_BRANCH) -> Any:
     """Return number of commits ahead of <remote>/<branch>."""
     rc, out, _ = git(["rev-list", "--count", f"{remote}/{branch}..{branch}"], cwd=cwd)
     if rc != 0:
@@ -231,7 +232,7 @@ def get_ahead_count(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
     except ValueError:
         return 0
 
-def get_ahead_commits(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+def get_ahead_commits(cwd: Any = REPO_DIR, remote: Any = DEFAULT_REMOTE, branch: Any = DEFAULT_BRANCH) -> Any:
     """Return list of commit hashes and messages ahead of <remote>/<branch>."""
     rc, out, _ = git(["log", "--oneline", f"{remote}/{branch}..{branch}"], cwd=cwd)
     if rc != 0:
@@ -244,7 +245,7 @@ def get_ahead_commits(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH
         commits.append({"hash": parts[0], "message": parts[1] if len(parts) > 1 else ""})
     return commits
 
-def get_ahead_oldest_ts(cwd=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+def get_ahead_oldest_ts(cwd: Any = REPO_DIR, remote: Any = DEFAULT_REMOTE, branch: Any = DEFAULT_BRANCH) -> Any:
     """Return the unix timestamp of the OLDEST commit ahead of <remote>/<branch>, or None."""
     rc, out, _ = git(["log", "--format=%ct", f"{remote}/{branch}..{branch}"], cwd=cwd)
     if rc != 0:
@@ -271,7 +272,7 @@ def _min_mtime_for_changes(cwd, changes):
             continue
     return min(mtimes) if mtimes else None
 
-def compute_desync_time(cwd, uncommitted, ahead_commits, remote, branch):
+def compute_desync_time(cwd: Any, uncommitted: Any, ahead_commits: Any, remote: Any, branch: Any) -> Any:
     """Return the earliest timestamp at which this repo became desynced.
 
     Combines the oldest ahead-commit time (committed-but-unpushed) with the
@@ -298,7 +299,7 @@ def compute_desync_time(cwd, uncommitted, ahead_commits, remote, branch):
 # auto-deploys, never mutates deployed files.
 
 
-def md5_of_file(path):
+def md5_of_file(path: Any) -> Any:
     """Return the md5 hex digest of a file, or None if unreadable."""
     h = hashlib.md5()
     try:
@@ -311,7 +312,7 @@ def md5_of_file(path):
     return h.hexdigest()
 
 
-def check_deploy_drift(repo_dir=None, deploy_dirs=None):
+def check_deploy_drift(repo_dir: Any = None, deploy_dirs: Any = None) -> Any:
     """Compare each repo scripts/ file against its deployed copies.
 
     Returns a list of drift dicts. Semantics:
@@ -384,7 +385,7 @@ def _fmt_ts(ts):
         return "unknown"
 
 
-def report_deploy_drift(drift):
+def report_deploy_drift(drift: Any) -> Any:
     """Print a human-readable deploy-drift alert to stdout (cron delivery)."""
     print("DEPLOY_DRIFT: deployed scripts differ from repo — manual deploy needed (no auto-deploy)")
     for d in drift:
@@ -397,10 +398,10 @@ def report_deploy_drift(drift):
 
 # ── DB Helpers ───────────────────────────────────────────────────────────────
 
-def get_db_path():
+def get_db_path() -> Any:
     return os.environ.get("HERMES_KANBAN_DB", KANBAN_DB)
 
-def has_pending_sync_task(conn, repo=None):
+def has_pending_sync_task(conn: Any, repo: Any = None) -> Any:
     """Check if there's already an active (non-done, non-blocked) sync task.
 
     When `repo` is provided, restrict the match to tasks whose title names
@@ -440,7 +441,7 @@ def has_pending_sync_task(conn, repo=None):
 
 # ── Idempotency ──────────────────────────────────────────────────────────────
 
-def load_synced_records():
+def load_synced_records() -> Any:
     """Load recent sync records from repo-sync.jsonl."""
     records = []
     if not os.path.isfile(SYNC_FILE):
@@ -463,7 +464,7 @@ def _record_pattern_key(repo_dir, remote):
     """Composite identity for the ledger — per-repo idempotency marker."""
     return f"{repo_dir}@{remote}"
 
-def record_sync(sync_task_id, uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH):
+def record_sync(sync_task_id: Any, uncommitted: Any, ahead_commits: Any, repo: Any = REPO_DIR, remote: Any = DEFAULT_REMOTE, branch: Any = DEFAULT_BRANCH) -> Any:
     """Append a sync record to repo-sync.jsonl."""
     os.makedirs(os.path.dirname(SYNC_FILE), exist_ok=True)
     entry = {
@@ -483,7 +484,7 @@ def record_sync(sync_task_id, uncommitted, ahead_commits, repo=REPO_DIR, remote=
     with open(SYNC_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-def recently_synced_repo(repo_dir, remote=DEFAULT_REMOTE, window_seconds=3600):
+def recently_synced_repo(repo_dir: Any, remote: Any = DEFAULT_REMOTE, window_seconds: Any = 3600) -> Any:
     """True if a ledger record exists for this repo within the last `window_seconds`."""
     key = _record_pattern_key(repo_dir, remote)
     cutoff = time.time() - window_seconds
@@ -511,9 +512,7 @@ def _legacy_key(rec):
 
 # ── Sibling-WIP suppression (t_261f31e3) ─────────────────────────────────────
 
-def find_live_sibling_workers(conn, exclude_task_id=None,
-                              heartbeat_max_age=WIP_HEARTBEAT_MAX_AGE,
-                              now=None):
+def find_live_sibling_workers(conn: Any, exclude_task_id: Any = None, heartbeat_max_age: Any = WIP_HEARTBEAT_MAX_AGE, now: Any = None) -> Any:
     """Return live claimed tasks: status='running' with a recent heartbeat.
 
     Uses the tasks table only (last_heartbeat_at is updated by the dispatcher
@@ -563,7 +562,7 @@ def find_live_sibling_workers(conn, exclude_task_id=None,
     return live
 
 
-def find_recent_sync_task(conn, repo, window_seconds=DEDUPE_WINDOW_SECONDS, now=None):
+def find_recent_sync_task(conn: Any, repo: Any, window_seconds: Any = DEDUPE_WINDOW_SECONDS, now: Any = None) -> Any:
     """Return the most recent OBJ-13 sync card for this repo within `window_seconds`.
 
     Matches on repo basename in the title (the title embeds it), regardless of
@@ -602,7 +601,7 @@ def find_recent_sync_task(conn, repo, window_seconds=DEDUPE_WINDOW_SECONDS, now=
     }
 
 
-def annotate_wip_files(cwd, changes):
+def annotate_wip_files(cwd: Any, changes: Any) -> Any:
     """Return (tracked_changes, fresh_untracked, old_untracked).
 
     fresh_untracked: '??' files younger than UNTRACKED_MIN_AGE (likely live
@@ -622,7 +621,7 @@ def annotate_wip_files(cwd, changes):
 
 # ── Task Creation ────────────────────────────────────────────────────────────
 
-def build_sync_body(uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH, assignee=None):
+def build_sync_body(uncommitted: Any, ahead_commits: Any, repo: Any = REPO_DIR, remote: Any = DEFAULT_REMOTE, branch: Any = DEFAULT_BRANCH, assignee: Any = None) -> Any:
     """Build the body for the sync task."""
     sections = []
     repo_label = repo
@@ -683,7 +682,7 @@ def _resolve_assignee(cfg):
         return DEFAULT_ASSIGNEE
     return cfg["assignee"]
 
-def create_sync_task(uncommitted, ahead_commits, cfg):
+def create_sync_task(uncommitted: Any, ahead_commits: Any, cfg: Any) -> Any:
     """Create a sync task via hermes kanban create CLI."""
     repo = cfg["repo"]
     remote = cfg["remote"]
@@ -825,7 +824,7 @@ def _gather_dirty_repos(configs, db_path):
             conn.close()
     return dirty
 
-def main():
+def main() -> Any:
     global VERBOSE
 
     parser = argparse.ArgumentParser(

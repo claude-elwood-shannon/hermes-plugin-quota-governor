@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from typing import Any
 """quota-gate.py — pre-run script for the autonomous task creator cron job.
 
 Queries all configured providers (Ollama Cloud, NanoGPT, OpenRouter,
@@ -245,7 +246,7 @@ def _nanogpt_balance_module():
     return _NANOGPT_BALANCE_MOD
 
 
-def nanogpt_budget_context(hermes_home=None):
+def nanogpt_budget_context(hermes_home: Any = None) -> Any:
     """Best-effort OBJ-26 balance budget block for the gate snapshot.
 
     Returns (context_dict_or_None, warning_list).  Never fatal: any error
@@ -311,7 +312,7 @@ PROVIDERS_CONFIG_PATH = os.path.join(
 )
 
 
-def load_providers_config(path=None):
+def load_providers_config(path: Any = None) -> Any:
     """Read providers.json (provider-profile config). Returns {} if absent.
 
     Format: {"providers": {"<profile>": {"parked": bool, "reason": str}}}
@@ -329,7 +330,7 @@ def load_providers_config(path=None):
         return {}
 
 
-def get_parked_profiles(config=None):
+def get_parked_profiles(config: Any = None) -> Any:
     """Set of profile names marked parked:true — temporarily out of use.
 
     Parked profiles are excluded from the candidate set BEFORE
@@ -349,7 +350,7 @@ def get_parked_profiles(config=None):
 # Environment helpers
 # ---------------------------------------------------------------------------
 
-def get_env(key):
+def get_env(key: Any) -> Any:
     """Read from environment or .env file."""
     val = os.environ.get(key)
     if val:
@@ -464,7 +465,7 @@ def _write_cache(provider, data):
         pass
 
 
-def load_burn_warnings():
+def load_burn_warnings() -> Any:
     """Read the burn-watchdog's active warnings (MULTI-PROV-08).
 
     The watchdog persists open burn warnings to
@@ -483,7 +484,7 @@ def load_burn_warnings():
         return {}
 
 
-def load_forecast():
+def load_forecast() -> Any:
     """Read the OBJ-24 F2 predictor output (forecast.json).
 
     Written by quota-forecast.py (no_agent cron, every 15m after
@@ -498,7 +499,7 @@ def load_forecast():
         return {}
 
 
-def forecast_context(forecast):
+def forecast_context(forecast: Any) -> Any:
     """Build the ``forecast_warning`` block for the creator context (F2).
 
     Decision rule (criterio definido en la tarea OBJ-24):
@@ -556,7 +557,7 @@ def forecast_context(forecast):
 # Profile validation (Guardrail G1)
 # ---------------------------------------------------------------------------
 
-def get_existing_profiles():
+def get_existing_profiles() -> Any:
     """Return the set of profile names that actually exist on this host.
 
     Parses `hermes profile list` output. Falls back to the known-good
@@ -589,8 +590,7 @@ def get_existing_profiles():
     return profiles
 
 
-def validate_recommended_profile(recommended, existing, warnings,
-                                 providers_list=None, parked=None):
+def validate_recommended_profile(recommended: Any, existing: Any, warnings: Any, providers_list: Any = None, parked: Any = None) -> Any:
     """Return a profile that is safe to assign tasks to.
 
     Guardrail G1: the recommended profile must (a) exist on the host and
@@ -650,7 +650,7 @@ def validate_recommended_profile(recommended, existing, warnings,
 # Provider queries
 # ---------------------------------------------------------------------------
 
-def query_ollama():
+def query_ollama() -> Any:
     """Query Ollama Cloud usage. Returns dict or raises."""
     api_key = get_env("OLLAMA_API_KEY")
     if not api_key:
@@ -686,7 +686,7 @@ def query_ollama():
     return result
 
 
-def query_nanogpt():
+def query_nanogpt() -> Any:
     """Query NanoGPT subscription usage. Returns dict or raises.
 
     Falls back to last-known-good cache on transient errors (OBJ-20).
@@ -726,7 +726,7 @@ def query_nanogpt():
     return result
 
 
-def query_openrouter():
+def query_openrouter() -> Any:
     """Query OpenRouter key usage. Returns dict or raises.
 
     Falls back to last-known-good cache on transient errors (OBJ-20).
@@ -770,7 +770,7 @@ def query_openrouter():
     return result
 
 
-def query_opencode_go():
+def query_opencode_go() -> Any:
     """Query OpenCode Go usage (MULTI-PROV-06). Returns dict or raises.
 
     Endpoint: GET https://opencode.ai/zen/go/v1/usage
@@ -943,7 +943,7 @@ PEAK_AFFECTED_MODELS = {
 }
 
 
-def is_peak_hours(now=None):
+def is_peak_hours(now: Any = None) -> Any:
     """True if *now* (UTC, default: current time) falls in peak pricing hours.
 
     Peak = Monday–Friday within any PEAK_WINDOWS_UTC hour range.
@@ -956,7 +956,7 @@ def is_peak_hours(now=None):
     return any(start <= now.hour < end for start, end in PEAK_WINDOWS_UTC)
 
 
-def peak_pricing_context(now=None):
+def peak_pricing_context(now: Any = None) -> Any:
     """Build the peak_pricing block for the gate output context."""
     active = is_peak_hours(now)
     return {
@@ -973,7 +973,7 @@ def peak_pricing_context(now=None):
     }
 
 
-def worker_model_for(profile):
+def worker_model_for(profile: Any) -> Any:
     """Cheap worker model for *profile* (MULTI-PROV-07 rule).
 
     Falls back to the interactive PROFILE_MODELS entry if the profile has
@@ -1014,7 +1014,7 @@ _LEDGER_UNSET = object()
 _MODEL_LEDGER_MOD = _LEDGER_UNSET
 
 
-def model_cost_context(rolling_resets_at=None):
+def model_cost_context(rolling_resets_at: Any = None) -> Any:
     """Best-effort per-model cost block for the gate snapshot.
 
     Returns (context_dict_or_None, warning_list).  Opportunistically syncs
@@ -1042,7 +1042,7 @@ PROVIDER_PREFERENCE = {
 }
 
 
-def compute_ollama_status():
+def compute_ollama_status() -> Any:
     """Build a ProviderStatus dict for Ollama Cloud."""
     raw = query_ollama()
     s = raw["session_pct"]
@@ -1072,7 +1072,7 @@ def compute_ollama_status():
     }
 
 
-def compute_nanogpt_status(budget=None):
+def compute_nanogpt_status(budget: Any = None) -> Any:
     """Build a ProviderStatus dict for NanoGPT.
 
     OBJ-26: *budget* is the nanogpt_balance context dict (may be None).
@@ -1168,7 +1168,7 @@ def compute_nanogpt_status(budget=None):
     }
 
 
-def compute_openrouter_status():
+def compute_openrouter_status() -> Any:
     """Build a ProviderStatus dict for OpenRouter."""
     raw = query_openrouter()
     limit = raw.get("limit")
@@ -1227,7 +1227,7 @@ def compute_openrouter_status():
     }
 
 
-def compute_opencode_go_status():
+def compute_opencode_go_status() -> Any:
     """Build a ProviderStatus dict for OpenCode Go (MULTI-PROV-06).
 
     All three windows (rolling, weekly, monthly) contribute to the
@@ -1318,7 +1318,7 @@ def compute_opencode_go_status():
 # Decision algorithm
 # ---------------------------------------------------------------------------
 
-def bottleneck_to_max_cost(bottleneck_pct):
+def bottleneck_to_max_cost(bottleneck_pct: Any) -> Any:
     """Map bottleneck percentage to max_task_cost tier."""
     if bottleneck_pct < 30:
         return "any"
@@ -1331,7 +1331,7 @@ def bottleneck_to_max_cost(bottleneck_pct):
     return "micro"
 
 
-def bottleneck_to_max_workers(bottleneck_pct):
+def bottleneck_to_max_workers(bottleneck_pct: Any) -> Any:
     """Map bottleneck percentage to max workers."""
     if bottleneck_pct < 50:
         return 2
@@ -1382,7 +1382,7 @@ def _normalise_privacy_value(value):
     return None
 
 
-def parse_privacy_tag(text):
+def parse_privacy_tag(text: Any) -> Any:
     """Extract the privacy level from a task body or arbitrary text.
 
     Looks for ``privacy: <level>`` where <level> is one of
@@ -1525,7 +1525,7 @@ def _parse_privacy_tag_raw(text):
     return None
 
 
-def compute_privacy_summary(kanban_db_path=None, warnings=None):
+def compute_privacy_summary(kanban_db_path: Any = None, warnings: Any = None) -> Any:
     """Census the privacy: tags of active tasks in kanban.db (OBJ-18 S1).
 
     Scans the body of every non-terminal task (ready / running / blocked
@@ -1630,7 +1630,7 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
 # lives in approved_objectives.budget_check (§6), which the tick applies.
 # ---------------------------------------------------------------------------
 
-def compute_objectives_snapshot(kanban_db_path=None, warnings=None):
+def compute_objectives_snapshot(kanban_db_path: Any = None, warnings: Any = None) -> Any:
     """Read-only snapshot of active approved_objectives rows.
 
     Returns a list of dicts (id, name, status, budget_daily, spent_today,
@@ -1674,7 +1674,7 @@ def compute_objectives_snapshot(kanban_db_path=None, warnings=None):
     return out
 
 
-def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
+def compute_zombie_check(kanban_db_path: Any = None, warnings: Any = None, now: Any = None) -> Any:
     """Deterministic G3 zombie guard (OBJ-21, t_e793b2b9, Sep 2026).
 
     Scans kanban.db for tasks with status ``running`` whose live age
@@ -1768,7 +1768,7 @@ def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
     return result
 
 
-def parse_privacy_level():
+def parse_privacy_level() -> Any:
     """Determine the privacy level for this gate run.
 
     Resolution order:
@@ -1800,8 +1800,7 @@ def parse_privacy_level():
     return None
 
 
-def select_provider(providers_list, privacy_level=None, parked=None,
-                    nanogpt_budget=None):
+def select_provider(providers_list: Any, privacy_level: Any = None, parked: Any = None, nanogpt_budget: Any = None) -> Any:
     """Pick the provider with the most available quota.
 
     *parked* (t_7da69d59): set of profile names marked ``parked: true`` in
@@ -1885,7 +1884,7 @@ def select_provider(providers_list, privacy_level=None, parked=None,
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> Any:
     providers_list = []
     warnings = []
 

@@ -1,4 +1,5 @@
 #!/usr/bin/python3.12
+from typing import Any
 """tick-observation.py — OBJ-26a follow-up (t_92d7f0d6).
 
 El tick de cron (quota-governor-tick.sh) decide pero nunca persiste una fila
