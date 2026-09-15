@@ -71,18 +71,22 @@ def _get_hermes_home() -> Path:
 
 
 def get_state_dir() -> Path:
+    """Return the quota-governor state directory under HERMES_HOME."""
     return _get_hermes_home() / "quota-governor"
 
 
 def get_state_file() -> Path:
+    """Return the path to the observations JSONL state file."""
     return get_state_dir() / "observations.jsonl"
 
 
 def get_stop_signal_file() -> Path:
+    """Return the path to the STOP signal file read by the cron layer."""
     return get_state_dir() / "STOP"
 
 
 def get_daemon_pidfile() -> Path:
+    """Return the path to the governor daemon PID file."""
     return _get_hermes_home() / "quota-governor-daemon.pid"
 
 
@@ -216,6 +220,7 @@ def clear_stop_signals() -> str:
 
 
 def has_stop_signal() -> bool:
+    """Return True if a STOP signal file is present."""
     return get_stop_signal_file().exists()
 
 

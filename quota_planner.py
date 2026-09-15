@@ -49,6 +49,7 @@ class GovernorDecision:
 
     @property
     def should_spawn(self) -> bool:
+        """Whether the dispatcher may spawn workers under this decision."""
         return self.action not in ("stop",) and self.max_workers > 0
 
     # Compatibility alias: sibling task t_58e412e0 uses `spending_limit` as the
@@ -57,6 +58,7 @@ class GovernorDecision:
     # the naming is unified.
     @property
     def spending_limit(self) -> float:
+        """Alias of ``spend_limit`` for callers using the other convention."""
         return self.spend_limit
 
 
