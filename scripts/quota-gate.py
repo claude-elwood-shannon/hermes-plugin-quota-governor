@@ -521,6 +521,24 @@ def forecast_context(forecast):
         reset_h = None
 
     providers = forecast.get("providers") or {}
+    fired, shutdown = _forecast_fired_rules(providers, reset_h)
+    if not fired:
+        return None
+    return {
+        "mode": "suggest" if _SUGGEST and not _ENFORCE else "enforce",
+        "hours_to_reset": reset_h,
+        "rules": fired,
+        "shutdown": shutdown,
+        "note": ("predictor EMA (6h, alpha 0.3) sobre metrics-history — "
+                 "observador; veto real solo con --enforce tras 7d de backtest"),
+    }
+
+
+def _forecast_fired_rules(providers, reset_h):
+    """Evaluate per-provider forecast rules; return (fired, shutdown).
+
+    *shutdown* is True when any provider's ETA_90 < 1h (board must go off).
+    """
     fired = []
     shutdown = False
     for prov, f in providers.items():
@@ -540,16 +558,7 @@ def forecast_context(forecast):
             fired.append(
                 f"{prov}: eta_90={eta90:.2f}h < margen reset "
                 f"({reset_h:.1f}h) → max_workers=1, cap cost")
-    if not fired:
-        return None
-    return {
-        "mode": "suggest" if _SUGGEST and not _ENFORCE else "enforce",
-        "hours_to_reset": reset_h,
-        "rules": fired,
-        "shutdown": shutdown,
-        "note": ("predictor EMA (6h, alpha 0.3) sobre metrics-history — "
-                 "observador; veto real solo con --enforce tras 7d de backtest"),
-    }
+    return fired, shutdown
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +631,23 @@ def validate_recommended_profile(recommended, existing, warnings,
     # availability, not the first one alphabetically. If providers_list
     # is not available (e.g. called from tests without it), fall back to
     # the old alphabetical behavior as a safe default.
+    fallback = _fallback_allowed_profile(
+        providers_list, existing, parked,
+    )
+    if fallback is not None:
+        return fallback
+
+    warnings.append("no allowed profile exists on host; skipping tick")
+    return None
+
+
+def _fallback_allowed_profile(providers_list, existing, parked):
+    """Pick a fallback allowed profile when the recommendation is invalid.
+
+    Returns the highest-availability allowed profile that exists on the
+    host, or the first existing profile alphabetically when no
+    ``providers_list`` is available (mirrors the historical behavior).
+    """
     if providers_list:
         allowed_candidates = [
             p for p in providers_list
@@ -641,8 +667,6 @@ def validate_recommended_profile(recommended, existing, warnings,
         for candidate in sorted(ALLOWED_PROFILES):
             if candidate in existing:
                 return candidate
-
-    warnings.append("no allowed profile exists on host; skipping tick")
     return None
 
 
@@ -810,6 +834,13 @@ def query_opencode_go():
             return cached
         raise
 
+    result = _opencode_go_result(data)
+    _write_cache("opencode_go", result)
+    return result
+
+
+def _opencode_go_result(data):
+    """Normalise the OpenCode Go usage payload into a cacheable result dict."""
     usage = data.get("usage", {})
     rolling = usage.get("rolling", {})
     weekly = usage.get("weekly", {})
@@ -820,7 +851,7 @@ def query_opencode_go():
         val = window.get("percent")
         return float(val) if val is not None else None
 
-    result = {
+    return {
         "rolling_pct": _pct(rolling),
         "weekly_pct": _pct(weekly),
         "monthly_pct": _pct(monthly),
@@ -831,8 +862,6 @@ def query_opencode_go():
         "weekly_resets_at": weekly.get("resetsAt"),
         "monthly_resets_at": monthly.get("resetsAt"),
     }
-    _write_cache("opencode_go", result)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1075,52 +1104,75 @@ def compute_ollama_status():
 def compute_nanogpt_status(budget=None):
     """Build a ProviderStatus dict for NanoGPT.
 
-    OBJ-26: *budget* is the nanogpt_balance context dict (may be None).
-    When present it feeds the availability calculation:
-
-    COVERED-FIRST policy — the availability reflects the routing surface
-    the rest of the gate can use:
-      - subscription quota healthy (weekly remainder >10%): covered models
-        are usable; balance-only models (qwen3.5-4b) drain the prepaid
-        balance so they are NOT part of availability (the plan's models
-        suffice; wasting quota idling is exactly what the user rejected).
-      - subscription nearly exhausted (<=10% left) and balance budget
-        allows: availability is blended — the remaining subscription slice
-        plus the balance budget's spendable headroom (capped at 100).
-      - balance budget exhausted (level "stop"): balance-only headroom
-        contributes nothing.
-
-    The covered/balance model split travels in ``raw`` (model sets for the
-    task creator) and the budget block in ``balance``.
+    OBJ-26 covered-first policy: when the subscription is healthy the
+    covered models carry availability; when nearly exhausted (<=10% left)
+    and the balance budget allows, the balance headroom is blended in;
+    a "stop" budget contributes nothing.
     """
     raw = query_nanogpt()
     state = raw.get("state")
     daily_pct = raw.get("daily_pct")
     weekly_pct = raw.get("weekly_tokens_pct")
 
+    # Skip if account not active
+    if state != "active":
+        return _nanogpt_inactive_status(budget, raw, state)
+
+    covered_models, _cov_err = _covered_models_safe()
+
+    availability, bottleneck_window, bottleneck_pct = _nanogpt_availability(
+        weekly_pct, budget,
+    )
+    availability = max(min(availability, 100.0), 0.0)
+
+    return {
+        "profile": "pr-nanogpt",
+        "provider": "nanogpt",
+        "model": PROFILE_MODELS["pr-nanogpt"],
+        "availability": round(availability, 1),
+        "bottleneck_pct": round(bottleneck_pct, 1),
+        "bottleneck_window": bottleneck_window,
+        "error": "",
+        "raw": {
+            "daily_pct": daily_pct, "weekly_tokens_pct": weekly_pct,
+            "state": state,
+            "covered_first": True,
+            "covered_model_count": (len(covered_models)
+                                    if covered_models is not None else None),
+            "coverage_unknown": covered_models is None,
+        },
+        "balance": budget or None,
+    }
+
+
+def _nanogpt_inactive_status(budget, raw, state):
+    """ProviderStatus for a non-active NanoGPT account (or None budget)."""
+    return {
+        "profile": "pr-nanogpt",
+        "provider": "nanogpt",
+        "model": PROFILE_MODELS["pr-nanogpt"],
+        "availability": 0.0,
+        "bottleneck_pct": 100.0,
+        "bottleneck_window": "state",
+        "error": f"state is '{state}', not 'active'",
+        "raw": raw,
+    }
+
+
+def _nanogpt_availability(weekly_pct, budget):
+    """Compute NanoGPT (availability, bottleneck_window, bottleneck_pct).
+
+    Covered-first policy (OBJ-26): subscription-healthy → covered models
+    carry everything; subscription nearly exhausted → blend in the balance
+    budget's spendable headroom (capped).  Missing usage data → assume
+    fully available.  ``budget`` is the nanogpt_balance context dict.
+    """
     budget = budget or {}
     level = budget.get("level")
     balance_usd = budget.get("usd_balance")
     max_spend = budget.get("window_max_spend_usd")
     spent = budget.get("window_spent_usd")
 
-    # Skip if account not active
-    if state != "active":
-        return {
-            "profile": "pr-nanogpt",
-            "provider": "nanogpt",
-            "model": PROFILE_MODELS["pr-nanogpt"],
-            "availability": 0.0,
-            "bottleneck_pct": 100.0,
-            "bottleneck_window": "state",
-            "error": f"state is '{state}', not 'active'",
-            "raw": raw,
-        }
-
-    covered_models, _cov_err = _covered_models_safe()
-
-    # Covered-first availability (OBJ-26). Budget numbers missing ->
-    # behave covered-first conservative: subscription only.
     weekly_left = (100.0 - weekly_pct) if weekly_pct is not None else None
     budget_open = level in ("ok", "warn")
     if weekly_left is None:
@@ -1146,26 +1198,7 @@ def compute_nanogpt_status(budget=None):
         bottleneck_window = "weekly_tokens+balance"
         bottleneck_pct = max(weekly_pct or 0.0, 100.0 - availability)
 
-    availability = max(min(availability, 100.0), 0.0)
-
-    return {
-        "profile": "pr-nanogpt",
-        "provider": "nanogpt",
-        "model": PROFILE_MODELS["pr-nanogpt"],
-        "availability": round(availability, 1),
-        "bottleneck_pct": round(bottleneck_pct, 1),
-        "bottleneck_window": bottleneck_window,
-        "error": "",
-        "raw": {
-            "daily_pct": daily_pct, "weekly_tokens_pct": weekly_pct,
-            "state": state,
-            "covered_first": True,
-            "covered_model_count": (len(covered_models)
-                                    if covered_models is not None else None),
-            "coverage_unknown": covered_models is None,
-        },
-        "balance": budget or None,
-    }
+    return availability, bottleneck_window, bottleneck_pct
 
 
 def compute_openrouter_status():
@@ -1176,27 +1209,53 @@ def compute_openrouter_status():
     weekly_usd = raw.get("usage_weekly_usd")
     expires_at = raw.get("expires_at")
 
-    # Check key expiry
-    if expires_at:
-        from datetime import datetime, timezone
-        try:
-            expiry = datetime.fromisoformat(
-                expires_at.replace("Z", "+00:00")
-            )
-            if datetime.now(timezone.utc) > expiry:
-                return {
-                    "profile": "pr-openrouter",
-                    "provider": "openrouter",
-                    "model": PROFILE_MODELS["pr-openrouter"],
-                    "availability": 0.0,
-                    "bottleneck_pct": 100.0,
-                    "bottleneck_window": "key_expired",
-                    "error": f"key expired {expires_at[:10]}",
-                    "raw": raw,
-                }
-        except (ValueError, TypeError):
-            pass  # Can't parse expiry — continue with usage-based check
+    expired = _openrouter_expired_status(expires_at, raw)
+    if expired is not None:
+        return expired
 
+    bottleneck_pct, bottleneck_window = _openrouter_bottleneck(
+        limit, usage, weekly_usd,
+    )
+    availability = max(100.0 - bottleneck_pct, 0.0)
+
+    return {
+        "profile": "pr-openrouter",
+        "provider": "openrouter",
+        "model": PROFILE_MODELS["pr-openrouter"],
+        "availability": round(availability, 1),
+        "bottleneck_pct": round(bottleneck_pct, 1),
+        "bottleneck_window": bottleneck_window,
+        "error": "",
+        "raw": {"usage_weekly_usd": weekly_usd, "limit": limit,
+                "usage": usage, "expires_at": expires_at},
+    }
+
+
+def _openrouter_expired_status(expires_at, raw):
+    """Return an expired-key ProviderStatus, or None if still valid/unparseable."""
+    if not expires_at:
+        return None
+    from datetime import datetime, timezone
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expiry:
+            return {
+                "profile": "pr-openrouter",
+                "provider": "openrouter",
+                "model": PROFILE_MODELS["pr-openrouter"],
+                "availability": 0.0,
+                "bottleneck_pct": 100.0,
+                "bottleneck_window": "key_expired",
+                "error": f"key expired {expires_at[:10]}",
+                "raw": raw,
+            }
+    except (ValueError, TypeError):
+        pass  # Can't parse expiry — continue with usage-based check
+    return None
+
+
+def _openrouter_bottleneck(limit, usage, weekly_usd):
+    """Map OpenRouter usage to (bottleneck_pct, bottleneck_window)."""
     if limit is not None and limit > 0:
         # Spending limit set: usage/limit * 100
         if usage is not None:
@@ -1211,20 +1270,7 @@ def compute_openrouter_status():
         else:
             bottleneck_pct = 0.0
         bottleneck_window = "weekly_usd"
-
-    availability = max(100.0 - bottleneck_pct, 0.0)
-
-    return {
-        "profile": "pr-openrouter",
-        "provider": "openrouter",
-        "model": PROFILE_MODELS["pr-openrouter"],
-        "availability": round(availability, 1),
-        "bottleneck_pct": round(bottleneck_pct, 1),
-        "bottleneck_window": bottleneck_window,
-        "error": "",
-        "raw": {"usage_weekly_usd": weekly_usd, "limit": limit,
-                "usage": usage, "expires_at": expires_at},
-    }
+    return bottleneck_pct, bottleneck_window
 
 
 def compute_opencode_go_status():
@@ -1246,15 +1292,7 @@ def compute_opencode_go_status():
         ("monthly", monthly_pct, raw.get("monthly_status")),
     ]
 
-    # A non-ok status on any window means that window is exhausted
-    # (rate-limited / over quota) — treat as 100%.
-    pcts = []
-    for name, pct, status in windows:
-        if status is not None and status != "ok":
-            pcts.append((name, 100.0))
-        elif pct is not None:
-            pcts.append((name, float(pct)))
-
+    pcts = _opencode_window_pcts(windows)
     if not pcts:
         # No usage data — assume fully available
         return {
@@ -1270,13 +1308,24 @@ def compute_opencode_go_status():
 
     bottleneck_window, bottleneck_pct = max(pcts, key=lambda x: x[1])
     availability = max(100.0 - bottleneck_pct, 0.0)
+    burning_balance, state = _opencode_balance_state(windows)
 
-    # Balance-fallback detection (calibrated live Sep 7 2026, t_47640f18):
-    # when a window is exhausted (status "rate-limited") but the API keeps
-    # serving requests, OpenCode Go is burning prepaid Zen balance — money,
-    # not subscription quota.  Availability stays 0 (correct: don't route
-    # more work here), but the context must say WHY so nobody mistakes
-    # "burning paid balance" for a hard block.
+    return _opencode_go_status_result(
+        raw, availability, bottleneck_pct, bottleneck_window,
+        burning_balance, state,
+    )
+
+
+def _opencode_balance_state(windows):
+    """Classify OpenCode Go balance-fallback state from the windows.
+
+    Returns (burning_balance, state).  Balance-fallback detection
+    (calibrated live Sep 7 2026, t_47640f18): when a window is exhausted
+    (status "rate-limited") but the API keeps serving requests, OpenCode
+    Go is burning prepaid Zen balance — money, not subscription quota.
+    Availability stays 0 (don't route more work here) but the context
+    must say WHY so nobody mistakes money-burn for a hard block.
+    """
     burning_balance = any(
         status is not None and status != "ok" for _, _, status in windows
     )
@@ -1284,7 +1333,23 @@ def compute_opencode_go_status():
     # (no fallback / balance exhausted). With balance-fallback the requests
     # keep succeeding past 100% — that is NOT a hard stop, it is spend.
     state = "burning-balance" if burning_balance else "ok"
+    return burning_balance, state
 
+
+def _opencode_go_status_result(raw, availability, bottleneck_pct,
+                               bottleneck_window, burning_balance, state):
+    """Build the OpenCode Go ProviderStatus dict from computed parts."""
+    raw_pct = {
+        "rolling_pct": raw.get("rolling_pct"),
+        "weekly_pct": raw.get("weekly_pct"),
+        "monthly_pct": raw.get("monthly_pct"),
+        "rolling_status": raw.get("rolling_status"),
+        "weekly_status": raw.get("weekly_status"),
+        "monthly_status": raw.get("monthly_status"),
+        "rolling_resets_at": raw.get("rolling_resets_at"),
+        "weekly_resets_at": raw.get("weekly_resets_at"),
+        "monthly_resets_at": raw.get("monthly_resets_at"),
+    }
     return {
         "profile": "pr-opencode",
         "provider": "opencode-go",
@@ -1294,24 +1359,28 @@ def compute_opencode_go_status():
         "bottleneck_window": bottleneck_window,
         "burning_balance": burning_balance,
         "state": state,
-        # Soft cap placeholder (t_47640f18): a configurable ceiling for the
-        # monthly Zen credits acceptable on autonomous tasks. The exact USD
-        # value is PENDING USER DECISION — leave unset (None) until the user
-        # names an amount. Read from OPENCODE_GO_ZEN_MONTHLY_SOFT_CAP USD.
+        # Soft cap placeholder (t_47640f18): configurable ceiling for monthly
+        # Zen credits on autonomous tasks — unset (None) until the user names
+        # an amount. Read from OPENCODE_GO_ZEN_MONTHLY_SOFT_CAP USD.
         "zen_monthly_soft_cap_usd": _config_zen_monthly_soft_cap(),
         "error": "",
-        "raw": {
-            "rolling_pct": rolling_pct,
-            "weekly_pct": weekly_pct,
-            "monthly_pct": monthly_pct,
-            "rolling_status": raw.get("rolling_status"),
-            "weekly_status": raw.get("weekly_status"),
-            "monthly_status": raw.get("monthly_status"),
-            "rolling_resets_at": raw.get("rolling_resets_at"),
-            "weekly_resets_at": raw.get("weekly_resets_at"),
-            "monthly_resets_at": raw.get("monthly_resets_at"),
-        },
+        "raw": raw_pct,
     }
+
+
+def _opencode_window_pcts(windows):
+    """Map (name, pct, status) tuples to usable (name, bottleneck) pairs.
+
+    A window whose ``status`` is not "ok" (e.g. rate-limited) is treated
+    as fully used.  Windows with no percent data are skipped.
+    """
+    pcts = []
+    for name, pct, status in windows:
+        if status is not None and status != "ok":
+            pcts.append((name, 100.0))
+        elif pct is not None:
+            pcts.append((name, float(pct)))
+    return pcts
 
 
 # ---------------------------------------------------------------------------
@@ -1528,30 +1597,18 @@ def _parse_privacy_tag_raw(text):
 def compute_privacy_summary(kanban_db_path=None, warnings=None):
     """Census the privacy: tags of active tasks in kanban.db (OBJ-18 S1).
 
-    Scans the body of every non-terminal task (ready / running / blocked
-    / todo / triage) for a ``privacy:<level>`` tag and counts them into
-    the OBJ-18 alias buckets::
-
-        {"high": N, "medium": N, "low": N, "none": N}
-
-    * Tasks with no ``privacy:`` tag count as ``none``.
-    * Tasks with a recognised tag (high/medium/low or their canonical /
-      alias equivalents) count in the corresponding bucket.
-    * Tasks with a malformed tag (e.g. ``privacy:xyz``) count as
-      ``none`` AND emit a warning via the *warnings* list, so the gate
-      snapshot surfaces the bad tag without breaking.
-
-    This is a READ-ONLY census: it does NOT change the recommendation
-    logic, the privacy_level field, or provider routing.  Routing by
-    privacy is S2 (separate task, after user approval of the matrix).
+    Counts every non-terminal task's ``privacy:<level>`` tag into the
+    OBJ-18 alias buckets {"high", "medium", "low", "none"}.  Tasks with no
+    tag count as none; malformed tags count as none AND emit a warning.
+    Read-only census — it never affects recommendation or routing.
 
     Args:
-        kanban_db_path: Path to kanban.db.  Defaults to
-            ``$HERMES_KANBAN_DB`` env var, then ``~/.hermes/kanban.db``.
+        kanban_db_path: Defaults to ``$HERMES_KANBAN_DB``, then
+            ``~/.hermes/kanban.db``.
         warnings: Optional list to append warning strings to.
 
     Returns:
-        dict with keys "high", "medium", "low", "none" (all ints >= 0).
+        dict {"high", "medium", "low", "none"} (all ints >= 0).
     """
     summary = {"high": 0, "medium": 0, "low": 0, "none": 0}
     if warnings is None:
@@ -1584,6 +1641,17 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
         warnings.append(f"privacy_summary: kanban.db read failed: {exc}")
         return summary
 
+    _tally_privacy_rows(rows, summary, warnings)
+
+    return summary
+
+
+def _tally_privacy_rows(rows, summary, warnings):
+    """Increment *summary* buckets from the tasks' privacy tags.
+
+    Emits warnings to *warnings* for empty/malformed tags.  *rows* are
+    sqlite3.Row objects with ``id`` and ``body`` columns.
+    """
     for row in rows:
         task_id = row["id"]
         body = row["body"] or ""
@@ -1609,8 +1677,6 @@ def compute_privacy_summary(kanban_db_path=None, warnings=None):
                     f"privacy_summary: task {task_id} has unrecognised "
                     f"privacy:{raw} tag (ignored, counted as none)"
                 )
-
-    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1677,26 +1743,21 @@ def compute_objectives_snapshot(kanban_db_path=None, warnings=None):
 def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
     """Deterministic G3 zombie guard (OBJ-21, t_e793b2b9, Sep 2026).
 
-    Scans kanban.db for tasks with status ``running`` whose live age
-    exceeds ZOMBIE_RUNNING_MINUTES (45 min — the G3 threshold), so the
-    creator-silence decision no longer depends on the LLM reading the
-    board correctly.  Age is measured ONLY from live running rows,
-    preferring ``last_heartbeat_at`` (worker liveness) over
-    ``started_at`` — measuring from the started_at of a completed task
-    is what produced the false "87 min zombie" report behind OBJ-21.
+    Scans kanban.db ``running`` tasks whose live age exceeds
+    ZOMBIE_RUNNING_MINUTES, so creator-silence no longer depends on the
+    LLM reading the board.  Age is from ``last_heartbeat_at`` when
+    present, else ``started_at`` (measuring only from started_at caused
+    the false "87 min zombie" report behind OBJ-21).
 
     Args:
-        kanban_db_path: Path to kanban.db.  Defaults to
-            ``$HERMES_KANBAN_DB`` env var, then ``~/.hermes/kanban.db``.
+        kanban_db_path: Defaults to ``$HERMES_KANBAN_DB``, then
+            ``~/.hermes/kanban.db``.
         warnings: Optional list to append warning strings to.
         now: Frozen epoch seconds (tests); defaults to time.time().
 
     Returns:
-        dict: {"has_zombie": bool, "count": int, "threshold_minutes": 45.0,
-               "tasks": [ {id, title, assignee, age_minutes,
-                           age_source, minutes_over_threshold}, ... ]}
-        Tasks sorted by age descending, capped at the 5 oldest (the
-        decision signal and the worst offenders, not a full census).
+        {"has_zombie", "count", "threshold_minutes", "tasks"} capping
+        the 5 oldest offenders.
     """
     if warnings is None:
         warnings = []
@@ -1709,6 +1770,31 @@ def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
     if now is None:
         now = time.time()
 
+    rows, read_error = _read_running_tasks(kanban_db_path)
+    if read_error is not None:
+        # DB error — fail open (no zombie declared) + warning.
+        warnings.append(f"zombie_check: kanban.db read failed: {read_error}")
+        return result
+    if rows is None:
+        # No kanban.db — nothing to guard.  Not an error, fail open.
+        return result
+
+    zombies = _zombie_rows(rows, now)
+    zombies.sort(key=lambda t: t["age_minutes"], reverse=True)
+    result["count"] = len(zombies)
+    result["has_zombie"] = bool(zombies)
+    # Signal + worst offenders only; a full census is not needed to
+    # silence the creator (and keeps the snapshot small).
+    result["tasks"] = zombies[:5]
+    return result
+
+
+def _read_running_tasks(kanban_db_path):
+    """Return (rows, error) for all ``running`` tasks in kanban.db.
+
+    Resolves the path (same order as compute_privacy_summary).  No
+    kanban.db → (None, None) (fail open).  DB error → (None, message).
+    """
     # Resolve the kanban.db path (same order as compute_privacy_summary)
     if kanban_db_path is None:
         kanban_db_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
@@ -1717,7 +1803,7 @@ def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
 
     if not os.path.isfile(kanban_db_path):
         # No kanban.db — nothing to guard.  Not an error, fail open.
-        return result
+        return None, None
 
     try:
         import sqlite3
@@ -1728,11 +1814,17 @@ def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
             "FROM tasks WHERE status = 'running'"
         ).fetchall()
         conn.close()
+        return rows, None
     except Exception as exc:
-        # DB error — fail open (no zombie declared) + warning.
-        warnings.append(f"zombie_check: kanban.db read failed: {exc}")
-        return result
+        return None, str(exc)
 
+
+def _zombie_rows(rows, now):
+    """Return zombie dicts for running *rows* older than the threshold.
+
+    Age is measured from ``last_heartbeat_at`` (worker liveness) when
+    present, else ``started_at``, else treated as an undated zombie.
+    """
     zombies = []
     for row in rows:
         hb = row["last_heartbeat_at"]
@@ -1758,14 +1850,7 @@ def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
                     age_minutes - ZOMBIE_RUNNING_MINUTES, 1
                 ),
             })
-
-    zombies.sort(key=lambda t: t["age_minutes"], reverse=True)
-    result["count"] = len(zombies)
-    result["has_zombie"] = bool(zombies)
-    # Signal + worst offenders only; a full census is not needed to
-    # silence the creator (and keeps the snapshot small).
-    result["tasks"] = zombies[:5]
-    return result
+    return zombies
 
 
 def parse_privacy_level():
@@ -1804,33 +1889,50 @@ def select_provider(providers_list, privacy_level=None, parked=None,
                     nanogpt_budget=None):
     """Pick the provider with the most available quota.
 
-    *parked* (t_7da69d59): set of profile names marked ``parked: true`` in
-    providers.json.  Parked profiles are removed from the candidate set
-    here — BEFORE any recommendation is computed — so a parked profile can
-    never become recommended_profile and trigger the G1 warn-and-fallback
-    warning on every tick.  None → no parked filtering (tests / callers
-    without config).
-
-    If *privacy_level* is given (public|sensitive|confidential), providers
-    are first filtered to those capable of handling that privacy level
-    before the normal availability scoring is applied.
-
-    *nanogpt_budget* (OBJ-26): the context["nanogpt_balance"] dict when
-    available.  When its level is "stop", pr-nanogpt drops out of the
-    candidate set entirely (budget exhausted; NanoGPT re-enters next
-    window).  Subscription-covered routing inside pr-nanogpt is handled in
-    compute_nanogpt_status, not here.
-
-    Routing mode:
-      * **preference-first** (OBJ-26, all levels): providers are sorted by
-        the applicable preference map first, availability as tie-breaker.
-        sensitive/confidential use PRIVACY_PROVIDER_PREFERENCE (NanoGPT
-        first for sensitive, from OBJ-18); public/no-privacy now uses
-        GENERAL_PROVIDER_PREFERENCE (NanoGPT first — user preference,
-        balance-sustained) instead of the old availability-first order.
+    *parked* (t_7da69d59): profiles marked ``parked: true`` are removed
+    from the candidate set before recommendation.  *privacy_level*
+    (public|sensitive|confidential) filters providers by capability.
+    *nanogpt_budget* (OBJ-26): when its level is "stop", pr-nanogpt
+    drops out entirely.  Routing is preference-first (OBJ-26), with
+    availability as tie-breaker.
 
     Returns the best ProviderStatus dict, or None if all exhausted
     (or if no provider satisfies the privacy constraint).
+    """
+    candidates = _select_candidates(
+        providers_list, privacy_level, parked, nanogpt_budget,
+    )
+    if not candidates:
+        return None
+
+    # Routing mode: preference-first ALWAYS (OBJ-26). The map depends on
+    # the privacy level; sensitive keeps NanoGPT-first from OBJ-18 too.
+    pref_map = _preference_map(privacy_level)
+    candidates.sort(
+        key=lambda p: (
+            pref_map.get(p["profile"], 99),
+            -p["availability"],
+        )
+    )
+
+    top = candidates[0]
+
+    # If top provider is in paying mode (availability=5, bottleneck>=100),
+    # check if a free provider exists with availability > 5
+    if top["bottleneck_pct"] >= 100 and top["availability"] <= 5:
+        free = [c for c in candidates if c["bottleneck_pct"] < 100]
+        if free:
+            return free[0]
+
+    return top
+
+
+def _select_candidates(providers_list, privacy_level, parked, nanogpt_budget):
+    """Filter *providers_list* to the candidates eligible for selection.
+
+    Excludes errored/exhausted/parked providers, providers incapable of
+    the active *privacy_level*, and pr-nanogpt when its balance budget
+    is in "stop".
     """
     candidates = []
     for p in providers_list:
@@ -1852,144 +1954,90 @@ def select_provider(providers_list, privacy_level=None, parked=None,
                 and nanogpt_budget.get("level") == "stop"):
             continue
         candidates.append(p)
+    return candidates
 
-    if not candidates:
-        return None
 
-    # Routing mode: preference-first ALWAYS (OBJ-26). The map depends on
-    # the privacy level; sensitive keeps NanoGPT-first from OBJ-18 too.
+def _preference_map(privacy_level):
+    """Return the provider-preference map active for *privacy_level*."""
     if privacy_level in _PREFERENCE_FIRST_LEVELS:
-        pref_map = PRIVACY_PROVIDER_PREFERENCE[privacy_level]
-    else:
-        pref_map = GENERAL_PROVIDER_PREFERENCE
-    candidates.sort(
-        key=lambda p: (
-            pref_map.get(p["profile"], 99),
-            -p["availability"],
-        )
-    )
-
-    top = candidates[0]
-
-    # If top provider is in paying mode (availability=5, bottleneck>=100),
-    # check if a free provider exists with availability > 5
-    if top["bottleneck_pct"] >= 100 and top["availability"] <= 5:
-        free = [c for c in candidates if c["bottleneck_pct"] < 100]
-        if free:
-            return free[0]
-
-    return top
+        return PRIVACY_PROVIDER_PREFERENCE[privacy_level]
+    return GENERAL_PROVIDER_PREFERENCE
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _error_status(profile, provider, error):
+    """ProviderStatus dict for a provider whose query raised an exception."""
+    return {
+        "profile": profile,
+        "provider": provider,
+        "model": PROFILE_MODELS[profile],
+        "availability": 0.0,
+        "bottleneck_pct": 100.0,
+        "bottleneck_window": "error",
+        "error": error,
+        "raw": {},
+    }
 
-def main():
+
+def _query_all_providers(warnings):
+    """Query every configured provider; returns (providers_list, ng_budget).
+
+    Each provider that raises is recorded as an errored ProviderStatus and
+    the message is appended to *warnings*.  ``ng_budget`` is the NanoGPT
+    balance-budget context dict, or None when NanoGPT is not configured.
+    """
     providers_list = []
-    warnings = []
+    ng_budget = None
 
-    # --- Parse privacy level (Phase 2) ---
-    privacy_level = parse_privacy_level()
-
-    # --- Query each provider ---
-    # Ollama
+    # --- Ollama ---
     try:
         providers_list.append(compute_ollama_status())
     except Exception as exc:
-        providers_list.append({
-            "profile": "pr-ollama",
-            "provider": "ollama-cloud",
-            "model": PROFILE_MODELS["pr-ollama"],
-            "availability": 0.0,
-            "bottleneck_pct": 100.0,
-            "bottleneck_window": "error",
-            "error": str(exc),
-            "raw": {},
-        })
+        providers_list.append(_error_status("pr-ollama", "ollama-cloud", str(exc)))
         warnings.append(f"ollama: {exc}")
 
-    # --- NanoGPT ---
+    # --- NanoGPT (OBJ-26 balance budget; never fatal) ---
     nanogpt_key = get_env("NANO_GPT_API_KEY")
     if nanogpt_key:
-        # OBJ-26: balance budget block (exact /api/check-balance probe,
-        # weekly budget state, covered-model list). Never fatal.
         ng_budget, ng_budget_warnings = nanogpt_budget_context()
         warnings.extend(ng_budget_warnings)
         try:
             providers_list.append(compute_nanogpt_status(budget=ng_budget))
         except Exception as exc:
-            providers_list.append({
-                "profile": "pr-nanogpt",
-                "provider": "nanogpt",
-                "model": PROFILE_MODELS["pr-nanogpt"],
-                "availability": 0.0,
-                "bottleneck_pct": 100.0,
-                "bottleneck_window": "error",
-                "error": str(exc),
-                "raw": {},
-            })
+            providers_list.append(_error_status("pr-nanogpt", "nanogpt", str(exc)))
             warnings.append(f"nanogpt: {exc}")
-    else:
-        ng_budget = None
     # else: not configured — skip silently
 
-    # OpenRouter
+    # --- OpenRouter ---
     openrouter_key = get_env("OPENROUTER_API_KEY")
     if openrouter_key:
         try:
             providers_list.append(compute_openrouter_status())
         except Exception as exc:
-            providers_list.append({
-                "profile": "pr-openrouter",
-                "provider": "openrouter",
-                "model": PROFILE_MODELS["pr-openrouter"],
-                "availability": 0.0,
-                "bottleneck_pct": 100.0,
-                "bottleneck_window": "error",
-                "error": str(exc),
-                "raw": {},
-            })
+            providers_list.append(_error_status("pr-openrouter", "openrouter", str(exc)))
             warnings.append(f"openrouter: {exc}")
-    # else: not configured — skip silently
 
-    # OpenCode Go (MULTI-PROV-06)
+    # --- OpenCode Go (MULTI-PROV-06) ---
     opencode_go_key = get_env("OPENCODE_GO_API_KEY")
     if opencode_go_key:
         try:
             providers_list.append(compute_opencode_go_status())
         except Exception as exc:
-            providers_list.append({
-                "profile": "pr-opencode",
-                "provider": "opencode-go",
-                "model": PROFILE_MODELS["pr-opencode"],
-                "availability": 0.0,
-                "bottleneck_pct": 100.0,
-                "bottleneck_window": "error",
-                "error": str(exc),
-                "raw": {},
-            })
+            providers_list.append(_error_status("pr-opencode", "opencode-go", str(exc)))
             warnings.append(f"opencode_go: {exc}")
-    # else: not configured — skip silently
 
-    # --- Parked profiles (t_7da69d59) ---
-    # Providers config may park profiles temporarily (e.g. pr-openrouter).
-    # Parked profiles stay in the providers array for observability but are
-    # excluded from selection BEFORE recommended_profile is computed, so
-    # guardrail G1 does not warn-and-fall-back every tick.
+    return providers_list, ng_budget
+
+
+def _set_parked_flags(providers_list):
+    """Mark parked profiles in place and return the parked profile set."""
     parked = get_parked_profiles()
     for p in providers_list:
         p["parked"] = p["profile"] in parked
+    return parked
 
-    # --- Select recommended provider (with privacy filtering + OBJ-26
-    #     balance-budget stop) ---
-    recommended = select_provider(providers_list, privacy_level=privacy_level,
-                                  parked=parked, nanogpt_budget=ng_budget)
 
-    # --- Per-model cost ledger (MULTI-PROV-09, t_5bdd7cfa) ---
-    # Opportunistic sync + per-window shares/warnings.  Reuse the gate's
-    # own live rolling_resets_at (from the query above) so no second API
-    # call is needed for window anchoring.  Never fatal.
+def _model_cost_ledger(providers_list, warnings):
+    """Per-model cost ledger (MULTI-PROV-09); never fatal. Returns dict."""
     _ocg_reset = None
     for p in providers_list:
         if p.get("provider") == "opencode-go":
@@ -1997,139 +2045,118 @@ def main():
     model_cost, model_cost_warnings = model_cost_context(_ocg_reset)
     for w in model_cost_warnings:
         warnings.append(w)
+    return model_cost
 
-    # If privacy filtering eliminated all candidates, warn
-    if recommended is None and privacy_level:
-        capable_providers = PRIVACY_CAPABILITIES.get(privacy_level, set())
-        available_names = [p["provider"] for p in providers_list if not p["error"]]
-        warnings.append(
-            f"privacy:{privacy_level} excludes all available providers "
-            f"(available: {available_names}, capable: {sorted(capable_providers)})"
-        )
 
-    # --- Guardrail G1: validate the recommended profile against the host ---
-    existing_profiles = get_existing_profiles()
-    valid_profiles = sorted(existing_profiles & ALLOWED_PROFILES)
+def _warn_privacy_empty(privacy_level, providers_list, warnings):
+    """Append a warning when privacy filtering eliminated all candidates."""
+    capable_providers = PRIVACY_CAPABILITIES.get(privacy_level, set())
+    available_names = [p["provider"] for p in providers_list if not p["error"]]
+    warnings.append(
+        f"privacy:{privacy_level} excludes all available providers "
+        f"(available: {available_names}, capable: {sorted(capable_providers)})"
+    )
 
-    # --- Deterministic zombie guard (OBJ-21) ---
-    # G3 of the creator prompt (any running task > 45 min → [SILENT])
-    # enforced HERE, deterministically: if a zombie exists the gate forces
-    # wakeAgent:false regardless of the recommendation.  Computed once,
-    # before both output branches, so the context always carries it.
-    zombie_check = compute_zombie_check(warnings=warnings)
-    if zombie_check["has_zombie"]:
-        worst = zombie_check["tasks"][0]
-        warnings.append(
-            f"zombie_guard: {zombie_check['count']} task(s) running >"
-            f"{int(ZOMBIE_RUNNING_MINUTES)} min "
-            f"(oldest {worst['id']} {worst['age_minutes']}min via "
-            f"{worst['age_source']}) — creator silenced (G3 deterministic)"
-        )
 
-    # --- OBJETIVOS APROBADOS snapshot (MEDIATOR t_4fa0a4b5) ---
-    # Active approved_objectives rows, computed once and wired into BOTH
-    # output branches (wakeAgent true/false) so the context always carries
-    # the creator's task source.  Observer only — dispatch-side budget
-    # enforcement lives in approved_objectives.budget_check (§6).
-    objectives_snapshot = compute_objectives_snapshot(warnings=warnings)
-
-    if recommended is not None:
-        recommended_profile = validate_recommended_profile(
-            recommended["profile"], existing_profiles, warnings,
-            providers_list=providers_list,
-            parked=parked,
-        )
-        if recommended_profile is None:
-            # No allowed profile exists on host — do not create any task.
-            recommended = None
-        else:
-            # BUG 2 FIX: Don't mutate the original dict in providers_list.
-            # Make a shallow copy so the providers array in the output
-            # retains the original profile names for each provider.
-            recommended = dict(recommended)
-            recommended["profile"] = recommended_profile
-            # Keep the model consistent with the (possibly changed) profile.
-            recommended["model"] = PROFILE_MODELS.get(
-                recommended_profile, recommended["model"]
-            )
-
-    # --- Predictor EMA (OBJ-24 F2) — modo --suggest: observador ---
-    # Solo se activa con --suggest (wrapper forecast-gate.sh); el gate del
-    # cron (sin flags) sigue produciendo el mismo JSON que antes — cero
-    # regresión. forecast.json ausente/corrupto -> None (silencio).
-    forecast_warning = forecast_context(load_forecast()) if _SUGGEST else None
-
-    if recommended is None or zombie_check["has_zombie"]:
-        # All providers exhausted/errored, no allowed profile exists,
-        # privacy filtering eliminated all candidates — OR the
-        # deterministic zombie guard fired (OBJ-21: G3 enforced here).
-        privacy_summary = compute_privacy_summary(warnings=warnings)
-        if recommended is not None:
-            # Zombie guard overrode a live recommendation: keep the
-            # recommendation fields visible in the context so the SILENT
-            # rationale is auditable, but never wake the agent.
-            rec_profile = recommended["profile"]
-            rec_model = recommended["model"]
-            rec_cost = bottleneck_to_max_cost(recommended["bottleneck_pct"])
-            rec_workers = bottleneck_to_max_workers(recommended["bottleneck_pct"])
-        else:
-            rec_profile = None
-            rec_model = None
-            rec_cost = None
-            rec_workers = 0
-        output = {
-            "wakeAgent": False,
-            "context": {
-                "providers": providers_list,
-                "recommended_profile": rec_profile,
-                "recommended_model": rec_model,
-                "max_task_cost": rec_cost,
-                "max_workers": rec_workers,
-                "privacy_level": privacy_level or "none",
-                "privacy_summary": privacy_summary,
-                "zombie_check": zombie_check,
-                "objectives": objectives_snapshot,
-                "valid_profiles": valid_profiles,
-                "warning": "; ".join(warnings) if warnings else "all providers exhausted",
-                "burn_warnings": load_burn_warnings(),
-            },
-        }
-        if model_cost:
-            output["context"]["model_cost"] = model_cost
-        if ng_budget:
-            output["context"]["nanogpt_balance"] = ng_budget
-        if forecast_warning:
-            output["context"]["forecast_warning"] = forecast_warning
-        print(json.dumps(output))
+def _warn_zombie(zombie_check, warnings):
+    """Append the deterministic G3 zombie_guard warning when a zombie exists."""
+    if not zombie_check["has_zombie"]:
         return
+    worst = zombie_check["tasks"][0]
+    warnings.append(
+        f"zombie_guard: {zombie_check['count']} task(s) running >"
+        f"{int(ZOMBIE_RUNNING_MINUTES)} min "
+        f"(oldest {worst['id']} {worst['age_minutes']}min via "
+        f"{worst['age_source']}) — creator silenced (G3 deterministic)"
+    )
 
-    # --- Build output ---
-    bottleneck = recommended["bottleneck_pct"]
-    max_cost = bottleneck_to_max_cost(bottleneck)
-    max_workers = bottleneck_to_max_workers(bottleneck)
 
-    # Privacy summary (OBJ-18 S1) — computed BEFORE the warning string is
-    # frozen so any malformed-tag warnings it emits are surfaced in the
-    # output ``warning`` field.  Read-only census; does NOT affect routing.
+def _validate_recommended(recommended, existing_profiles, providers_list,
+                          parked, warnings):
+    """Validate the recommendation against the host; return it or None.
+
+    Guardrail G1 checks the recommended profile exists and is allowed.  A
+    copy is returned so the providers array keeps its original profile
+    names (BUG 2 FIX).  None if no allowed profile exists on the host.
+    """
+    recommended_profile = validate_recommended_profile(
+        recommended["profile"], existing_profiles, warnings,
+        providers_list=providers_list,
+        parked=parked,
+    )
+    if recommended_profile is None:
+        # No allowed profile exists on host — do not create any task.
+        return None
+    recommended = dict(recommended)
+    recommended["profile"] = recommended_profile
+    # Keep the model consistent with the (possibly changed) profile.
+    recommended["model"] = PROFILE_MODELS.get(
+        recommended_profile, recommended["model"]
+    )
+    return recommended
+
+
+def _emit_no_agent(providers_list, warnings, privacy_level, zombie_check,
+                   objectives_snapshot, valid_profiles, model_cost,
+                   ng_budget, forecast_warning, recommended):
+    """Print the wakeAgent:false snapshot and return."""
     privacy_summary = compute_privacy_summary(warnings=warnings)
+    if recommended is not None:
+        # Zombie guard overrode a live recommendation: keep the
+        # recommendation fields visible in the context so the SILENT
+        # rationale is auditable, but never wake the agent.
+        rec_profile = recommended["profile"]
+        rec_model = recommended["model"]
+        rec_cost = bottleneck_to_max_cost(recommended["bottleneck_pct"])
+        rec_workers = bottleneck_to_max_workers(recommended["bottleneck_pct"])
+    else:
+        rec_profile = None
+        rec_model = None
+        rec_cost = None
+        rec_workers = 0
+    output = {
+        "wakeAgent": False,
+        "context": {
+            "providers": providers_list,
+            "recommended_profile": rec_profile,
+            "recommended_model": rec_model,
+            "max_task_cost": rec_cost,
+            "max_workers": rec_workers,
+            "privacy_level": privacy_level or "none",
+            "privacy_summary": privacy_summary,
+            "zombie_check": zombie_check,
+            "objectives": objectives_snapshot,
+            "valid_profiles": valid_profiles,
+            "warning": "; ".join(warnings) if warnings else "all providers exhausted",
+            "burn_warnings": load_burn_warnings(),
+        },
+    }
+    if model_cost:
+        output["context"]["model_cost"] = model_cost
+    if ng_budget:
+        output["context"]["nanogpt_balance"] = ng_budget
+    if forecast_warning:
+        output["context"]["forecast_warning"] = forecast_warning
+    print(json.dumps(output))
 
-    # Build warning if any provider had errors
-    warning = None
-    if warnings:
-        warning = "; ".join(warnings)
 
+def _active_warning_string(recommended, providers_list, warnings):
+    """Build the output ``warning`` string for the wakeAgent:true branch.
+
+    Starts from the accumulated *warnings*, then appends the paying-mode
+    deprioritization note and any OpenCode Go burning-balance note.
+    """
+    warning = "; ".join(warnings) if warnings else None
     # Note paying-mode deprioritization in warning
     if recommended["bottleneck_pct"] >= 100 and recommended["availability"] <= 5:
         if warning:
             warning += f"; {recommended['profile']} in paying mode (deprioritized)"
         else:
             warning = f"{recommended['profile']} in paying mode (deprioritized)"
-
-    # Burning-balance WARNING (t_47640f18): surface it in the snapshot even
-    # when pr-opencode is NOT the recommended provider (it has availability 0
-    # while burning, so it is never recommended) — otherwise the money-burn
-    # state would be invisible to the task creator. Explicitly notes that
-    # burning-balance means spending prepaid Zen, NOT free subscription quota.
+    # Burning-balance WARNING (t_47640f18): surface it even when pr-opencode
+    # is NOT recommended (availability 0 while burning, never recommended) so
+    # the money-burn state stays visible to the task creator. Burning-balance
+    # means spending PREPAID ZEN credits (money), NOT free subscription quota.
     for p in providers_list:
         if p.get("provider") == "opencode-go" and p.get("burning_balance"):
             note = (f"{p['profile']} state=burning-balance: an OpenCode Go window "
@@ -2140,6 +2167,20 @@ def main():
                 warning += "; " + note
             else:
                 warning = note
+    return warning
+
+
+def _emit_active(providers_list, warnings, privacy_level, zombie_check,
+                 objectives_snapshot, valid_profiles, model_cost, ng_budget,
+                 forecast_warning, recommended):
+    """Print the wakeAgent:true snapshot."""
+    # Privacy summary computed BEFORE the warning string is frozen so any
+    # malformed-tag warnings it emits are surfaced in the output warning.
+    privacy_summary = compute_privacy_summary(warnings=warnings)
+    warning = _active_warning_string(recommended, providers_list, warnings)
+
+    max_cost = bottleneck_to_max_cost(recommended["bottleneck_pct"])
+    max_workers = bottleneck_to_max_workers(recommended["bottleneck_pct"])
 
     output = {
         "wakeAgent": True,
@@ -2160,11 +2201,7 @@ def main():
             "max_workers": max_workers,
             "privacy_level": privacy_level or "none",
             "privacy_summary": privacy_summary,
-            # OBJ-21: always present.  Reaches this branch only when
-            # has_zombie is False (a zombie forces the early return above).
             "zombie_check": zombie_check,
-            # MEDIATOR t_4fa0a4b5: active approved_objectives rows — the
-            # creator's task source + per-objective budget gate input.
             "objectives": objectives_snapshot,
             "valid_profiles": valid_profiles,
             "warning": warning,
@@ -2178,6 +2215,59 @@ def main():
         output["context"]["forecast_warning"] = forecast_warning
     print(json.dumps(output))
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    warnings = []
+
+    # --- Parse privacy level (Phase 2) ---
+    privacy_level = parse_privacy_level()
+
+    # --- Query each provider ---
+    providers_list, ng_budget = _query_all_providers(warnings)
+
+    # --- Parked profiles (t_7da69d59) + recommended provider ---
+    parked = _set_parked_flags(providers_list)
+    recommended = select_provider(providers_list, privacy_level=privacy_level,
+                                  parked=parked, nanogpt_budget=ng_budget)
+
+    # --- Per-model cost ledger (MULTI-PROV-09) — never fatal ---
+    model_cost = _model_cost_ledger(providers_list, warnings)
+
+    # If privacy filtering eliminated all candidates, warn
+    if recommended is None and privacy_level:
+        _warn_privacy_empty(privacy_level, providers_list, warnings)
+
+    # --- Guardrail G1: validate the recommended profile against the host ---
+    existing_profiles = get_existing_profiles()
+    valid_profiles = sorted(existing_profiles & ALLOWED_PROFILES)
+
+    # --- Deterministic zombie guard (OBJ-21, G3 deterministic) ---
+    zombie_check = compute_zombie_check(warnings=warnings)
+    _warn_zombie(zombie_check, warnings)
+
+    # --- OBJETIVOS APROBADOS snapshot (MEDIATOR t_4fa0a4b5) ---
+    objectives_snapshot = compute_objectives_snapshot(warnings=warnings)
+
+    if recommended is not None:
+        recommended = _validate_recommended(
+            recommended, existing_profiles, providers_list, parked, warnings,
+        )
+
+    # --- Predictor EMA (OBJ-24 F2) — modo --suggest: observador ---
+    forecast_warning = forecast_context(load_forecast()) if _SUGGEST else None
+
+    if recommended is None or zombie_check["has_zombie"]:
+        _emit_no_agent(providers_list, warnings, privacy_level, zombie_check,
+                       objectives_snapshot, valid_profiles, model_cost,
+                       ng_budget, forecast_warning, recommended)
+    else:
+        _emit_active(providers_list, warnings, privacy_level, zombie_check,
+                     objectives_snapshot, valid_profiles, model_cost,
+                     ng_budget, forecast_warning, recommended)
 
 if __name__ == "__main__":
     main()
