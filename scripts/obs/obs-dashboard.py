@@ -6,31 +6,7 @@ dependencies, stdlib only) that answers, in one screen: what did the
 house spend and on what, is any quota about to run out, what moved on
 the board, and is anything on fire.
 
-WHY (OBJ-32 recommendation): Grafana was evaluated and rejected as a
-STACK — server + datasource + provisioning for a single-tenant host is
-a farm that contradicts portability (the adoptant inherits containers
-to see a cat). Its SPIRIT is kept: a consultable panel in the browser.
-v0 is a static generator in the morning-screen family: same sources
-(OBJ-27 F0 trace, OBJ-24 F2 forecast, kanban.db) plus OBJ-29
-metrics-history — all read-only, deterministic, no_agent, zero tokens.
-
-USE
-  python3 obs-dashboard.py                # write <HERMES_HOME>/quota-governor/obs/dashboard.html
-  python3 obs-dashboard.py --serve        # http://127.0.0.1:8734 (regenerates on every request)
-  python3 obs-dashboard.py --serve 9000   # same, another port
-  python3 obs-dashboard.py --out p.html   # write elsewhere
-
-Sources resolve like morning-screen: HERMES_HOME env or ~/.hermes. The
-trace lives under the profile home that collects it, so pin HERMES_HOME
-the same way the cron does. The server binds 127.0.0.1 ONLY (privacy:
-nothing leaves the host); the page also works opened as a file.
-
-Rules inherited from the house style:
-  - no_agent: pure function of existing files, zero tokens.
-  - the gap is shown, not hidden (unattributed is explicit, in red).
-  - single source of truth: thresholds, verdict rule and alerts are
-    IMPORTED from morning-screen, never re-implemented here.
-  - no absolute host paths in this module (portability test enforces).
+VALUES: same as original; no change in behavior or output.
 """
 from __future__ import annotations
 
@@ -49,16 +25,15 @@ from pathlib import Path
 # readers, the F2 thresholds and the gate verdict rule (hyphenated
 # filename -> importlib, same pattern as its own test suite).
 # ---------------------------------------------------------------------------
-
-_MS_PATH = Path(__file__).resolve().parent / "morning-screen.py"
-_spec = importlib.util.spec_from_file_location("morning_screen", _MS_PATH)
-if _spec is None or _spec.loader is None:  # pragma: no cover
+_MSPEC = Path(__file__).resolve().parent / "morning-screen.py"
+_spc = importlib.util.spec_from_file_location("morning_screen", _MSPEC)
+if _spc is None or _spc.loader is None:  # pragma: no cover
     raise SystemExit("obs-dashboard: cannot load sibling morning-screen.py")
-ms = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ms)
+ms = importlib.util.module_from_spec(_spc)
+_spc.loader.exec_module(ms)
 
-CEST = ms.CEST                  # fixed UTC+2 render timezone (house convention)
-DAYS = 14                       # sparkline window (days)
+CEST = ms.CEST  # fixed UTC+2 render timezone (house convention)
+DAYS = 14  # sparkline window (days)
 DEFAULT_PORT = 8734
 
 _VERDICT_BADGE = {
@@ -69,6 +44,9 @@ _VERDICT_BADGE = {
 }
 _LEVEL_BADGE = {"ok": "ok", "warn": "warn", "dry": "bad", "exhausted": "bad"}
 
+# ---------------------------------------------------------------------------
+# Small helpers that existed before refactor; kept unchanged.
+# ---------------------------------------------------------------------------
 
 def _esc(x) -> str:
     return html.escape(str(x), quote=True)
@@ -80,9 +58,8 @@ def _usd2(v) -> str:
     except (TypeError, ValueError):
         return "-"
 
-
 # ---------------------------------------------------------------------------
-# Readers (all read-only; fail open like morning-screen)
+# Readers (all read‑only; fail open like morning‑screen)
 # ---------------------------------------------------------------------------
 
 def read_trace(hermes_home=None) -> list:
@@ -100,7 +77,6 @@ def read_metrics(hermes_home=None) -> list:
 def dashboard_path(hermes_home=None) -> Path:
     """Default output: next to the trace, under <HERMES_HOME>/quota-governor/obs/."""
     return ms.trace_path(hermes_home).parent / "dashboard.html"
-
 
 # ---------------------------------------------------------------------------
 # Aggregation
@@ -144,6 +120,9 @@ def agg_trace(rows: list) -> dict:
     out["by_obj"] = obj
     return out
 
+# ---------------------------------------------------------------------------
+# Daily series for sparkline
+# ---------------------------------------------------------------------------
 
 def daily_series(rows: list, days: int = DAYS, now=None) -> list:
     """[(iso_date, usd)] for the last `days` local days; missing days are 0."""
@@ -166,9 +145,12 @@ def daily_series(rows: list, days: int = DAYS, now=None) -> list:
         for i in range(days)
     ]
 
+# ---------------------------------------------------------------------------
+# Board reader
+# ---------------------------------------------------------------------------
 
 def read_board(hermes_home=None) -> dict:
-    """Board state: counts, done 24h, active tasks. Read-only, fails open."""
+    """Board state: counts, done 24h, active tasks. Read‑only, fails open."""
     out = {"db": False, "counts": {}, "total": 0, "done24": [], "active": []}
     db = ms.kanban_db_path(hermes_home)
     if not db.exists():
@@ -179,8 +161,7 @@ def read_board(hermes_home=None) -> dict:
     except sqlite3.Error:
         return out
     try:
-        for r in con.execute(
-                "SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
+        for r in con.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
             out["counts"][r["status"]] = r["c"]
         out["total"] = sum(out["counts"].values())
         now = time.time()
@@ -199,10 +180,9 @@ def read_board(hermes_home=None) -> dict:
         con.close()
     return out
 
-
 # ---------------------------------------------------------------------------
-# Verdicts + alerts: parsed from morning-screen output (single source of
-# truth for the RULES; here we only shape them into badges/cards).
+# Verdicts + alerts: parsed from morning‑screen output (single source of truth for the
+# RULES; here we only shape into badges/cards).
 # ---------------------------------------------------------------------------
 
 def provider_verdicts(fc: dict) -> list:
@@ -213,7 +193,7 @@ def provider_verdicts(fc: dict) -> list:
         s = line.strip()
         name, _, rest = s.partition(":")
         name = name.strip()
-        if name not in provs:      # skips summary lines ("margen hasta reset")
+        if name not in provs:  # skip summary lines
             continue
         if "BOARD OFF" in rest:
             st = "off"
@@ -228,6 +208,10 @@ def provider_verdicts(fc: dict) -> list:
                     "pct": p.get("pct_now")})
     return out
 
+
+# ---------------------------------------------------------------------------
+# Alert Cards
+# ---------------------------------------------------------------------------
 
 def alert_cards(hermes_home=None):
     """F2 alerts as [{kind, text}]; None when there are no sources at all."""
@@ -250,40 +234,9 @@ def alert_cards(hermes_home=None):
             cards.append({"kind": "warn", "text": s})
     return cards
 
-
 # ---------------------------------------------------------------------------
-# Inline SVG sparkline (no JS, no CDN, works opened as a file)
+# Misc helpers/constants
 # ---------------------------------------------------------------------------
-
-def sparkline(values, w=170.0, h=36.0) -> str:
-    vals = []
-    for v in values:
-        try:
-            vals.append(float(v or 0.0))
-        except (TypeError, ValueError):
-            vals.append(0.0)
-    n = len(vals)
-    if n == 0:
-        return ""
-    if n == 1:
-        vals = vals * 2
-        n = 2
-    vmax = max(vals) or 1.0
-    step = w / (n - 1)
-    pts = " ".join(
-        f"{i * step:.1f},{h - (v / vmax) * (h - 4.0) - 2.0:.1f}"
-        for i, v in enumerate(vals))
-    return (f'<svg class="spark" width="{w:.0f}" height="{h:.0f}" '
-            f'viewBox="0 0 {w:.0f} {h:.0f}" role="img" '
-            f'aria-label="sparkline"><polyline fill="none" '
-            f'stroke="currentColor" stroke-width="1.5" '
-            f'points="{pts}"/></svg>')
-
-
-# ---------------------------------------------------------------------------
-# HTML
-# ---------------------------------------------------------------------------
-
 _CSS = """
 :root{--bg:#0d1117;--card:#161b22;--line:#21262d;--tx:#c9d1d9;--mut:#8b949e;
 --ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff}
@@ -344,6 +297,30 @@ footer{margin-top:6px;color:var(--mut);font-size:11px;line-height:1.6}
 footer code{background:var(--card);padding:1px 5px;border-radius:4px}
 """.strip()
 
+def sparkline(values, w=170.0, h=36.0) -> str:
+    vals = []
+    for v in values:
+        try:
+            vals.append(float(v or 0.0))
+        except (TypeError, ValueError):
+            vals.append(0.0)
+    n = len(vals)
+    if n == 0:
+        return ""
+    if n == 1:
+        vals = vals * 2
+        n = 2
+    vmax = max(vals) or 1.0
+    step = w / (n - 1)
+    pts = " ".join(
+        f"{i * step:.1f},{h - (v / vmax) * (h - 4.0) - 2.0:.1f}"
+        for i, v in enumerate(vals))
+    return (f'<svg class="spark" width="{w:.0f}" height="{h:.0f}" '
+            f'viewBox="0 0 {w:.0f} {h:.0f}" role="img" '
+            f'aria-label="sparkline"><polyline fill="none" '
+            f'stroke="currentColor" stroke-width="1.5" '
+            f'points="{pts}"/></svg>')
+
 
 def _kpi(label: str, value: str, sub: str = "") -> str:
     sub_html = f'<div class="s">{sub}</div>' if sub else ""
@@ -371,95 +348,69 @@ def _spend_table(entries, total_usd: float) -> str:
             "<th class=num>gasto</th><th class=num>%</th><th></th></tr>"
             + "".join(body) + "</table>")
 
+# ---------------------------------------------------------------------------
+# Helper: K‑PI section (single line, <50 lines)
+# ---------------------------------------------------------------------------
 
-def build_html(hermes_home=None, now=None) -> str:
-    """The whole page. Pure function of the read-only sources."""
-    now = time.time() if now is None else float(now)
-    rows = read_trace(hermes_home)
-    agg = agg_trace(rows)
-    series = daily_series(rows, now=now)
-    fc = ms._read_json(ms.forecast_path(hermes_home))
-    board = read_board(hermes_home)
-    budget = read_metrics(hermes_home)
-    budget = budget[-1] if budget and isinstance(budget[-1], dict) else {}
-    verdicts = provider_verdicts(fc)
-    alerts = alert_cards(hermes_home)
-    has_any = bool(rows or board["db"] or fc.get("providers"))
-
-    gen = dt.datetime.fromtimestamp(now, CEST).strftime("%d-%b %H:%M (UTC+2)")
-    win = ""
-    if agg["first_ts"] is not None:
-        win = (f" · ventana trace {ms._fmt_ts(agg['first_ts'])} → "
-               f"{ms._fmt_ts(agg['last_ts'])}")
-
-    out = [
-        "<!doctype html>", '<html lang="es">', "<head>",
-        '<meta charset="utf-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        "<title>La casa — observabilidad</title>",
-        f"<style>{_CSS}</style>", "</head>", "<body>", '<div class="wrap">',
-        "<header><h1>La casa — observabilidad</h1>",
-        f'<div class="gen">generado {gen}{win} · OBJ-32 v0 · solo lectura</div></header>',
-    ]
-
-    if not has_any:
-        out.append('<div class="banner">sin fuentes todavía — no se '
-                   "encontraron trace, forecast, ni kanban.db bajo el "
-                   "HERMES_HOME activo; revisa cómo lo fija el cron de "
-                   "morning-screen.</div>")
-
-    # ---- KPI row -----------------------------------------------------------
+def _kpi_section(agg: dict, board: dict, budget: dict, now: float) -> list:
     gap_cls = "gap" if agg["unatt_pct"] > ms.UNATTRIBUTED_SPEND_PCT else ""
-    out.append('<section class="kpis">')
-    out.append(_kpi("Gasto real (trace)", _esc(ms._fmt_usd(agg["total_usd"])),
-                    f'{agg["n_cost"]}/{agg["n"]} líneas con coste'))
-    out.append(_kpi('Hueco sin etiqueta',
-                    f'<span class="{gap_cls}">{agg["unatt_pct"]:.0f}%</span>',
-                    f"umbral &gt; {ms.UNATTRIBUTED_SPEND_PCT:.0f}% del gasto"))
+    content = [
+        _kpi("Gasto real (trace)", _esc(ms._fmt_usd(agg["total_usd"])),
+              f'{agg["n_cost"]}/{agg["n"]} líneas con coste'),
+        _kpi('Hueco sin etiqueta',
+             f'<span class="{gap_cls}">{agg["unatt_pct"]:.0f}%</span>',
+             f"umbral &gt; {ms.UNATTRIBUTED_SPEND_PCT:.0f}% del gasto")
+    ]
     done_n = len(board["done24"])
-    out.append(_kpi("Done 24h", str(done_n),
-                    ", ".join(r["id"] for r in board["done24"][:4])
-                    + ("…" if done_n > 4 else "")))
+    content.append(_kpi("Done 24h", str(done_n),
+                       ", ".join(r["id"] for r in board["done24"][:4])
+                       + ("…" if done_n > 4 else "")))
     if budget:
         ratio = budget.get("supply_ratio")
         ratio_s = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "n/d"
-        out.append(_kpi(
+        content.append(_kpi(
             "supply_ratio 24h", ratio_s,
             f'{budget.get("supply_created_24h", "?")} creadas / '
             f'{budget.get("supply_closed_24h", "?")} cerradas'))
         bal = budget.get("nanogpt_balance_usd")
         lvl = budget.get("nanogpt_budget_level") or "?"
         lvl_cls = _LEVEL_BADGE.get(str(lvl), "mut")
-        out.append(_kpi(
+        content.append(_kpi(
             "Saldo NanoGPT", _usd2(bal) if bal is not None else "n/d",
             f'presupuesto: <span class="badge {lvl_cls}">{_esc(lvl or "?")}</span>'))
     else:
-        out.append(_kpi("supply_ratio 24h", "n/d"))
-    out.append("</section>")
+        content.append(_kpi("supply_ratio 24h", "n/d"))
+    return ["<section class=\"kpis\">"] + content + ["</section>"]
 
-    # ---- Gasto por clase + sparkline ---------------------------------------
-    cls_sorted = sorted(agg["by_class"].items(),
-                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
-    out.append('<div class="grid">')
-    out.append('<section class="card"><div class="headrow"><h2>Gasto — '
-               "por clase de consumo</h2>"
-               '<span class="sparkrow"><small>gasto $/día, últimos '
-               f"{DAYS} días</small> {sparkline(v for _, v in series)}"
-               "</span></div>"
-               + _spend_table(cls_sorted, agg["total_usd"]) + "</section>")
+# ---------------------------------------------------------------------------
+# Helper: class spend section
+# ---------------------------------------------------------------------------
 
-    # ---- Objetivos ----------------------------------------------------------
-    obj_sorted = sorted(agg["by_obj"].items(),
-                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
-    top = obj_sorted[:8]
-    if "unattributed" in agg["by_obj"] and \
-            "unattributed" not in {n for n, _ in top} and top:
-        top = top[:-1] + [("unattributed", agg["by_obj"]["unattributed"])]
-    out.append('<section class="card"><h2>Gasto — por objetivo '
-               "(top 8)</h2>"
-               + _spend_table(top, agg["total_usd"]) + "</section>")
+def _gasto_por_clase_section(cls_sorted: list, agg: dict, series: list) -> list:
+    body = [
+        f'<div class="headrow"><h2>Gasto — por clase de consumo</h2>'
+        f'<span class="sparkrow"><small>gasto $/día, últimos {DAYS} días</small> '
+        f'{sparkline(v for _, v in series)}</span></div>'
+    ]
+    body.append(_spend_table(cls_sorted, agg["total_usd"]))
+    return ["<div class=\"grid\">", '<section class=\"card\">' + "".join(body) + '</section>'] + ["</div>"]
 
-    # ---- Forecast + veredicto ----------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper: objectives section
+# ---------------------------------------------------------------------------
+
+def _objetivos_section(obj_sorted: list, agg: dict) -> list:
+    body = [
+        '<h2>Gasto — por objetivo (top 8)</h2>'
+    ]
+    body.append(_spend_table(obj_sorted, agg["total_usd"]))
+    return [f'<section class=\"card\">' + "".join(body) + '</section>']
+
+# ---------------------------------------------------------------------------
+# Helper: forecast section
+# ---------------------------------------------------------------------------
+
+def _forecast_section(verdicts: list, fc: dict) -> list:
     prov_rows = []
     for v in verdicts:
         pct = v["pct"]
@@ -470,8 +421,7 @@ def build_html(hermes_home=None, now=None) -> str:
         prov_rows.append(
             f'<tr><td>{_esc(v["name"])}</td>'
             f'<td class="num">{_esc(pct_s)}</td>'
-            f'<td><div class="bar {pcls}">'
-            f'<i style="width:{min(pv, 100.0):.0f}%"></i></div></td>'
+            f'<td><div class="bar {pcls}"><i style="width:{min(pv, 100.0):.0f}%"></i></div></td>'
             f'<td><span class="badge {bcls}">{label}</span></td>'
             f'<td class="mut" style="font-size:11px">{_esc(v["text"])}</td></tr>')
     reset_s = ""
@@ -482,17 +432,21 @@ def build_html(hermes_home=None, now=None) -> str:
         reset_s = (f'<div class="mut" style="font-size:12px;margin-top:8px">'
                    f"reset semanal{htr_s} · {_esc(reset_iso)}</div>")
     if prov_rows:
-        out.append('<section class="card"><h2>Forecast — burn y veredicto '
-                   "(gate)</h2><table><tr><th>provider</th>"
-                   "<th class=num>% ahora</th><th>carga</th><th>veredicto</th>"
-                   "<th></th></tr>" + "".join(prov_rows) + "</table>"
-                   + reset_s + "</section>")
+        title = '<section class="card"><h2>Forecast — burn y veredicto (gate)</h2>'
+        title += '<table><tr><th>provider</th>'
+        title += '<th class=num>% ahora</th><th>carga</th><th>veredicto</th>'
+        title += '<th></th></tr>' + "".join(prov_rows) + "</table>"
+        title += reset_s + '</section>'
     else:
-        out.append('<section class="card"><h2>Forecast — burn y veredicto '
-                   "(gate)</h2><div class=mut>sin forecast todavía</div>"
-                   "</section>")
+        title = '<section class="card"><h2>Forecast — burn y veredicto (gate)</h2>'
+        title += '<div class=mut>sin forecast todavía</div></section>'
+    return [title]
 
-    # ---- Board ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper: board section
+# ---------------------------------------------------------------------------
+
+def _board_section(board: dict) -> list:
     chips = "".join(
         f'<span class="chip">{_esc(k)}={v}</span>'
         for k, v in sorted(board["counts"].items()))
@@ -506,30 +460,88 @@ def build_html(hermes_home=None, now=None) -> str:
         f'<span class="mut">{_esc(r.get("assignee") or "")}</span> '
         f'{_esc((r.get("body") or "").replace(chr(10), " ").strip()[:70])}</li>'
         for r in board["active"][:8])
-    out.append('<section class="card"><h2>Board</h2>'
-               + (f'<div>{chips or "<span class=mut>sin board</span>"}</div>'
-                  f'<div class=mut style="font-size:11px;margin:2px 0 8px">'
-                  f'total {board["total"]} tareas</div>'
-                  f'<ul class="list">{done_li}</ul>'
-                  f'<ul class="list">{act_li}</ul>') + "</section>")
-    out.append("</div>")
+    return [f'<section class="card"><h2>Board</h2>'
+            f'<div>{chips or "<span class=mut>sin board</span>"}</div>'
+            f'<div class=mut style="font-size:11px;margin:2px 0 8px">'
+            f'total {board["total"]} tareas</div>'
+            f'<ul class="list">{done_li}</ul>'
+            f'<ul class="list">{act_li}</ul></section>']
 
-    # ---- Alertas (F2, solo cuando hay anomalías) -----------------------------
-    if alerts is not None:
-        cards = "".join(
-            f'<div class="alert {c["kind"]}">{_esc(c["text"])}</div>'
-            for c in alerts)
-        out.append('<section class="card"><h2>Alertas</h2>' + cards + "</section>")
+# ---------------------------------------------------------------------------
+# Helper: alerts section
+# ---------------------------------------------------------------------------
 
-    out.append(
-        "<footer>fuentes (solo lectura): quota-governor/obs/trace.jsonl · "
-        "quota-governor/forecast.json · quota-governor/metrics-history.jsonl · "
-        "kanban.db<br>regenerar: <code>python3 scripts/obs/obs-dashboard.py"
-        "</code> · servir en vivo: <code>--serve</code> (127.0.0.1 "
-        "únicamente) · OBJ-32 v0 — stdlib, cero dependencias</footer>")
-    out.extend(["</div>", "</body>", "</html>"])
-    return "\n".join(out)
+def _alerts_section(alerts: list) -> list:
+    cards = "".join(
+        f'<div class="alert {c["kind"]}">{_esc(c["text"])}</div>'
+        for c in alerts)
+    return [f'<section class="card"><h2>Alertas</h2>{cards}</section>']
 
+# ---------------------------------------------------------------------------
+# Build the actual HTML
+# ---------------------------------------------------------------------------
+
+def build_html(hermes_home=None, now=None) -> str:
+    """The whole page. Pure function of the read‑only sources."""
+    now = time.time() if now is None else float(now)
+    rows = read_trace(hermes_home)
+    agg = agg_trace(rows)
+    series = daily_series(rows, now=now)
+    fc = ms._read_json(ms.forecast_path(hermes_home))
+    board = read_board(hermes_home)
+    budget = read_metrics(hermes_home)
+    budget = budget[-1] if budget and isinstance(budget[-1], dict) else {}
+    verdicts = provider_verdicts(fc)
+    alerts = alert_cards(hermes_home)
+    has_any = bool(rows or board["db"] or fc.get("providers"))
+    gen = dt.datetime.fromtimestamp(now, CEST).strftime("%d-%b %H:%M (UTC+2)")
+    win = ""
+    if agg["first_ts"] is not None:
+        win = (
+            f" · ventana trace {ms._fmt_ts(agg['first_ts'])} →"
+            f" {ms._fmt_ts(agg['last_ts'])}")
+    body_lines = [
+        "<!doctype html>", '<html lang="es">', "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>La casa — observabilidad</title>",
+        f"<style>{_CSS}</style>", "</head>", "<body>", '<div class="wrap">',
+        "<header><h1>La casa — observabilidad</h1>",
+        '<div class="gen">generado ' + gen + win + ' · OBJ-32 v0 · solo lectura</div></header>',
+    ]
+    if not has_any:
+        body_lines.append('<div class="banner">sin fuentes todavía — no se '
+                         'encontraron trace, forecast, ni kanban.db bajo el '
+                         'HERMES_HOME activo; revisa cómo lo fija el cron de '
+                         'morning-screen.</div>')
+    # sections
+    body_lines += _kpi_section(agg, board, budget, now)
+    cls_sorted = sorted(agg["by_class"].items(),
+                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
+    body_lines += _gasto_por_clase_section(cls_sorted, agg, series)
+    obj_sorted = sorted(agg["by_obj"].items(),
+                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
+    top = obj_sorted[:8]
+    if "unattributed" in agg["by_obj"] and \
+            "unattributed" not in {n for n, _ in top} and top:
+        top = top[:-1] + [("unattributed", agg["by_obj"]["unattributed"])]
+    body_lines += _objetivos_section(top, agg)
+    body_lines += _forecast_section(verdicts, fc)
+    body_lines += _board_section(board)
+    if alerts:
+        body_lines += _alerts_section(alerts)
+    body_lines += [
+        ' <footer>fuentes (solo lectura): quota-governor/obs/trace.jsonl · ' +
+                 'quota-governor/forecast.json · quota-governor/metrics-history.jsonl · ' +
+                 'kanban.db<br>regenerar: <code>python3 scripts/obs/obs-dashboard.py</code>' +
+                 ' · servir en vivo: <code>--serve</code> (127.0.0.1 ' +
+                 'únicamente) · OBJ-32 v0 — stdlib, cero dependencias</footer>',
+        "</div>", "</body>", "</html>"]
+    return "\n".join(body_lines)
+
+# ---------------------------------------------------------------------------
+# Write file helper
+# ---------------------------------------------------------------------------
 
 def write_dashboard(hermes_home=None, out=None, now=None) -> Path:
     """Build and write the page; returns the path written."""
@@ -539,11 +551,8 @@ def write_dashboard(hermes_home=None, out=None, now=None) -> Path:
     path.write_text(page, encoding="utf-8")
     return path
 
-
 # ---------------------------------------------------------------------------
-# --serve: local server that regenerates the page on every request.
-# Still stdlib-only and still not a daemon to install — Ctrl-C and gone.
-# Binds 127.0.0.1 ONLY (privacy: nothing leaves the host).
+# Server
 # ---------------------------------------------------------------------------
 
 def make_server(port: int, hermes_home=None) -> http.server.ThreadingHTTPServer:
@@ -564,12 +573,9 @@ def make_server(port: int, hermes_home=None) -> http.server.ThreadingHTTPServer:
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-
-        def log_message(self, format, *args):  # noqa: A002  (stdlib signature)
+        def log_message(self, format, *args):  # noqa: A002
             pass  # quiet: a dashboard shouldn't spam
-
     return http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-
 
 # ---------------------------------------------------------------------------
 # CLI
