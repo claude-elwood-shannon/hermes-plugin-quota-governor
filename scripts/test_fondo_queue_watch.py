@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """test_fondo_queue_watch.py — OBJ-30b: anti-parada mechanism during budget windows.
 
 Covers (fixtures only, no network, no real kanban.db, no real CLI):
@@ -91,7 +90,7 @@ def _window(id="t_win", status="running", assignee="pr-ollama", body=WINDOW_BODY
 
 
 class Base(unittest.TestCase):
-    def setUp(self: Any) -> Any:
+    def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fqw-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.addCleanup(os.environ.pop, "HERMES_HOME", None)
@@ -115,7 +114,7 @@ class Base(unittest.TestCase):
         self.calls["comment"].append((task_id, body))
         return True
 
-    def home(self: Any) -> Any:
+    def home(self):
         return self.tmp
 
     def _state(self):
@@ -135,7 +134,7 @@ class Base(unittest.TestCase):
 
 
 class TestNoWindow(Base):
-    def test_no_window_is_silent(self: Any) -> Any:
+    def test_no_window_is_silent(self):
         _mk_db(self.db, [{"id": "t_1", "title": "x", "status": "ready",
                           "assignee": "pr-ollama", "body": "objective:OBJ-27"}])
         out = fw.run(hermes_home=self.home(), execute=True, now=NOW)
@@ -145,7 +144,7 @@ class TestNoWindow(Base):
 
 
 class TestQueueNonEmpty(Base):
-    def test_queue_nonempty_resets_and_stays_silent(self: Any) -> Any:
+    def test_queue_nonempty_resets_and_stays_silent(self):
         _mk_db(self.db, [_window(), {"id": "t_1", "title": "x", "status": "ready",
                                      "assignee": "pr-ollama", "body": "objective:OBJ-27"}])
         # Pre-seed a stale empty-since to prove it resets.
@@ -158,14 +157,14 @@ class TestQueueNonEmpty(Base):
 
 
 class TestQueueEmptyGrace(Base):
-    def test_first_empty_tick_starts_clock(self: Any) -> Any:
+    def test_first_empty_tick_starts_clock(self):
         _mk_db(self.db, [_window()])
         out = fw.run(hermes_home=self.home(), execute=True, now=NOW)
         self.assertEqual(out, [])
         self.assertIsNotNone(self._state().get("empty_since"))
         self.assertEqual(self.calls["create"], [])
 
-    def test_within_grace_stays_silent(self: Any) -> Any:
+    def test_within_grace_stays_silent(self):
         _mk_db(self.db, [_window()])
         fw._write_state(fw.state_file_path(self.home()),
                         {"empty_since": NOW - 600, "window": "t_win"})  # 10 min
@@ -175,7 +174,7 @@ class TestQueueEmptyGrace(Base):
 
 
 class TestCascade(Base):
-    def test_step1_promotes_next_phase(self: Any) -> Any:
+    def test_step1_promotes_next_phase(self):
         _mk_db(self.db, [_window()])
         fw._write_state(fw.state_file_path(self.home()),
                         {"empty_since": NOW - 3600, "window": "t_win"})  # 60 min
@@ -187,7 +186,7 @@ class TestCascade(Base):
         self.assertIn("OBJ-27 F1", title)
         self.assertEqual(assignee, "pr-ollama")
 
-    def test_step1_skips_phase_already_on_board(self: Any) -> Any:
+    def test_step1_skips_phase_already_on_board(self):
         # The phase task exists but is NOT in the ready/running queue (todo),
         # so the queue is empty but step1 finds nothing new to promote.
         single_cartera = (
@@ -210,7 +209,7 @@ class TestCascade(Base):
         self.assertIn("STOP", out[0])
         self.assertEqual(self.calls["create"], [])
 
-    def test_step2_structural_successor(self: Any) -> Any:
+    def test_step2_structural_successor(self):
         _mk_db(self.db, [_window(body=WINDOW_BODY_NO_CARTERA)],
                done=[{"id": "t_done", "title": "OBJ-27 F0 trace",
                       "assignee": "pr-ollama", "body": "objective:OBJ-27",
@@ -223,7 +222,7 @@ class TestCascade(Base):
         self.assertEqual(len(self.calls["create"]), 1)
         self.assertIn("Test/hardening: OBJ-27 F0 trace", self.calls["create"][0][0])
 
-    def test_step3_assigns_triage(self: Any) -> Any:
+    def test_step3_assigns_triage(self):
         _mk_db(self.db, [_window(body=WINDOW_BODY_NO_CARTERA)],
                triage=[{"id": "t_tri", "title": "OBJ-19: Documentar matriz de routing",
                         "assignee": None,
@@ -237,7 +236,7 @@ class TestCascade(Base):
         self.assertEqual(self.calls["assign"], [("t_tri", "pr-ollama")])
         self.assertEqual(self.calls["create"], [])
 
-    def test_step4_stop_when_nothing_legitimate(self: Any) -> Any:
+    def test_step4_stop_when_nothing_legitimate(self):
         _mk_db(self.db, [_window(body=WINDOW_BODY_NO_CARTERA)])
         fw._write_state(fw.state_file_path(self.home()),
                         {"empty_since": NOW - 3600, "window": "t_win"})
@@ -252,7 +251,7 @@ class TestCascade(Base):
         self.assertEqual(len(self.calls["comment"]), 1)
         self.assertEqual(self.calls["comment"][0][0], "t_win")
 
-    def test_max_one_action_per_tick(self: Any) -> Any:
+    def test_max_one_action_per_tick(self):
         # Window with a phase AND a done task AND a triage task: only step1 fires.
         _mk_db(self.db, [_window()],
                done=[{"id": "t_done", "title": "OBJ-27 F0 trace",
@@ -269,7 +268,7 @@ class TestCascade(Base):
 
 
 class TestDryRun(Base):
-    def test_dry_run_prints_but_does_not_mutate(self: Any) -> Any:
+    def test_dry_run_prints_but_does_not_mutate(self):
         _mk_db(self.db, [_window()])
         fw._write_state(fw.state_file_path(self.home()),
                         {"empty_since": NOW - 3600, "window": "t_win"})
@@ -281,7 +280,7 @@ class TestDryRun(Base):
 
 
 class TestPortability(unittest.TestCase):
-    def test_no_absolute_host_paths_in_module(self: Any) -> Any:
+    def test_no_absolute_host_paths_in_module(self):
         src = Path(SCRIPT).read_text(encoding="utf-8")
         for needle in ("/home/", "/data", Path.home().name):
             self.assertNotIn(needle, src,

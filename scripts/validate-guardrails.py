@@ -595,7 +595,7 @@ def record_proposal(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> Any:
+def main():
     parser = argparse.ArgumentParser(
         description="OBJ-17 guardrails validator for autonomous objectives."
     )

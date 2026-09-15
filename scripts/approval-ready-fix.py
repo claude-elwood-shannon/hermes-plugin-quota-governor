@@ -98,7 +98,7 @@ def fill_package(body: str, assignee: str) -> tuple:
         return body, [], []
     lines = []
 
-    def val(name: Any) -> Any:
+    def val(name):
         if name == "presupuesto":
             m = COST_RE.search(body)
             return (f"presupuesto estimado: ${COST_BUDGET_USD.get(m.group(1).lower(), 0.10):.2f}"

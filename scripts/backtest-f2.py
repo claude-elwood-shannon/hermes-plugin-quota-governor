@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """backtest-f2.py — OBJ-24 F2 forecast-accuracy harness (no_agent).
 
 Every 15m (cron or manual run) this script:
@@ -78,7 +77,7 @@ HITO = qf.HITO_STOP          # 90.0 % milestone
 TOL_PCT = 20.0               # close criterion: error must be < 20%
 
 
-def read_jsonl(path: Any) -> Any:
+def read_jsonl(path):
     """Tolerant JSONL reader: bad lines are skipped, missing file -> []."""
     rows = []
     try:
@@ -94,7 +93,7 @@ def read_jsonl(path: Any) -> Any:
     return rows
 
 
-def read_forecast(path: Any) -> Any:
+def read_forecast(path):
     """Tolerant forecast.json reader -> dict or None."""
     try:
         d = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -103,7 +102,7 @@ def read_forecast(path: Any) -> Any:
         return None
 
 
-def forecast_providers(forecast: Any) -> Any:
+def forecast_providers(forecast):
     """Provider map from a forecast dict, tolerant to BOTH shapes.
 
     quota-forecast.py writes per-provider data at the TOP level
@@ -120,7 +119,7 @@ def forecast_providers(forecast: Any) -> Any:
     return provs
 
 
-def snapshot_record(forecast: Any) -> Any:
+def snapshot_record(forecast):
     """Extract a compact snapshot line from a forecast dict, or None."""
     ts = forecast.get("generated_at")
     provs_raw = forecast_providers(forecast)
@@ -145,7 +144,7 @@ def snapshot_record(forecast: Any) -> Any:
             "providers": provs}
 
 
-def crossings_by_provider(history_rows: Any) -> Any:
+def crossings_by_provider(history_rows):
     """{provider: sorted [(epoch, pct)]} from metrics rows, deduped by ts."""
     series = {p: {} for p in qf.METRICAS_WEEKLY}
     for row in history_rows:
@@ -162,7 +161,7 @@ def crossings_by_provider(history_rows: Any) -> Any:
     return {p: sorted(d.items()) for p, d in series.items()}
 
 
-def first_crossing(points: Any, after: Any, upto: Any) -> Any:
+def first_crossing(points, after, upto):
     """First (epoch, pct) with epoch > after, epoch <= upto and pct >= HITO."""
     for e, pct in points:
         if e <= after or e > upto:
@@ -172,7 +171,7 @@ def first_crossing(points: Any, after: Any, upto: Any) -> Any:
     return None
 
 
-def evaluate_snapshots(snaps: Any, series: Any, resolved: Any, now_epoch: Any) -> Any:
+def evaluate_snapshots(snaps, series, resolved, now_epoch):
     """Return new 'res' records for every snapshot/provider still open.
 
     snaps: list of snapshot records (deduped by ts, chronological).
@@ -217,7 +216,7 @@ def evaluate_snapshots(snaps: Any, series: Any, resolved: Any, now_epoch: Any) -
     return out
 
 
-def day_verdicts(snaps: Any, res_records: Any, existing_days: Any, now_iso: Any) -> Any:
+def day_verdicts(snaps, res_records, existing_days, now_iso):
     """New 'day' verdict lines (OK/FAIL/OPEN) for changed (day, provider)."""
     from collections import defaultdict
     per = defaultdict(lambda: {"ok": 0, "fail": 0, "na": 0, "open": 0,
@@ -260,7 +259,7 @@ def day_verdicts(snaps: Any, res_records: Any, existing_days: Any, now_iso: Any)
     return new
 
 
-def main() -> Any:
+def main():
     now_epoch = time.time()
     new_records = []
 

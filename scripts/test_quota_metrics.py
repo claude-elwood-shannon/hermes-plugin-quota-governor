@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """test_quota_metrics.py — OBJ-29 (t_a821194b): supply_ratio in metrics-history.
 
 Covers (fixtures only, no network, no real kanban.db):
@@ -54,7 +53,7 @@ def _mk_db(path, events):
 
 
 class SupplyCounts(unittest.TestCase):
-    def test_counts_window_and_excludes_outside(self: Any) -> Any:
+    def test_counts_window_and_excludes_outside(self):
         now = 1_000_000_000
         evs = [("created", now - 3600), ("created", now - 100),
                ("completed", now - 60), ("created", now - 90000)]  # fuera
@@ -64,7 +63,7 @@ class SupplyCounts(unittest.TestCase):
             created, closed = qm.supply_counts(now_epoch=now, db_path=db)
         self.assertEqual((created, closed), (2, 1))
 
-    def test_archived_not_counted_as_closed(self: Any) -> Any:
+    def test_archived_not_counted_as_closed(self):
         now = 1_000_000_000
         evs = [("completed", now - 500), ("archived", now - 400),
                ("archived", now - 300)]
@@ -74,7 +73,7 @@ class SupplyCounts(unittest.TestCase):
             created, closed = qm.supply_counts(now_epoch=now, db_path=db)
         self.assertEqual((created, closed), (0, 1))
 
-    def test_empty_db_zero_zero(self: Any) -> Any:
+    def test_empty_db_zero_zero(self):
         with tempfile.TemporaryDirectory() as td:
             db = str(Path(td) / "k.db")
             _mk_db(db, [])
@@ -82,7 +81,7 @@ class SupplyCounts(unittest.TestCase):
                                                db_path=db)
         self.assertEqual((created, closed), (0, 0))
 
-    def test_default_now_uses_time_time(self: Any) -> Any:
+    def test_default_now_uses_time_time(self):
         # default now_epoch is time.time(): a window far in the past -> zeros
         with tempfile.TemporaryDirectory() as td:
             db = str(Path(td) / "k.db")
@@ -92,26 +91,26 @@ class SupplyCounts(unittest.TestCase):
 
 
 class SupplyRatio(unittest.TestCase):
-    def test_normal(self: Any) -> Any:
+    def test_normal(self):
         self.assertEqual(qm.supply_ratio(26, 23), 1.130)
 
-    def test_none_when_zero_closed(self: Any) -> Any:
+    def test_none_when_zero_closed(self):
         self.assertIsNone(qm.supply_ratio(5, 0))
 
-    def test_none_when_negative_closed(self: Any) -> Any:
+    def test_none_when_negative_closed(self):
         self.assertIsNone(qm.supply_ratio(5, -1))
 
-    def test_none_when_closed_none(self: Any) -> Any:
+    def test_none_when_closed_none(self):
         self.assertIsNone(qm.supply_ratio(5, None))
 
-    def test_exact_one(self: Any) -> Any:
+    def test_exact_one(self):
         self.assertEqual(qm.supply_ratio(3, 3), 1.0)
 
 
 class MainRow(unittest.TestCase):
     """main() with a monkeypatched KANBAN_DB: fixture board + events."""
 
-    def setUp(self: Any) -> Any:
+    def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         db = str(Path(self.td.name) / "kanban.db")
         con = sqlite3.connect(db)
@@ -144,14 +143,14 @@ class MainRow(unittest.TestCase):
         qm.LAST_GOOD_DIR.mkdir()
         qm.NANOGPT_LEDGER = str(Path(self.td.name) / "missing-ledger.py")
 
-    def tearDown(self: Any) -> Any:
+    def tearDown(self):
         qm.KANBAN_DB = self._orig_db
         qm.OUT = self._orig_out
         qm.LAST_GOOD_DIR = self._orig_lg
         qm.NANOGPT_LEDGER = self._orig_ledger
         self.td.cleanup()
 
-    def test_row_contains_supply_fields(self: Any) -> Any:
+    def test_row_contains_supply_fields(self):
         rc = qm.main()
         self.assertEqual(rc, 0)
         row = json.loads(qm.OUT.read_text().splitlines()[0])
@@ -165,7 +164,7 @@ class MainRow(unittest.TestCase):
         self.assertEqual(row["running"], 2)
         self.assertEqual(row["providers_ok"], 0)
 
-    def test_row_degrades_to_none_on_bad_events_db(self: Any) -> Any:
+    def test_row_degrades_to_none_on_bad_events_db(self):
         # events table missing -> supply fields None, row still written
         con = sqlite3.connect(self.db)
         con.execute("DROP TABLE task_events")
@@ -179,7 +178,7 @@ class MainRow(unittest.TestCase):
         self.assertIsNone(row["supply_ratio"])
         self.assertIn("running", row)  # the rest of the row survives
 
-    def test_consecutive_appends(self: Any) -> Any:
+    def test_consecutive_appends(self):
         qm.main()
         qm.main()
         lines = qm.OUT.read_text().splitlines()
@@ -196,13 +195,13 @@ class SchemaEvolution(unittest.TestCase):
                "nanogpt_weekly_pct": 100.0, "opencode_weekly_pct": 100.0,
                "providers_ok": 3}
 
-    def test_old_row_without_supply_fields_still_valid(self: Any) -> Any:
+    def test_old_row_without_supply_fields_still_valid(self):
         # forecast reader pattern: json.loads + dict.get
         d = json.loads(json.dumps(self.OLD_ROW))
         self.assertIsNone(d.get("supply_ratio"))
         self.assertEqual(d["providers_ok"], 3)
 
-    def test_new_row_superset_of_old_keys(self: Any) -> Any:
+    def test_new_row_superset_of_old_keys(self):
         now = 1_000_000_000
         with tempfile.TemporaryDirectory() as td:
             db = str(Path(td) / "k.db")

@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """tick-cola-viva.py — OBJ-30b-IMPL: mecanismo cola viva (constitucion del vuelo, clausula 3).
 
 The constitution of flight (t_cfe8060b, ratified 3x by the user) says: with
@@ -552,7 +551,7 @@ def run(hermes_home=None, execute: bool = False, now=None,
 
     decisions: list[str] = []
 
-    def act(entry: dict, msg: str) -> Any:
+    def act(entry: dict, msg: str):
         _log(ledger, entry)
         decisions.append(msg if execute else f"DRY: {msg}")
 

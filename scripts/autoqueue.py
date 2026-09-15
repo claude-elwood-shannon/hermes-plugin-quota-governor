@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from typing import Any
 """autoqueue.py — OBJ-44: deterministic seed queue consumption.
 
 Reads a seed queue (default `~/.hermes/data/autoqueue.md`) and converts, at

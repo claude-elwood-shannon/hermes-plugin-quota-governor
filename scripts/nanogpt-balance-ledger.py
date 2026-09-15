@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-from typing import Any
-"""nanogpt-balance-ledger.py - OBJ-26: balance USD ledger + budget state for
+"""nanogpt-balance-ledger.py — OBJ-26: balance USD ledger + budget state for
 the pr-nanogpt provider (NanoGPT).
 
 WHAT IT DOES
@@ -31,7 +30,7 @@ subscription period start, falling back to ISO-week):
     window_start, spent_usd (sum of observed balance drops), max_spend_usd
 
 FRAUD/NOISE GUARD: a balance *increase* (top-up) resets ``spent_usd`` to 0
-but the LEDGER keeps the raw history - reconciliation stays possible.
+but the LEDGER keeps the raw history — reconciliation stays possible.
 A balance drop LARGER than ``max_spend_usd`` cannot be autonomous spend
 (manual spend elsewhere, refund reversal); it is recorded, and the window
 is re-baselined (spent_usd=0 from that point) with a ``rebaseline`` row so
@@ -45,7 +44,7 @@ Gate integration (see quota-gate.py ``nanogpt_budget_context``):
         "request_covered_usd": 0.0,   # OBJ-26a: per-request capture sums
         "request_balance_usd": 0.03,  # (separate from probe-derived spend)
         "level": "ok" | "warn" | "stop",
-        "covered_model_count": 292,   # MEDIATOR t_4fa0a4b5: count only -
+        "covered_model_count": 292,   # MEDIATOR t_4fa0a4b5: count only —
                                       # the raw list left the snapshot
                                       # (data_inspection 400, see below)
         "coverage_unknown": false,
@@ -53,11 +52,11 @@ Gate integration (see quota-gate.py ``nanogpt_budget_context``):
     }
 
 LEVEL RULES (covered-first budget):
-    stop  - spent >= max_spend  → gate drops balance-only models from the
+    stop  — spent >= max_spend  → gate drops balance-only models from the
             candidate set (subscription stays; NanoGPT never fully dies).
-    warn  - spent >= warn_fraction * max (default 50%) → warning string,
+    warn  — spent >= warn_fraction * max (default 50%) → warning string,
             routing continues.
-    ok    - anything below.
+    ok    — anything below.
 
 This module NEVER raises into the gate: every public helper returns
 fallback values on any error.
@@ -90,23 +89,21 @@ DEFAULT_WARN_FRACTION = 0.5
 _LAST_PROBE = {"ts": 0.0, "data": None}
 
 
-def state_dir(hermes_home: str | None = None) -> str:
-    """Return state directory."""
+def state_dir(hermes_home=None):
     base = hermes_home or os.environ.get("HERMES_HOME", HERMES_HOME_DEFAULT)
     return os.environ.get("QUOTA_GOVERNOR_DIR",
                           os.path.join(base, "quota-governor"))
 
 
-def ledger_path(hermes_home: str | None = None) -> str:
-    """Return ledger file path.""
+def ledger_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "nanogpt-balance-ledger.jsonl")
 
 
-def cache_path(hermes_home: Any = None) -> Any:
+def cache_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "nanogpt-balance-last-good.json")
 
 
-def budget_path(hermes_home: Any = None) -> Any:
+def budget_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "nanogpt-budget-state.json")
 
 
@@ -131,7 +128,7 @@ def _env_key():
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers (providers reject Tor/proxy - same convention as quota-gate)
+# HTTP helpers (providers reject Tor/proxy — same convention as quota-gate)
 # ---------------------------------------------------------------------------
 
 def _no_proxy():
@@ -174,7 +171,7 @@ def _post(url, key, payload=None):
 # Probe + cache
 # ---------------------------------------------------------------------------
 
-def fetch_snapshot(key: Any = None, force: Any = False) -> Any:
+def fetch_snapshot(key=None, force=False):
     """Exact probe of balance + subscription state. Cached 60 s.
 
     Returns dict:
@@ -233,7 +230,7 @@ def _write_cache(data):
         pass
 
 
-def read_cache(hermes_home: Any = None) -> Any:
+def read_cache(hermes_home=None):
     try:
         with open(cache_path(hermes_home), encoding="utf-8") as fh:
             return json.load(fh)
@@ -245,7 +242,7 @@ def read_cache(hermes_home: Any = None) -> Any:
 # Covered-model set (exact list from the provider)
 # ---------------------------------------------------------------------------
 
-def fetch_covered_models(key: Any = None, ttl_s: Any = 3600.0) -> Any:
+def fetch_covered_models(key=None, ttl_s=3600.0):
     """Set of subscription-covered model ids (exact API list).
 
     Cached on disk for an hour. Returns (set_or_None, err_or_None); the set
@@ -282,12 +279,12 @@ def fetch_covered_models(key: Any = None, ttl_s: Any = 3600.0) -> Any:
         return None, str(exc)
 
 
-def is_covered(model: Any, covered_set: Any) -> Any:
+def is_covered(model, covered_set):
     """Exact match, else bare-segment match (zai-org/glm-5.2 ~ z-ai/glm-5.2).
 
-    # Verified live 2026-09-08: covered list has z-ai/glm-5.2 but NOT
-    # zai-org/glm-5.2 (the profile's interactive model) - bare-segment match
-    # is required; qwen3.5-4b matches nothing (correctly NOT covered).
+    Verified live 2026-09-08: covered list has z-ai/glm-5.2 but NOT
+    zai-org/glm-5.2 (the profile's interactive model) — bare-segment match
+    is required; qwen3.5-4b matches nothing (correctly NOT covered).
     """
     if not model or not covered_set:
         return False
@@ -301,7 +298,7 @@ def is_covered(model: Any, covered_set: Any) -> Any:
 # Ledger + weekly budget window
 # ---------------------------------------------------------------------------
 
-def append_ledger(row: Any, hermes_home: Any = None) -> Any:
+def append_ledger(row, hermes_home=None):
     try:
         os.makedirs(os.path.dirname(ledger_path(hermes_home)), exist_ok=True)
         with open(ledger_path(hermes_home), "a", encoding="utf-8") as fh:
@@ -327,14 +324,14 @@ def _save_budget(path, state):
         pass
 
 
-def week_start(now: Any = None) -> Any:
-    """ISO-week Monday 00:00 UTC - fallback budget window anchor."""
+def week_start(now=None):
+    """ISO-week Monday 00:00 UTC — fallback budget window anchor."""
     now = now or dt.datetime.now(dt.timezone.utc)
     monday = now - dt.timedelta(days=now.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def window_start_from_period(period_end_str: Any, now: Any = None) -> Any:
+def window_start_from_period(period_end_str, now=None):
     """Subscription period start = currentPeriodEnd - 7 days.
 
     The budget window follows the subscription period when known (the plan
@@ -354,7 +351,8 @@ def window_start_from_period(period_end_str: Any, now: Any = None) -> Any:
     return week_start(now)
 
 
-def update_budget(snapshot: Any, max_spend_usd: Any = None, warn_fraction: Any = None, hermes_home: Any = None, now: Any = None) -> Any:
+def update_budget(snapshot, max_spend_usd=None, warn_fraction=None,
+                  hermes_home=None, now=None):
     """Track window spend from observed balance deltas.
 
     window semantics: see module docstring. Returns the budget dict:
@@ -419,14 +417,14 @@ def _parse_dt(s):
 
 # ---------------------------------------------------------------------------
 # Per-request billing fold (OBJ-26a): rows written by the agent's in-process
-# capture (agent/nanogpt_pricing_capture.py) - one line per API request.
+# capture (agent/nanogpt_pricing_capture.py) — one line per API request.
 # ---------------------------------------------------------------------------
 
-def requests_path(hermes_home: Any = None) -> Any:
+def requests_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "nanogpt-requests.jsonl")
 
 
-def append_request_row(row: Any, hermes_home: Any = None) -> Any:
+def append_request_row(row, hermes_home=None):
     """Append one per-request billing row (costUsd>0 drains balance; =0 covered)."""
     try:
         os.makedirs(os.path.dirname(requests_path(hermes_home)), exist_ok=True)
@@ -459,12 +457,12 @@ def _budget_window_start(hermes_home=None):
     return window_start_from_period(cached.get("period_end"))
 
 
-def request_window_totals(since: Any = None, hermes_home: Any = None) -> Any:
+def request_window_totals(since=None, hermes_home=None):
     """Window accumulators from per-request rows: covered_usd, balance_usd,
     plus request counts. Rows outside the window (ts < since or before the
     budget window anchor) are excluded. Never raises.
 
-    NOTE: costs are NanoGPT-scale (1e-06 USD/request) - accumulators are
+    NOTE: costs are NanoGPT-scale (1e-06 USD/request) — accumulators are
     rounded to 12 decimals, never 6 (6 dp would collapse real micro-spend).
     """
     try:
@@ -486,7 +484,7 @@ def request_window_totals(since: Any = None, hermes_home: Any = None) -> Any:
             try:
                 cost = float(raw_cost)
             except (TypeError, ValueError):
-                # Unparseable cost: can't tell covered from balance - skip the
+                # Unparseable cost: can't tell covered from balance — skip the
                 # row entirely instead of miscounting it as covered.
                 continue
             if cost <= 0:
@@ -520,12 +518,12 @@ def request_window_totals(since: Any = None, hermes_home: Any = None) -> Any:
 # Observers (the tick's request-window fields) must therefore merge every
 # profile home, not just their own. ~/.hermes itself is included: processes
 # with no HERMES_HOME (bare crons, subprocesses without profile env) write
-# there. Entries are HERMES_HOME-style roots - state_dir() resolves
+# there. Entries are HERMES_HOME-style roots — state_dir() resolves
 # <entry>/quota-governor under the hood, same convention as the rest of the
 # module. New profiles require a deploy of any ledger copy anyway, which
 # updates this list.
 # QUOTA_GOVERNOR_PROFILE_HOMES (os.pathsep-separated HERMES roots) overrides
-# the list - used by tests and hosts with non-standard profile names.
+# the list — used by tests and hosts with non-standard profile names.
 _DEFAULT_PROFILE_HOMES = (
     HERMES_HOME_DEFAULT,
 ) + tuple(
@@ -542,12 +540,12 @@ def _profile_homes():
     return homes or _DEFAULT_PROFILE_HOMES
 
 
-def request_window_totals_all_homes(since: Any = None, hermes_home: Any = None) -> Any:
+def request_window_totals_all_homes(since=None, hermes_home=None):
     """Merge request_window_totals() across every profile home.
 
     Rows are written under the CAPTURING process's HERMES_HOME (pr-nanogpt
     workers for now), while observers like quota-governor-tick run under
-    pr-ollama - a single-home read would undercount to zero. Duplicates are
+    pr-ollama — a single-home read would undercount to zero. Duplicates are
     impossible (capture dedupes by requestId within one process and each
     home is read exactly once). Merged accumulators are sums in NanoGPT
     scale (1e-06 USD/request), rounded to 12 decimals like the single-home
@@ -566,14 +564,14 @@ def request_window_totals_all_homes(since: Any = None, hermes_home: Any = None) 
     window_start = None
     try:
         for home in homes:
-            # A missing requests file means the home has no capture data -
+            # A missing requests file means the home has no capture data —
             # not an error, but not a "read" either (homes_read stays honest
             # for observability).
             if not os.path.isfile(requests_path(hermes_home=home)):
                 continue
             totals = request_window_totals(since=since, hermes_home=home)
             if totals is None:
-                continue  # unreadable home - fail-open per home
+                continue  # unreadable home — fail-open per home
             merged["homes_read"] += 1
             for key in ("request_covered_usd", "request_balance_usd",
                         "requests", "balance_requests", "covered_requests"):
@@ -592,7 +590,7 @@ def request_window_totals_all_homes(since: Any = None, hermes_home: Any = None) 
         return None
 
 
-def budget_context(max_spend_usd: Any = None, warn_fraction: Any = None, hermes_home: Any = None) -> Any:
+def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
     """One call for quota-gate.py. Never raises; degrades gracefully.
 
     Returns (context_dict_or_None, warning_string_or_None).
@@ -663,7 +661,7 @@ def budget_context(max_spend_usd: Any = None, warn_fraction: Any = None, hermes_
                        f"weekly balance budget spent (>= {int(warn_frac*100)}%)")
         elif level == "stop":
             warning = (f"nanogpt budget EXHAUSTED: ${spent:.2f} >= "
-                       f"${max_spend:.2f} weekly balance budget - "
+                       f"${max_spend:.2f} weekly balance budget — "
                        f"balance-only models dropped, subscription models "
                        f"still routed")
         if cov_err and covered is None:
@@ -678,7 +676,7 @@ def budget_context(max_spend_usd: Any = None, warn_fraction: Any = None, hermes_
 # CLI (manual reconciliation)
 # ---------------------------------------------------------------------------
 
-def main(argv: Any = None) -> Any:
+def main(argv=None):
     import argparse
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     p.add_argument("cmd", choices=["status", "report", "covered"],

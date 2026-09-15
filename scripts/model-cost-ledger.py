@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from typing import Any
 """model-cost-ledger.py — per-model cost ledger for OpenCode Go 5h windows
 (MULTI-PROV-09, t_5bdd7cfa).
 
@@ -101,21 +100,21 @@ import time
 HERMES_HOME_DEFAULT = os.path.expanduser("~/.hermes")
 
 
-def state_dir(hermes_home: Any = None) -> Any:
+def state_dir(hermes_home=None):
     base = hermes_home or HERMES_HOME_DEFAULT
     return os.environ.get("QUOTA_GOVERNOR_DIR",
                           os.path.join(base, "quota-governor"))
 
 
-def ledger_path(hermes_home: Any = None) -> Any:
+def ledger_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "model-cost-ledger.jsonl")
 
 
-def cursor_path(hermes_home: Any = None) -> Any:
+def cursor_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "model-cost-ledger.cursor.json")
 
 
-def config_path(hermes_home: Any = None) -> Any:
+def config_path(hermes_home=None):
     return os.path.join(state_dir(hermes_home), "model-cost.json")
 
 
@@ -145,7 +144,7 @@ MODEL_PRICES = {
 PEAK_AFFECTED = {"deepseek-v4-flash"}  # x2 mono-fr 01-04 & 06-10 UTC
 
 
-def load_config(hermes_home: Any = None) -> Any:
+def load_config(hermes_home=None):
     cfg = {
         "prices": MODEL_PRICES,
         "window_usd": DEFAULT_WINDOW_BUDGET_USD,
@@ -170,14 +169,15 @@ def load_config(hermes_home: Any = None) -> Any:
     return cfg
 
 
-def is_peak(utc_dt: Any) -> Any:
+def is_peak(utc_dt):
     """Peak pricing hours (mirrors quota-gate.py MULTI-PROV-07)."""
     if utc_dt.weekday() >= 5:
         return False
     return (1 <= utc_dt.hour < 4) or (6 <= utc_dt.hour < 10)
 
 
-def estimate_cost(model: Any, input_tokens: Any, output_tokens: Any, cache_read: Any, reasoning_tokens: Any = 0, at_ts: Any = None, prices: Any = None) -> Any:
+def estimate_cost(model, input_tokens, output_tokens, cache_read,
+                  reasoning_tokens=0, at_ts=None, prices=None):
     """USD estimate for one usage delta (see ESTIMATION RULE above)."""
     prices = prices if prices is not None else MODEL_PRICES
     p = prices.get(model)
@@ -196,7 +196,7 @@ def estimate_cost(model: Any, input_tokens: Any, output_tokens: Any, cache_read:
 # Window anchoring
 # ---------------------------------------------------------------------------
 
-def iso_to_epoch(s: Any) -> Any:
+def iso_to_epoch(s):
     """ISO timestamp (possibly Z-suffixed) or epoch number -> epoch seconds.
 
     state.db stores last_seen as ISO strings in Hermes but numeric epoch in
@@ -213,7 +213,7 @@ def iso_to_epoch(s: Any) -> Any:
         return None
 
 
-def anchor_from_resets_at(s: Any, now: Any = None) -> Any:
+def anchor_from_resets_at(s, now=None):
     """Window anchor (= resetsAt - 5h) from rolling.resetsAt. None if untrustworthy.
 
     resetsAt is ALWAYS the END of the current rolling window — both while
@@ -235,7 +235,7 @@ def anchor_from_resets_at(s: Any, now: Any = None) -> Any:
     return reset - WINDOW_SECONDS
 
 
-def window_key(ts_epoch: Any, anchor: Any = None) -> Any:
+def window_key(ts_epoch, anchor=None):
     """Deterministic ISO start-of-window for an event timestamp (UTC).
 
     With anchor: windows are [anchor + k*5h).  Without anchor: 5h floors
@@ -254,7 +254,7 @@ def window_key(ts_epoch: Any, anchor: Any = None) -> Any:
 # State-DB scan
 # ---------------------------------------------------------------------------
 
-def scan_opencode_go_usage(hermes_home: Any = None) -> Any:
+def scan_opencode_go_usage(hermes_home=None):
     """List of session_model_usage rows (dicts) with provider opencode-go,
     scanned read-only from every profile state.db.  Never raises."""
     base = hermes_home or HERMES_HOME_DEFAULT
@@ -311,7 +311,7 @@ def _save_json(path, data):
     os.replace(tmp, path)
 
 
-def sync_ledger(hermes_home: Any = None, now: Any = None) -> Any:
+def sync_ledger(hermes_home=None, now=None):
     """Append usage DELTAS since the cursor to the ledger.
 
     Returns number of rows appended (0 = nothing new — cron-silent safe).
@@ -411,7 +411,7 @@ def sync_ledger(hermes_home: Any = None, now: Any = None) -> Any:
 # Anchor resolution (best-effort, never raises)
 # ---------------------------------------------------------------------------
 
-def resolve_anchor(hermes_home: Any = None, now: Any = None) -> Any:
+def resolve_anchor(hermes_home=None, now=None):
     """(anchor, source) for window bucketing.
 
     Tries the live usage endpoint via quota-gate's query helper (same dir);
@@ -456,7 +456,7 @@ def resolve_anchor(hermes_home: Any = None, now: Any = None) -> Any:
 # Summaries / warnings (consumed by report CLI and quota-gate.py)
 # ---------------------------------------------------------------------------
 
-def load_ledger(hermes_home: Any = None) -> Any:
+def load_ledger(hermes_home=None):
     rows = []
     try:
         with open(ledger_path(hermes_home), "r", encoding="utf-8") as fh:
@@ -472,7 +472,7 @@ def load_ledger(hermes_home: Any = None) -> Any:
     return rows
 
 
-def summarize(rows: Any, hermes_home: Any = None, now: Any = None) -> Any:
+def summarize(rows, hermes_home=None, now=None):
     """{window: {model: {cost_usd, requests, tokens_in/out/cache, profiles}}}."""
     cfg = load_config(hermes_home)
     out = {}
@@ -498,7 +498,7 @@ def summarize(rows: Any, hermes_home: Any = None, now: Any = None) -> Any:
     return out, cfg
 
 
-def model_window_warnings(hermes_home: Any = None, now: Any = None, reset_at: Any = None) -> Any:
+def model_window_warnings(hermes_home=None, now=None, reset_at=None):
     """Warning strings for any model > warn_fraction of the current window.
 
     Used by quota-gate.py per tick.  reset_at: the live rolling_resets_at
@@ -530,7 +530,7 @@ def model_window_warnings(hermes_home: Any = None, now: Any = None, reset_at: An
         return []
 
 
-def current_window_shares(hermes_home: Any = None, now: Any = None, reset_at: Any = None) -> Any:
+def current_window_shares(hermes_home=None, now=None, reset_at=None):
     """{window, budget, per-model shares} for the gate context. {} on error."""
     try:
         now = now if now is not None else time.time()
@@ -556,7 +556,7 @@ def current_window_shares(hermes_home: Any = None, now: Any = None, reset_at: An
         return {}
 
 
-def sync_model_cost_ledger_if_due(hermes_home: Any = None, now: Any = None) -> Any:
+def sync_model_cost_ledger_if_due(hermes_home=None, now=None):
     """Opportunistic sync for the gate: at most one sync per SYNC_MIN_INTERVAL.
 
     Returns rows appended (0 when skipped/not-due/error).  Never raises.
@@ -583,7 +583,7 @@ def sync_model_cost_ledger_if_due(hermes_home: Any = None, now: Any = None) -> A
 # CLI
 # ---------------------------------------------------------------------------
 
-def cmd_report(as_json: Any = False, since_hours: Any = None, hermes_home: Any = None) -> Any:
+def cmd_report(as_json=False, since_hours=None, hermes_home=None):
     rows = load_ledger(hermes_home)
     now = time.time()
     anchor, src = resolve_anchor(hermes_home, now)
@@ -632,7 +632,7 @@ def cmd_report(as_json: Any = False, since_hours: Any = None, hermes_home: Any =
     return result
 
 
-def main(argv: Any = None) -> Any:
+def main(argv=None):
     ap = argparse.ArgumentParser(description="OpenCode Go per-model cost ledger")
     ap.add_argument("command", choices=["sync", "report"])
     ap.add_argument("--json", action="store_true", help="machine-readable report")

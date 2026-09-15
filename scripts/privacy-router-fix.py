@@ -239,7 +239,7 @@ def reassign_task(task_id: str, correct_profile: str) -> bool:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> Any:
+def main():
     parser = argparse.ArgumentParser(
         description="Deterministic privacy routing enforcement."
     )

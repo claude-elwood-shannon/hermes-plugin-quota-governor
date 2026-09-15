@@ -1048,7 +1048,7 @@ def propose_objective(
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
-def main() -> Any:
+def main():
     global VERBOSE
 
     parser = argparse.ArgumentParser(

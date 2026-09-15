@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """triage-bridge.py — OBJ-21: deterministic triage->todo bridge (no LLM).
 
 Promotes kanban tasks sitting in `triage` to `todo` WITHOUT any LLM call,
@@ -85,7 +84,7 @@ def header_of(body: str) -> str:
     return "\n".join(lines)
 
 
-def parse_tags(body: str) -> Any:
+def parse_tags(body: str):
     """Extract (objective_id, cost_value) from the header only. None if absent."""
     h = header_of(body)
     m_obj = OBJECTIVE_RE.search(h)
@@ -99,7 +98,7 @@ def has_approval_gate(title: str, body: str) -> bool:
     return bool(APPROVAL_GATE_RE.search(gate_text))
 
 
-def evaluate(title: str, body: str) -> Any:
+def evaluate(title: str, body: str):
     """Return (promotable: bool, reason: str) for one triage task."""
     obj, cost = parse_tags(body)
     if not obj:
@@ -139,7 +138,7 @@ def log(entry: dict, dry: bool = False) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def fetch_triage(db_path: Any = KANBAN_DB) -> Any:
+def fetch_triage(db_path=KANBAN_DB):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         return conn.execute(
@@ -183,12 +182,12 @@ def human_gate_pending(db_path, task_id: str) -> bool:
         return False
 
 
-def run(db_path: Any = KANBAN_DB, execute: bool = False, now: str | None = None) -> Any:
+def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
     """Core loop. Returns list of decision entries (for tests and reporting)."""
     now = now or datetime.now(timezone.utc).isoformat()
     decisions: list[dict] = []
 
-    def decide(entry: Any) -> Any:
+    def decide(entry):
         decisions.append(entry)
         log(entry, dry=not execute)
 
@@ -236,7 +235,7 @@ def run(db_path: Any = KANBAN_DB, execute: bool = False, now: str | None = None)
     return decisions
 
 
-def main(argv: Any) -> Any:
+def main(argv):
     execute = "--execute" in argv
     db = Path(os.environ.get("TRIAGE_BRIDGE_DB", str(KANBAN_DB)))
     run(db_path=db, execute=execute)

@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """ttl_blocked.py — P1: TTL agresivo de tareas blocked con autorremediación.
 
 Promesa (13-sep, user-approved): ninguna tarea permanece en blocked más de

@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """budget_check.py — FASE 3 del sistema predictivo de cuota (OBJ-24).
 
 Cruza, para cada tarea elegible (ready/todo/triage con assignee válido),
@@ -112,7 +111,7 @@ def _nanogpt_subscription_free():
 
 # ── Helpers de estado ─────────────────────────────────────────────────────────
 
-def load_forecast() -> Any:
+def load_forecast():
     """forecast.json del F2 (ruta del perfil activo). {} si falta."""
     path = STATE_DIR / "forecast.json"
     try:
@@ -122,7 +121,7 @@ def load_forecast() -> Any:
         return {}
 
 
-def provider_free_pct(forecast: Any, profile: Any) -> Any:
+def provider_free_pct(forecast, profile):
     """Cuota libre % del provider asignado, según forecast F2.
 
     free = 100 - pct_now. Provider ausente -> None (no veto).
@@ -139,7 +138,7 @@ def provider_free_pct(forecast: Any, profile: Any) -> Any:
         return None
 
 
-def eta90_hours(forecast: Any, profile: Any) -> Any:
+def eta90_hours(forecast, profile):
     f = (forecast.get("providers") or {}).get(profile)
     if not isinstance(f, dict):
         return None
@@ -152,7 +151,7 @@ def eta90_hours(forecast: Any, profile: Any) -> Any:
         return None
 
 
-def parse_cost_tag(body: Any) -> Any:
+def parse_cost_tag(body):
     """cost:<clase> del header del body. None si no lleva."""
     if not body:
         return None
@@ -166,7 +165,7 @@ def parse_cost_tag(body: Any) -> Any:
     return None
 
 
-def pick_alternative(forecast: Any, exclude_profile: Any) -> Any:
+def pick_alternative(forecast, exclude_profile):
     """Provider con más holgura (mayor cuota libre), excluyendo el actual."""
     best, best_free = None, -1.0
     for profile in (forecast.get("providers") or {}):
@@ -182,7 +181,8 @@ def pick_alternative(forecast: Any, exclude_profile: Any) -> Any:
 
 # ── Núcleo ────────────────────────────────────────────────────────────────────
 
-def evaluate(db_path: Any = KANBAN_DB, forecast: Any = None, enforce: Any = False, dry_run: Any = True) -> Any:
+def evaluate(db_path=KANBAN_DB, forecast=None, enforce=False,
+             dry_run=True):
     """Evalúa el presupuesto de cada tarea elegible.
 
     Devuelve lista de decisiones:
@@ -279,7 +279,7 @@ def _to_triage(task_id, reason):
         pass
 
 
-def main() -> Any:
+def main():
     ap = argparse.ArgumentParser(description="OBJ-24 F3 budget check")
     ap.add_argument("--enforce", action="store_true",
                     help="aplica las decisiones (veto real; default: log)")

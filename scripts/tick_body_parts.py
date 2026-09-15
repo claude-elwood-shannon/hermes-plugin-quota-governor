@@ -1,5 +1,4 @@
 #!/usr/bin/python3.12
-from typing import Any
 """tick_body_parts.py — OBJ-39-REBELION: the body is the program, the tick
 is the interpreter.
 
