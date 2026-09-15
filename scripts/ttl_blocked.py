@@ -386,11 +386,202 @@ def _apply_override_and_unblock(db_path: Path, task_id: str, old: str) -> tuple[
     return True, ""
 
 
+def _skip_human_gate(title: str, body: str, task_id: str,
+                     minutes: int) -> TtlResult | None:
+    """Exclusión [human-gate]: el TTL nunca actúa sobre esa tarea."""
+    if not has_human_gate(title, body):
+        return None
+    return TtlResult("skip-human-gate", task_id,
+                     f"{minutes}m — puerta humana explícita, TTL no actúa")
+
+
+def _classify_early(db_path: Path, task_id: str, age_s: float,
+                    minutes: int) -> TtlResult | None:
+    """Ventana 0-5m: solo clasificación — salvo crash loop (no espera a 5m)."""
+    if age_s >= TTL_CLASSIFY_S:
+        return None
+    errors = gave_up_history(db_path, task_id)
+    if not any(sum(1 for x in errors if x == e) >= CRASH_LOOP_MIN
+               for e in errors):
+        return TtlResult("classify", task_id,
+                         f"{minutes}m — ventana 0-5m, solo clasificación")
+    return None
+
+
+def _crash_loop_triage(db_path: Path, task_id: str, minutes: int,
+                       execute: bool, dry) -> TtlResult | None:
+    """R4: crash loop (gave_up >=3 con el mismo error) -> triage directo."""
+    errors = gave_up_history(db_path, task_id)
+    loop = None
+    for e in errors:
+        if sum(1 for x in errors if x == e) >= CRASH_LOOP_MIN:
+            loop = e
+            break
+    if not loop:
+        return None
+    why = f"crash loop {CRASH_LOOP_MIN}x con el mismo error"
+    if execute:
+        done, err = _route_to_triage(task_id, triage_comment(
+            minutes, "permanente", (loop or "")[:120],
+            "no", "crash loop no es autorremediable",
+            why + f": {(loop or '')[:160]}"), db_path)
+        if done:
+            return TtlResult("triaged", task_id, f"{minutes}m — {why}")
+        return TtlResult("retrying", task_id,
+                         f"{minutes}m — {why} | ruta a triage: {err}")
+    return dry("triage", why)
+
+
+def _r6_escalation_triage(db_path: Path, task_id: str, reason: str,
+                          model_override: str, minutes: int, execute: bool,
+                          dry) -> TtlResult | None:
+    """R6(a): re-bloqueo con la MISMA causa tras remediación ok -> triage."""
+    esc = r6_escalation(db_path, task_id, reason or model_override)
+    if not esc:
+        return None
+    if execute:
+        done, err = _route_to_triage(task_id, triage_comment(
+            minutes, "permanente", (reason or model_override or "")[:120],
+            "R1-R3", "sin efecto persistente sobre la causa",
+            f"retry loop: {esc}"), db_path)
+        if done:
+            return TtlResult("triaged", task_id, f"{minutes}m — retry loop: {esc}")
+        return TtlResult("retrying", task_id,
+                         f"{minutes}m — retry loop: {esc} | ruta a triage: {err}")
+    return dry("triage", f"retry loop: {esc}")
+
+
+def _pending_remedies(db_path: Path, task_id: str, reason: str,
+                      model_override: str, provider: str) -> tuple[list[str], list[str]]:
+    """Remedios deterministas pendientes (R1-R3) en orden R2->R1->R3."""
+    pending: list[str] = []
+    if model_override and not valid_override_for(provider, model_override,
+                                                 DEFAULT_OFFER):
+        pending.append("R2")
+    if reason and SELF_GENERABLE_RE.search(reason):
+        pending.append("R1")
+    deps = dependency_ids(db_path, task_id)
+    resolved = [d for d in deps if parent_status(db_path, d) == "done"]
+    if deps and len(resolved) == len(deps):
+        pending.append("R3")
+    return pending, deps
+
+
+def _r6_counter_triage(db_path: Path, task_id: str, pending: list[str],
+                       reason: str, model_override: str, minutes: int,
+                       execute: bool, dry) -> TtlResult | None:
+    """R6(b): contador por remedio — la misma R >= 2x pendiente -> triage."""
+    for remedy in pending:
+        attempts = remediation_attempt_count(db_path, task_id, remedy)
+        if attempts < R6_MAX_ATTEMPTS:
+            continue
+        why = (f"retry loop: {remedy} intentada {attempts}x y la tarea sigue "
+               f"blocked con remedio pendiente — escalado a triage")
+        if execute:
+            done, err = _route_to_triage(task_id, triage_comment(
+                minutes, "permanente", (reason or model_override or "")[:120],
+                f"{remedy} x{attempts}", "sin efecto persistente", why), db_path)
+            if done:
+                return TtlResult("triaged", task_id, f"{minutes}m — {why}")
+            return TtlResult("retrying", task_id,
+                             f"{minutes}m — {why} | ruta a triage: {err}")
+        return dry("triage", why)
+    return None
+
+
+def _apply_remediation(db_path: Path, task_id: str, pending: list[str],
+                       reason: str, model_override: str, deps: list[str],
+                       minutes: int, execute: bool, dry) -> TtlResult | None:
+    """Aplica el primer remedio pendiente en orden R2 -> R1 -> R3."""
+    if "R2" in pending:
+        return _remediate_r2(db_path, task_id, reason, model_override,
+                             minutes, execute, dry)
+    if "R1" in pending:
+        return _remediate_r1(db_path, task_id, reason, minutes, execute, dry)
+    if "R3" in pending:
+        return _remediate_r3(db_path, task_id, reason, deps, minutes,
+                             execute, dry)
+    return None
+
+
+def _remediate_r2(db_path: Path, task_id: str, reason: str,
+                  model_override: str, minutes: int, execute: bool,
+                  dry) -> TtlResult:
+    """R2: override envenenado -> set-model al pin del gate + unblock + verify."""
+    if not execute:
+        return dry("remediate",
+                   f"R2 pendiente: set-model deepseek-v4-flash + unblock + verify")
+    ok, err = _apply_override_and_unblock(db_path, task_id, model_override)
+    record_remediation_attempt(db_path, task_id, "R2", reason, ok=ok)
+    if not ok:
+        return TtlResult("failed", task_id,
+                         f"{minutes}m — R2 action-failed: {err}")
+    return TtlResult("remediated", task_id,
+                     f"{minutes}m — R2 override '{model_override}' -> pin gate (verificado)")
+
+
+def _remediate_r1(db_path: Path, task_id: str, reason: str, minutes: int,
+                  execute: bool, dry) -> TtlResult:
+    """R1: campo que el propio sistema podía generar -> unblock limpio."""
+    if not execute:
+        return dry("remediate", f"R1 pendiente: unblock ({reason[:50]})")
+    unp = _cli("unblock", task_id, "--reason",
+               "TTL-BLOCKED R1: campo auto-generable resuelto por el sistema")
+    ok = not _cli_failed(unp)
+    record_remediation_attempt(db_path, task_id, "R1", reason, ok=ok)
+    if ok:
+        _cli("comment", task_id,
+             f"{TRIAGE_MARK} autorremediación R1: '{reason[:80]}' es un campo "
+             f"generable por el sistema -> desbloqueada sin intervención humana")
+    else:
+        return TtlResult("failed", task_id,
+                         f"{minutes}m — R1 action-failed: {_first_err(unp)}")
+    return TtlResult("remediated", task_id, f"{minutes}m — R1 {reason[:60]}")
+
+
+def _remediate_r3(db_path: Path, task_id: str, reason: str, deps: list[str],
+                  minutes: int, execute: bool, dry) -> TtlResult:
+    """R3: dependencia ya resuelta -> unblock como ready."""
+    if not execute:
+        return dry("remediate", f"R3 pendiente: unblock (deps {deps} done)")
+    unp = _cli("unblock", task_id, "--reason", "TTL-BLOCKED R3: dependencia resuelta")
+    ok = not _cli_failed(unp)
+    record_remediation_attempt(db_path, task_id, "R3", reason, ok=ok)
+    if ok:
+        _cli("comment", task_id,
+             f"{TRIAGE_MARK} autorremediación R3: dependencias {deps} ya done -> desbloqueada")
+    else:
+        return TtlResult("failed", task_id,
+                         f"{minutes}m — R3 action-failed: {_first_err(unp)}")
+    return TtlResult("remediated", task_id, f"{minutes}m — R3 deps {deps} done")
+
+
+def _triage_or_classify(db_path: Path, task_id: str, reason: str,
+                        age_s: float, minutes: int, execute: bool,
+                        dry) -> TtlResult:
+    """15-30m+ sin remedio -> triage; resto: clasificada hasta la ventana."""
+    if age_s < TTL_TRIAGE_S:
+        return TtlResult("classify", task_id,
+                         f"{minutes}m — sin reparación determinista aún (ventana 5-15m)")
+    cls = "no-clasificable" if not reason else "permanente"
+    why = "TTL 30m agotado sin resolución ni reparación determinista"
+    if execute:
+        done, err = _route_to_triage(task_id, triage_comment(
+            minutes, cls, (reason or "(sin razon registrada)")[:120],
+            "sí" if age_s >= TTL_REMEDIATE_S else "no",
+            "sin reparación determinista disponible", why), db_path)
+        if done:
+            return TtlResult("triaged", task_id, f"{minutes}m — {cls} -> triage")
+        return TtlResult("retrying", task_id,
+                         f"{minutes}m — {cls} -> triage | ruta: {err}")
+    return dry("triage", f"{cls} -> triage")
+
+
 def process_blocked(db_path: Path, task_id: str, model_override: str,
                     provider: str, body: str, title: str,
                     blocked_at: float, now: float,
                     *, execute: bool, root: Path) -> TtlResult:
-    """Una tarea blocked: clasificar y actuar según la ventana del TTL."""
+    """Orquestador: mide la ventana TTL y despacha a helpers de triage/remedio."""
     age_s = now - blocked_at
     minutes = int(age_s // 60)
     reason = blocked_reason(db_path, task_id)
@@ -399,144 +590,31 @@ def process_blocked(db_path: Path, task_id: str, model_override: str,
     def dry(action: str, detail: str) -> TtlResult:
         return TtlResult(f"dry-{action}", task_id, f"{minutes}m — {detail}")
 
-    # Puerta humana explícita: nunca se toca.
-    if has_human_gate(title, body):
-        return TtlResult("skip-human-gate", task_id,
-                         f"{minutes}m — puerta humana explícita, TTL no actúa")
-
-    if age_s < TTL_CLASSIFY_S:
-        # Ventana 0-5m: solo clasificación — PERO el crash loop es urgente y
-        # determinista: no espera a los 5 min.
-        errors_early = gave_up_history(db_path, task_id)
-        if not any(sum(1 for x in errors_early if x == e) >= CRASH_LOOP_MIN
-                   for e in errors_early):
-            return TtlResult("classify", task_id,
-                             f"{minutes}m — ventana 0-5m, solo clasificación")
-
-    # R4: crash loop — triage directo con historial (no autorremediable).
-    errors = gave_up_history(db_path, task_id)
-    loop = None
-    for e in errors:
-        n = sum(1 for x in errors if x == e)
-        if n >= CRASH_LOOP_MIN:
-            loop = e
-            break
-    if loop:
-        why = f"crash loop {CRASH_LOOP_MIN}x con el mismo error"
-        if execute:
-            done, err = _route_to_triage(task_id, triage_comment(
-                minutes, "permanente", (loop or "")[:120],
-                "no", "crash loop no es autorremediable",
-                why + f": {(loop or '')[:160]}"), db_path)
-            if done:
-                return TtlResult("triaged", task_id, f"{minutes}m — {why}")
-            return TtlResult("retrying", task_id,
-                             f"{minutes}m — {why} | ruta a triage: {err}")
-        return dry("triage", why)
-
-    # ── R6 (leído antes de remediar: solo consultas) ──
-    esc = r6_escalation(db_path, task_id, reason or model_override)
-    if esc:
-        if execute:
-            done, err = _route_to_triage(task_id, triage_comment(
-                minutes, "permanente", (reason or model_override or "")[:120],
-                "R1-R3", "sin efecto persistente sobre la causa",
-                f"retry loop: {esc}"), db_path)
-            if done:
-                return TtlResult("triaged", task_id, f"{minutes}m — retry loop: {esc}")
-            return TtlResult("retrying", task_id,
-                             f"{minutes}m — retry loop: {esc} | ruta a triage: {err}")
-        return dry("triage", f"retry loop: {esc}")
-
-    # ── Autorremediación determinista (desde los 5 min: R1-R3 son seguras) ──
-    pending_remedies = []
-    if model_override and not valid_override_for(provider, model_override, DEFAULT_OFFER):
-        pending_remedies.append("R2")
-    if reason and SELF_GENERABLE_RE.search(reason):
-        pending_remedies.append("R1")
-    deps = dependency_ids(db_path, task_id)
-    resolved = [d for d in deps if parent_status(db_path, d) == "done"]
-    if deps and len(resolved) == len(deps):
-        pending_remedies.append("R3")
-
-    # R6(b): contador por remedio — la misma R >= 2 veces y sigue pendiente.
-    for remedy in pending_remedies:
-        attempts = remediation_attempt_count(db_path, task_id, remedy)
-        if attempts >= R6_MAX_ATTEMPTS:
-            why = (f"retry loop: {remedy} intentada {attempts}x y la tarea sigue "
-                   f"blocked con remedio pendiente — escalado a triage")
-            if execute:
-                done, err = _route_to_triage(task_id, triage_comment(
-                    minutes, "permanente", (reason or model_override or "")[:120],
-                    f"{remedy} x{attempts}", "sin efecto persistente", why), db_path)
-                if done:
-                    return TtlResult("triaged", task_id, f"{minutes}m — {why}")
-                return TtlResult("retrying", task_id,
-                                 f"{minutes}m — {why} | ruta a triage: {err}")
-            return dry("triage", why)
-
-    # R2: override envenenado — con verificación de persistencia.
-    if "R2" in pending_remedies:
-        if not execute:
-            return dry("remediate",
-                       f"R2 pendiente: set-model deepseek-v4-flash + unblock + verify")
-        ok, err = _apply_override_and_unblock(db_path, task_id, model_override)
-        record_remediation_attempt(db_path, task_id, "R2", reason, ok=ok)
-        if not ok:
-            return TtlResult("failed", task_id,
-                             f"{minutes}m — R2 action-failed: {err}")
-        return TtlResult("remediated", task_id,
-                         f"{minutes}m — R2 override '{model_override}' -> pin gate (verificado)")
-
-    # R1: campo que el propio sistema podía generar.
-    if "R1" in pending_remedies:
-        if not execute:
-            return dry("remediate", f"R1 pendiente: unblock ({reason[:50]})")
-        unp = _cli("unblock", task_id, "--reason",
-                   "TTL-BLOCKED R1: campo auto-generable resuelto por el sistema")
-        ok = not _cli_failed(unp)
-        record_remediation_attempt(db_path, task_id, "R1", reason, ok=ok)
-        if ok:
-            _cli("comment", task_id,
-                 f"{TRIAGE_MARK} autorremediación R1: '{reason[:80]}' es un campo "
-                 f"generable por el sistema -> desbloqueada sin intervención humana")
-        else:
-            return TtlResult("failed", task_id,
-                             f"{minutes}m — R1 action-failed: {_first_err(unp)}")
-        return TtlResult("remediated", task_id, f"{minutes}m — R1 {reason[:60]}")
-
-    # R3: dependencia ya resuelta.
-    if "R3" in pending_remedies:
-        if not execute:
-            return dry("remediate", f"R3 pendiente: unblock (deps {deps} done)")
-        unp = _cli("unblock", task_id, "--reason", "TTL-BLOCKED R3: dependencia resuelta")
-        ok = not _cli_failed(unp)
-        record_remediation_attempt(db_path, task_id, "R3", reason, ok=ok)
-        if ok:
-            _cli("comment", task_id,
-                 f"{TRIAGE_MARK} autorremediación R3: dependencias {deps} ya done -> desbloqueada")
-        else:
-            return TtlResult("failed", task_id,
-                             f"{minutes}m — R3 action-failed: {_first_err(unp)}")
-        return TtlResult("remediated", task_id, f"{minutes}m — R3 deps {deps} done")
-
-    # 15-30m o >30m sin reparación determinista -> triage.
-    if age_s >= TTL_TRIAGE_S:
-        cls = "no-clasificable" if not reason else "permanente"
-        why = "TTL 30m agotado sin resolución ni reparación determinista"
-        if execute:
-            done, err = _route_to_triage(task_id, triage_comment(
-                minutes, cls, (reason or "(sin razon registrada)")[:120],
-                "sí" if age_s >= TTL_REMEDIATE_S else "no",
-                "sin reparación determinista disponible", why), db_path)
-            if done:
-                return TtlResult("triaged", task_id, f"{minutes}m — {cls} -> triage")
-            return TtlResult("retrying", task_id,
-                             f"{minutes}m — {cls} -> triage | ruta: {err}")
-        return dry("triage", f"{cls} -> triage")
-
-    return TtlResult("classify", task_id,
-                     f"{minutes}m — sin reparación determinista aún (ventana 5-15m)")
+    res = _skip_human_gate(title, body, task_id, minutes)
+    if res:
+        return res
+    res = _classify_early(db_path, task_id, age_s, minutes)
+    if res:
+        return res
+    res = _crash_loop_triage(db_path, task_id, minutes, execute, dry)
+    if res:
+        return res
+    res = _r6_escalation_triage(db_path, task_id, reason, model_override,
+                                minutes, execute, dry)
+    if res:
+        return res
+    pending, deps = _pending_remedies(db_path, task_id, reason,
+                                      model_override, provider)
+    res = _r6_counter_triage(db_path, task_id, pending, reason,
+                             model_override, minutes, execute, dry)
+    if res:
+        return res
+    res = _apply_remediation(db_path, task_id, pending, reason,
+                             model_override, deps, minutes, execute, dry)
+    if res:
+        return res
+    return _triage_or_classify(db_path, task_id, reason, age_s, minutes,
+                              execute, dry)
 
 
 def run(execute: bool = False, now: float | None = None,
