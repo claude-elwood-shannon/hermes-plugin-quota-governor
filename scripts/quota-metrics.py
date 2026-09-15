@@ -131,18 +131,11 @@ def from_last_good(name):
         return {}
 
 
-def main():
-    row: dict = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+def _collect_supply_metrics(row: dict) -> None:
+    """OBJ-29: populate supply_created_24h, supply_closed_24h, supply_ratio.
 
-    # board
-    try:
-        row.update(board_counts())
-    except Exception as e:
-        print(f"quota-metrics: board ilegible: {e}")
-        return 0
-
-    # OBJ-29: supply_ratio (suministro de objetivos, t_99e3b849 capa 1).
-    # Fallo de lectura no rompe la fila: campos a None (known-unknown).
+    Read failure degrades to None fields (known-unknown), never raises.
+    """
     try:
         created, closed = supply_counts()
         row["supply_created_24h"] = created
@@ -153,9 +146,12 @@ def main():
         row["supply_closed_24h"] = None
         row["supply_ratio"] = None
 
-    # providers via last-good (el tick/gate ya los refresco hace <15min;
-    # providers.py directo seria una segunda probe — evitamos duplicar
-    # llamadas a la API: el last-good del ciclo actual SIRVE como sample)
+
+def _collect_provider_pcts(row: dict) -> int:
+    """Populate ollama_* and nanogpt_weekly_pct from last-good snapshots.
+
+    Returns the count of providers with usable percentage data (0-2).
+    """
     ok = 0
     og = from_last_good("ollama")
     if og:
@@ -169,8 +165,16 @@ def main():
         row["nanogpt_weekly_pct"] = ng.get("weekly_tokens_pct")
         if ng.get("weekly_tokens_pct") is not None:
             ok += 1
-    # OBJ-26: nanogpt balance budget (exact /api/check-balance probe via
-    # nanogpt-balance-ledger.py, 60s cache) + level + weekly budget state.
+    return ok
+
+
+def _collect_nanogpt_budget(row: dict) -> None:
+    """OBJ-26: nanogpt balance budget + per-request ledger accumulators.
+
+    Loads nanogpt-balance-ledger.py dynamically and populates balance/level/
+    window_spent and request_balance/covered fields. Never raises — F1 must
+    not fail for these columns.
+    """
     ng_mod = None
     try:
         sys.path.insert(0, os.path.join(_PLUGIN_ROOT, "scripts"))
@@ -205,6 +209,13 @@ def main():
                     "request_covered_usd")
     except Exception:
         pass  # F1 must never fail for the request columns
+
+
+def _write_row(row: dict, ok: int) -> int:
+    """Append the metrics row to JSONL and warn on zero-provider samples.
+
+    Returns 0 (success — the row is written regardless of provider count).
+    """
     og2 = from_last_good("opencode_go")
     if og2:
         row["opencode_rolling_pct"] = og2.get("rolling_pct")
@@ -219,6 +230,32 @@ def main():
     if ok == 0:
         print(f"quota-metrics: NINGUN provider sampleado — fila con board only: {json.dumps(row)}")
     return 0
+
+
+def main() -> int:
+    """Collect one metrics row from board + providers and append to JSONL."""
+    row: dict = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    # board
+    try:
+        row.update(board_counts())
+    except Exception as e:
+        print(f"quota-metrics: board ilegible: {e}")
+        return 0
+
+    # OBJ-29: supply_ratio (suministro de objetivos, t_99e3b849 capa 1).
+    _collect_supply_metrics(row)
+
+    # providers via last-good (el tick/gate ya los refresco hace <15min;
+    # providers.py directo seria una segunda probe — evitamos duplicar
+    # llamadas a la API: el last-good del ciclo actual SIRVE como sample)
+    ok = _collect_provider_pcts(row)
+
+    # OBJ-26: nanogpt balance budget + per-request ledger.
+    _collect_nanogpt_budget(row)
+
+    # opencode last-good, providers_ok count, JSONL append, anomaly stdout.
+    return _write_row(row, ok)
 
 
 if __name__ == "__main__":
