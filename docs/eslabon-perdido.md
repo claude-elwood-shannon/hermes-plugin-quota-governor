@@ -98,6 +98,25 @@ BUT: nadie crea tareas bajo objetivos ❌  ← eslabón perdido
   git stash). `tests/test_bridge_governance_endpoints.py` 5b falla por
   estado del board host (t_c7e04f98 archivada); también preexistente.
 
+## Verificación en vivo (2026-09-15 02:21 CEST)
+
+El fire del creator creó `t_241c8832` (OBJ-CODEQUALITY: docs/coding-standards.md +
+auditoría py_compile/bash -n) con tag `objective:OBJ-CODEQUALITY` parseable,
+budget 0/0.5 verificado por el propio creator, dedup comprobado y G2 respetado.
+Fire siguiente: [SILENT] correcto con 3 running (G2). Cadena cerrada.
+
+### Incidencia descubierta en vivo: data_inspection 400 (Console Go)
+Los fires de 01:45 y 02:05 murieron con `HTTP 400
+InternalError.Algo.DataInspectionFailed` ANTES de responder. Causa: la lista de
+292 `covered_models` del snapshot NanoGPT (nombres "uncensored",
+"obliterated", "Derestricted"...) viajaba en el prompt y dispara
+intermitentemente el filtro de contenido upstream de Console Go. Fix
+(eddae2a): el snapshot lleva solo `covered_model_count` + `coverage_unknown`;
+`fetch_covered_models()` intacto para consumidores que sí necesitan la lista.
+Nota de lección: el creator puso el criterio en un heading "(criterio de
+éxito)" + bullets, que el regex del verifier no casa (`^success:` literal);
+prompt reforzado para exigir la línea literal.
+
 ## Cadena de efecto esperada
 
 Creator crea 1 tarea/tick bajo un objetivo activo con criterio verificable
