@@ -476,6 +476,27 @@ def _find_profile_observations() -> List[tuple]:
     return results
 
 
+def _get_latest_observation_ts(path: Path) -> Optional[datetime]:
+    """Return the timestamp of the most recent observation line."""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    for line in reversed(text.split("\n")):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = _parse_iso(entry.get("timestamp", ""))
+        if ts:
+            return ts
+    return None
+
+
 def check_silent_plugin(
     observations_path: Optional[Path] = None,
     profile_name: Optional[str] = None,
@@ -495,19 +516,12 @@ def check_silent_plugin(
     """
     obs_path = observations_path if observations_path is not None else get_observations_file()
 
-    # Idle-profile suppression: if we know the profile name and it has no
-    # active tasks (none in ready/running/blocked/todo), silence is expected
-    # — don't alert.  This covers both:
-    #   - On-demand profiles (e.g. pr-nanogpt) that only run when assigned
-    #   - The tick profile when the quota gate has max_workers=0 and the
-    #     board has no work queued (legitimate idle, not a plugin failure)
-    if profile_name is not None:
-        if not _profile_has_any_active_tasks(profile_name):
-            logger.debug(
-                "silent_plugin: profile %s has zero active tasks — suppressing alert",
-                profile_name,
-            )
-            return None
+    if profile_name is not None and not _profile_has_any_active_tasks(profile_name):
+        logger.debug(
+            "silent_plugin: profile %s has zero active tasks — suppressing alert",
+            profile_name,
+        )
+        return None
 
     if not obs_path.exists():
         return write_alert(
@@ -516,36 +530,7 @@ def check_silent_plugin(
             extra={"hours_silent": None, "profile": profile_name},
         )
 
-    try:
-        text = obs_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return write_alert(
-            "silent_plugin",
-            f"Plugin silent ({profile_name or 'unknown'}): cannot read observations file",
-            extra={"hours_silent": None, "profile": profile_name},
-        )
-
-    if not text:
-        return write_alert(
-            "silent_plugin",
-            f"Plugin silent ({profile_name or 'unknown'}): observations file is empty — plugin may not be loaded",
-            extra={"hours_silent": None, "profile": profile_name},
-        )
-
-    # Find the most recent observation timestamp
-    last_ts: Optional[datetime] = None
-    for line in reversed(text.split("\n")):
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        ts = _parse_iso(entry.get("timestamp", ""))
-        if ts:
-            last_ts = ts
-            break
-
+    last_ts = _get_latest_observation_ts(obs_path)
     if last_ts is None:
         return write_alert(
             "silent_plugin",
@@ -554,8 +539,7 @@ def check_silent_plugin(
         )
 
     now = datetime.now(timezone.utc)
-    silence = now - last_ts
-    hours_silent = silence.total_seconds() / 3600
+    hours_silent = (now - last_ts).total_seconds() / 3600
 
     if hours_silent > SILENT_PLUGIN_HOURS:
         msg = (
