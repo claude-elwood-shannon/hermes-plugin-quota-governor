@@ -438,6 +438,31 @@ def _estimate_tick_cost(
     return cost_now, tick_cost
 
 
+def _compute_cumulative(cost_now, prior, tick_cost, provider, burning, cum):
+    """Compute cumulative cost for a provider.
+
+    ``burning`` is the CURRENT tick's flag (from ``is_burning``), matching the
+    pre-refactor inline logic: only the percent-delta estimate path stays
+    gated on it. Handles the special case of a DECREASING balance meter that
+    has no ``last_cost`` record: ``seed_balance_cum`` pulls the cumulative
+    figure from the stance ledger. After seeding the per-tick delta is added.
+    """
+    if cost_now is not None:
+        if prior.get("last_cost") is None and meter_is_balance(provider):
+            cum = seed_balance_cum(provider, prior)
+        cum += tick_cost
+    elif burning and tick_cost > 0:
+        cum += tick_cost
+    return cum
+
+
+def _compute_rate(tick_elapsed, prior, tick_cost):
+    """Calculate burn rate given elapsed time and tick cost."""
+    if tick_elapsed > 0 and prior.get("last_ts") and tick_cost > 0:
+        return tick_cost / max(tick_elapsed, 0.001)
+    return 0.0
+
+
 def analyze_provider(
     provider: Dict[str, Any],
     prior: Dict[str, Any],
@@ -470,34 +495,10 @@ def analyze_provider(
     if cover["gap"]:
         tick_cost += cover["covered_usd"]
 
-    # Accumulate the real-meter burn regardless of the qualitative `burning`
-    # flag. `burning` was designed for CUMULATIVE-SPEND meters (opencode-go
-    # percent-delta + cost meter) where a recovered window resets the episode.
-    # A DECREASING balance meter (nanogpt prepaid) never flips `burning`
-    # (state stays "active"), yet its balance drop IS real burn — so a
-    # `if burning: cum += tick_cost` gate kept cum_cost_usd pinned at 0 and
-    # made the WARN/STOP thresholds unreachable for balance meters
-    # (OBJ-39/t_cce2a554). Only the pure percent-delta ESTIMATE (no real
-    # meter) stays gated on `burning`, so non-burning window creep never
-    # counts as spend.
     cum = float(prior.get("cum_cost_usd", 0.0))
-    if cost_now is not None:
-        # First observation of a balance meter has no last_cost, so the
-        # per-tick delta is 0 — seed cum from the authoritative spent amount
-        # the watchdog missed before it started running (window_spent_usd).
-        if prior.get("last_cost") is None and meter_is_balance(provider):
-            cum = seed_balance_cum(provider, prior)
-        cum += tick_cost
-    elif burning and tick_cost > 0:
-        cum += tick_cost
+    cum = _compute_cumulative(cost_now, prior, tick_cost, provider, burning, cum)
 
-    # Derived burn rate = cost consumed over the last tick interval (USD/min).
-    # Needs at least one prior observation (tick_elapsed reflects the gap);
-    # on the very first observation we cannot yet derive a rate.
-    if tick_elapsed > 0 and prior.get("last_ts") and tick_cost > 0:
-        rate = tick_cost / max(tick_elapsed, 0.001)
-    else:
-        rate = 0.0
+    rate = _compute_rate(tick_elapsed, prior, tick_cost)
 
     return {
         "burning": burning,
