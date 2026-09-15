@@ -261,20 +261,9 @@ def get_crashed_tasks() -> List[Dict[str, Any]]:
 
 # ── Pattern detectors ────────────────────────────────────────────────────────
 
-def _is_error_resolved(error_msg: str, observations: List[Dict[str, Any]]) -> bool:
-    """Check if a recurring error has already been resolved.
-
-    An error is considered resolved if BOTH:
-    1. It has NOT appeared in observations in the last 48h (staleness check)
-    2. There exists a done/archived kanban task whose title mentions keywords
-       from the error (fix verification check)
-
-    This prevents false-positive proposals for errors that were already fixed
-    but whose old occurrences remain in the 7-day observation window.
-    """
-    # Check 1: Did the error appear in the last 48h?
+def _has_recent_occurrence(error_msg: str, observations: List[Dict[str, Any]]) -> bool:
+    """Return True if error_msg (normalized) appears in observations from the last 48h."""
     recent_cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
-    has_recent = False
     for obs in observations:
         ts_str = obs.get("timestamp", "")
         try:
@@ -291,23 +280,27 @@ def _is_error_resolved(error_msg: str, observations: List[Dict[str, Any]]) -> bo
             obs_normalized = re.sub(r"\d+", "N", error_msg)
             obs_normalized = re.sub(r"\s+", " ", obs_normalized).strip()
             if normalized == obs_normalized:
-                has_recent = True
-                break
-        if has_recent:
-            break
+                return True
+    return False
 
-    if has_recent:
-        return False  # Error is still active
 
-    # Check 2: Is there a done task that fixes this error?
-    # Extract keywords from the error message for matching
-    # e.g. "nanogpt: HTTP Error N: Forbidden" → keywords: "nanogpt", "Forbidden"
+def _extract_error_keywords(error_msg: str) -> List[str]:
+    """Extract distinctive lowercase keywords from an error for matching.
+
+    e.g. "nanogpt: HTTP Error N: Forbidden" → ["nanogpt", "forbidden"].
+    """
     keywords = []
-    parts = re.split(r"[:\s]+", error_msg)
+    parts = re.split(r"[:\\s]+", error_msg)
     for p in parts:
         p_clean = re.sub(r"[^a-zA-Z]", "", p).lower()
         if len(p_clean) >= 4 and p_clean not in ("http", "error", "urlopen", "tunnel"):
             keywords.append(p_clean)
+    return keywords
+
+
+def _has_fixing_done_task(error_msg: str) -> bool:
+    """Return True if a done/archived task mentions >=2 keywords from error_msg."""
+    keywords = _extract_error_keywords(error_msg)
     if not keywords:
         return False  # Can't extract keywords, don't assume resolved
 
@@ -329,16 +322,30 @@ def _is_error_resolved(error_msg: str, observations: List[Dict[str, Any]]) -> bo
     return False
 
 
-def detect_recurring_errors(observations: List[Dict[str, Any]]) -> Optional[Pattern]:
-    """Detect errors that appear >= ERROR_RECURRENCE_THRESHOLD times in the window.
+def _is_error_resolved(error_msg: str, observations: List[Dict[str, Any]]) -> bool:
+    """Check if a recurring error has already been resolved.
 
-    Looks at the `errors` field in observations and the `event` field for
-    session_end events with errors.
+    An error is considered resolved if BOTH:
+    1. It has NOT appeared in observations in the last 48h (staleness check)
+    2. There exists a done/archived kanban task whose title mentions keywords
+       from the error (fix verification check)
 
-    Skips errors that have already been resolved (no occurrences in last 48h
-    AND a done kanban task exists that addresses the error).
+    This prevents false-positive proposals for errors that were already fixed
+    but whose old occurrences remain in the 7-day observation window.
     """
-    error_counter = Counter()
+    # Check 1: Did the error appear in the last 48h?
+    if _has_recent_occurrence(error_msg, observations):
+        return False  # Error is still active
+
+    # Check 2: Is there a done task that fixes this error?
+    return _has_fixing_done_task(error_msg)
+
+
+def _collect_error_counts(
+    observations: List[Dict[str, Any]],
+) -> Tuple[Counter, Dict[str, List[Dict[str, Any]]]]:
+    """Normalize errors across observations, returning counts and per-error sources."""
+    error_counter: Counter = Counter()
     error_to_observations: Dict[str, List[Dict[str, Any]]] = {}
 
     for obs in observations:
@@ -351,30 +358,11 @@ def detect_recurring_errors(observations: List[Dict[str, Any]]) -> Optional[Patt
             error_counter[normalized] += 1
             error_to_observations.setdefault(normalized, []).append(obs)
 
-    if not error_counter:
-        return None
+    return error_counter, error_to_observations
 
-    # Sort by frequency (most common first), then check each for eligibility
-    for error_msg, count in error_counter.most_common():
-        if count < ERROR_RECURRENCE_THRESHOLD:
-            continue
 
-        # Check if this error was already resolved (fix done + no recent occurrences)
-        if _is_error_resolved(error_msg, error_to_observations.get(error_msg, observations)):
-            log(f"Recurring error already resolved, skipping: {error_msg[:60]}")
-            continue
-
-        # Check if this error was already proposed recently
-        if _already_proposed(f"recurring_error:{error_msg[:80]}"):
-            log(f"Recurring error already proposed recently: {error_msg[:60]}")
-            continue
-
-        # Found an eligible error — build the proposal
-        break
-    else:
-        return None  # No eligible errors
-
-    # Build proposal
+def _build_recurring_error_proposal(error_msg: str, count: int) -> Pattern:
+    """Build the recurring-error proposal Pattern."""
     severity = "high" if count >= 5 else "medium"
 
     title = f"OBJ-X: Fix recurring error in quota observations ({count}x in {ANALYSIS_WINDOW_DAYS}d)"
@@ -409,19 +397,48 @@ def detect_recurring_errors(observations: List[Dict[str, Any]]) -> Optional[Patt
     )
 
 
-def detect_quota_imbalance(observations: List[Dict[str, Any]]) -> Optional[Pattern]:
-    """Detect quota imbalance: one provider consistently high while another low.
+def detect_recurring_errors(observations: List[Dict[str, Any]]) -> Optional[Pattern]:
+    """Detect errors that appear >= ERROR_RECURRENCE_THRESHOLD times in the window.
 
-    If Ollama is consistently >80% while NanoGPT or OpenRouter is <30%, that
-    suggests the system is not using the multi-provider routing effectively.
+    Looks at the `errors` field in observations and the `event` field for
+    session_end events with errors.
+
+    Skips errors that have already been resolved (no occurrences in last 48h
+    AND a done kanban task exists that addresses the error).
     """
-    # Collect quota samples
-    ollama_high = 0
-    ollama_total = 0
-    nanogpt_low = 0
-    nanogpt_total = 0
-    openrouter_low = 0
-    openrouter_total = 0
+    error_counter, error_to_observations = _collect_error_counts(observations)
+
+    if not error_counter:
+        return None
+
+    # Sort by frequency (most common first), then check each for eligibility
+    for error_msg, count in error_counter.most_common():
+        if count < ERROR_RECURRENCE_THRESHOLD:
+            continue
+
+        # Check if this error was already resolved (fix done + no recent occurrences)
+        if _is_error_resolved(error_msg, error_to_observations.get(error_msg, observations)):
+            log(f"Recurring error already resolved, skipping: {error_msg[:60]}")
+            continue
+
+        # Check if this error was already proposed recently
+        if _already_proposed(f"recurring_error:{error_msg[:80]}"):
+            log(f"Recurring error already proposed recently: {error_msg[:60]}")
+            continue
+
+        # Found an eligible error — build the proposal
+        return _build_recurring_error_proposal(error_msg, count)
+
+    return None  # No eligible errors
+
+
+def _collect_quota_samples(observations: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Count high/low quota samples per provider across observations."""
+    samples = {
+        "ollama_high": 0, "ollama_total": 0,
+        "nanogpt_low": 0, "nanogpt_total": 0,
+        "openrouter_low": 0, "openrouter_total": 0,
+    }
 
     for obs in observations:
         quota = obs.get("quota", {})
@@ -430,122 +447,125 @@ def detect_quota_imbalance(observations: List[Dict[str, Any]]) -> Optional[Patte
 
         ollama_pct = quota.get("ollama_weekly_pct")
         if ollama_pct is not None:
-            ollama_total += 1
+            samples["ollama_total"] += 1
             if ollama_pct > QUOTA_IMBALANCE_HIGH:
-                ollama_high += 1
+                samples["ollama_high"] += 1
 
         nanogpt_pct = quota.get("nanogpt_weekly_tokens_pct")
         if nanogpt_pct is not None:
-            nanogpt_total += 1
+            samples["nanogpt_total"] += 1
             if nanogpt_pct < QUOTA_IMBALANCE_LOW:
-                nanogpt_low += 1
+                samples["nanogpt_low"] += 1
 
         openrouter_usd = quota.get("openrouter_weekly_usd")
         if openrouter_usd is not None:
-            openrouter_total += 1
+            samples["openrouter_total"] += 1
             if openrouter_usd < 1.0:  # Very low usage
-                openrouter_low += 1
+                samples["openrouter_low"] += 1
 
+    return samples
+
+
+def _build_quota_imbalance_proposal(samples: Dict[str, int]) -> Optional[Pattern]:
+    """Return a quota-imbalance Pattern if thresholds are met, else None."""
     # Need enough samples to be meaningful
-    if ollama_total < QUOTA_IMBALANCE_MIN_SAMPLES:
+    if samples["ollama_total"] < QUOTA_IMBALANCE_MIN_SAMPLES:
         return None
 
-    ollama_high_ratio = ollama_high / ollama_total if ollama_total > 0 else 0
-    nanogpt_low_ratio = nanogpt_low / nanogpt_total if nanogpt_total > 0 else 0
+    ollama_high_ratio = samples["ollama_high"] / samples["ollama_total"] if samples["ollama_total"] > 0 else 0
+    nanogpt_total = samples["nanogpt_total"]
+    nanogpt_low_ratio = samples["nanogpt_low"] / nanogpt_total if nanogpt_total > 0 else 0
 
     # Ollama consistently high AND NanoGPT consistently low
-    if ollama_high_ratio > 0.6 and nanogpt_low_ratio > 0.6 and nanogpt_total >= 3:
-        if _already_proposed("quota_imbalance:ollama_high_nanogpt_low"):
-            return None
-
-        title = f"OBJ-X: Rebalance quota usage — Ollama consistently high while NanoGPT underutilized"
-        body = (
-            f"objective:OBJ-X\n"
-            f"auto_created:true\n"
-            f"cost:small\n"
-            f"provider:pr-ollama\n\n"
-            f"Quota imbalance detected: Ollama weekly usage is consistently "
-            f">{QUOTA_IMBALANCE_HIGH}% while NanoGPT is <{QUOTA_IMBALANCE_LOW}%.\n\n"
-            f"Evidence:\n"
-            f"- Ollama >{QUOTA_IMBALANCE_HIGH}%: {ollama_high}/{ollama_total} samples "
-            f"({ollama_high_ratio:.0%})\n"
-            f"- NanoGPT <{QUOTA_IMBALANCE_LOW}%: {nanogpt_low}/{nanogpt_total} samples "
-            f"({nanogpt_low_ratio:.0%})\n"
-            f"- Window: last {ANALYSIS_WINDOW_DAYS} days\n\n"
-            f"Tareas que lo avanzan:\n"
-            f"- Investigar por que el multi-provider routing no usa NanoGPT\n"
-            f"- Verificar quota-gate.py recommended_profile logic\n"
-            f"- Ajustar heuristica si necesario\n\n"
-            f"Criterio de completitud: NanoGPT usage >30% en al menos 3 "
-            f"observaciones consecutivas tras el fix."
-        )
-        evidence = (
-            f"Ollama high: {ollama_high}/{ollama_total}, "
-            f"NanoGPT low: {nanogpt_low}/{nanogpt_total}"
-        )
-
-        return Pattern(
-            kind="quota_imbalance",
-            severity="medium",
-            title=title,
-            body=body,
-            evidence=evidence,
-            source="observations.jsonl",
-        )
-
-    return None
-
-
-def detect_stale_objectives() -> Optional[Pattern]:
-    """Detect objectives that have been in-progress for too long without progress."""
-    active = get_active_objectives()
-    completed_info = get_completed_objectives_info()
-
-    now_ts = datetime.now(timezone.utc).timestamp()
-    stale_threshold_ts = now_ts - (STALE_OBJECTIVE_DAYS * 86400)
-
-    stale_objectives = []
-    for obj_id, info in active.items():
-        # Check if this objective has had any recent completions
-        comp_info = completed_info.get(obj_id, {})
-        last_completed = comp_info.get("last_completed_at", 0)
-        statuses = info.get("statuses", [])
-
-        if last_completed and last_completed > stale_threshold_ts:
-            continue  # Had recent progress
-
-        # t_fbe97066 fix: skip objectives with work currently in flight.
-        # A task running/ready at evaluation time IS progress, even if the
-        # objective's last completion is older than the threshold (e.g. a
-        # task running since minutes ago finishing soon after the sweep).
-        if any(s in ("running", "ready") for s in statuses):
-            continue
-
-        # Check if it was created recently (still warming up)
-        # If all tasks are just 'triage' or 'todo', it might be new
-        # (blocked tasks stay detectable: a stuck objective IS stale material)
-        if all(s in ("triage", "todo") for s in statuses):
-            continue  # Not started yet, not stale
-
-        # t_fbe97066 fix: also honor recent activity on the just-closed
-        # task (started_at) — a task that started recently shows progress
-        # even if it has not completed yet or completed long after.
-        last_started = comp_info.get("last_started_at", 0)
-        if last_started and last_started > stale_threshold_ts:
-            continue
-
-        stale_objectives.append((obj_id, info))
-
-    if not stale_objectives:
+    if not (ollama_high_ratio > 0.6 and nanogpt_low_ratio > 0.6 and nanogpt_total >= 3):
         return None
 
-    # Pick the stalest
-    stale_objectives.sort(key=lambda x: x[0])  # By OBJ-N number
-    obj_id, info = stale_objectives[0]
+    title = f"OBJ-X: Rebalance quota usage — Ollama consistently high while NanoGPT underutilized"
+    body = (
+        f"objective:OBJ-X\n"
+        f"auto_created:true\n"
+        f"cost:small\n"
+        f"provider:pr-ollama\n\n"
+        f"Quota imbalance detected: Ollama weekly usage is consistently "
+        f">{QUOTA_IMBALANCE_HIGH}% while NanoGPT is <{QUOTA_IMBALANCE_LOW}%.\n\n"
+        f"Evidence:\n"
+        f"- Ollama >{QUOTA_IMBALANCE_HIGH}%: {samples['ollama_high']}/{samples['ollama_total']} samples "
+        f"({ollama_high_ratio:.0%})\n"
+        f"- NanoGPT <{QUOTA_IMBALANCE_LOW}%: {samples['nanogpt_low']}/{nanogpt_total} samples "
+        f"({nanogpt_low_ratio:.0%})\n"
+        f"- Window: last {ANALYSIS_WINDOW_DAYS} days\n\n"
+        f"Tareas que lo avanzan:\n"
+        f"- Investigar por que el multi-provider routing no usa NanoGPT\n"
+        f"- Verificar quota-gate.py recommended_profile logic\n"
+        f"- Ajustar heuristica si necesario\n\n"
+        f"Criterio de completitud: NanoGPT usage >30% en al menos 3 "
+        f"observaciones consecutivas tras el fix."
+    )
+    evidence = (
+        f"Ollama high: {samples['ollama_high']}/{samples['ollama_total']}, "
+        f"NanoGPT low: {samples['nanogpt_low']}/{nanogpt_total}"
+    )
 
-    if _already_proposed(f"stale_objective:{obj_id}"):
+    return Pattern(
+        kind="quota_imbalance",
+        severity="medium",
+        title=title,
+        body=body,
+        evidence=evidence,
+        source="observations.jsonl",
+    )
+
+
+def detect_quota_imbalance(observations: List[Dict[str, Any]]) -> Optional[Pattern]:
+    """Detect quota imbalance: one provider consistently high while another low.
+
+    If Ollama is consistently >80% while NanoGPT or OpenRouter is <30%, that
+    suggests the system is not using the multi-provider routing effectively.
+    """
+    samples = _collect_quota_samples(observations)
+    pattern = _build_quota_imbalance_proposal(samples)
+    if pattern is None:
         return None
 
+    if _already_proposed("quota_imbalance:ollama_high_nanogpt_low"):
+        return None
+
+    return pattern
+
+
+def _is_stale_objective(info: Dict[str, Any], comp_info: Dict[str, Any], stale_threshold_ts: float) -> bool:
+    """Return True if an objective is stale (no progress, no in-flight work)."""
+    statuses = info.get("statuses", [])
+    last_completed = comp_info.get("last_completed_at", 0)
+
+    if last_completed and last_completed > stale_threshold_ts:
+        return False  # Had recent progress
+
+    # t_fbe97066 fix: skip objectives with work currently in flight.
+    # A task running/ready at evaluation time IS progress, even if the
+    # objective's last completion is older than the threshold (e.g. a
+    # task running since minutes ago finishing soon after the sweep).
+    if any(s in ("running", "ready") for s in statuses):
+        return False
+
+    # Check if it was created recently (still warming up)
+    # If all tasks are just 'triage' or 'todo', it might be new
+    # (blocked tasks stay detectable: a stuck objective IS stale material)
+    if all(s in ("triage", "todo") for s in statuses):
+        return False  # Not started yet, not stale
+
+    # t_fbe97066 fix: also honor recent activity on the just-closed
+    # task (started_at) — a task that started recently shows progress
+    # even if it has not completed yet or completed long after.
+    last_started = comp_info.get("last_started_at", 0)
+    if last_started and last_started > stale_threshold_ts:
+        return False
+
+    return True
+
+
+def _build_stale_objective_proposal(obj_id: str, info: Dict[str, Any]) -> Pattern:
+    """Build the stale-objective proposal Pattern."""
     title = f"OBJ-X: Diagnose stale objective {obj_id} — no progress in {STALE_OBJECTIVE_DAYS}d"
     body = (
         f"objective:OBJ-X\n"
@@ -578,18 +598,43 @@ def detect_stale_objectives() -> Optional[Pattern]:
     )
 
 
-def detect_missing_test_coverage() -> Optional[Pattern]:
-    """Detect plugin scripts without corresponding test files."""
-    if not os.path.isdir(SCRIPT_DIR_PLUGIN):
+def detect_stale_objectives() -> Optional[Pattern]:
+    """Detect objectives that have been in-progress for too long without progress."""
+    active = get_active_objectives()
+    completed_info = get_completed_objectives_info()
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    stale_threshold_ts = now_ts - (STALE_OBJECTIVE_DAYS * 86400)
+
+    stale_objectives = []
+    for obj_id, info in active.items():
+        # Check if this objective has had any recent completions
+        comp_info = completed_info.get(obj_id, {})
+        if _is_stale_objective(info, comp_info, stale_threshold_ts):
+            stale_objectives.append((obj_id, info))
+
+    if not stale_objectives:
         return None
+
+    # Pick the stalest
+    stale_objectives.sort(key=lambda x: x[0])  # By OBJ-N number
+    obj_id, info = stale_objectives[0]
+
+    if _already_proposed(f"stale_objective:{obj_id}"):
+        return None
+
+    return _build_stale_objective_proposal(obj_id, info)
+
+
+def _find_uncovered_scripts() -> List[str]:
+    """Return plugin scripts lacking a corresponding test file."""
+    if not os.path.isdir(SCRIPT_DIR_PLUGIN):
+        return []
 
     scripts = []
     for f in os.listdir(SCRIPT_DIR_PLUGIN):
         if f.endswith(".py") and not f.startswith("__"):
             scripts.append(f)
-
-    if not scripts:
-        return None
 
     # Check for test files in the repo root
     repo_root = PLUGIN_REPO
@@ -611,12 +656,11 @@ def detect_missing_test_coverage() -> Optional[Pattern]:
         if expected_test not in test_files and expected_test not in script_tests:
             uncovered.append(script)
 
-    if not uncovered:
-        return None
+    return uncovered
 
-    if _already_proposed("missing_test_coverage"):
-        return None
 
+def _build_coverage_proposal(uncovered: List[str]) -> Pattern:
+    """Build the missing-test-coverage proposal Pattern."""
     uncovered_str = ", ".join(uncovered[:5])
     title = f"OBJ-X: Add test coverage for uncovered plugin scripts ({len(uncovered)} scripts)"
     body = (
@@ -646,6 +690,18 @@ def detect_missing_test_coverage() -> Optional[Pattern]:
         evidence=evidence,
         source="plugin_repo",
     )
+
+
+def detect_missing_test_coverage() -> Optional[Pattern]:
+    """Detect plugin scripts without corresponding test files."""
+    uncovered = _find_uncovered_scripts()
+    if not uncovered:
+        return None
+
+    if _already_proposed("missing_test_coverage"):
+        return None
+
+    return _build_coverage_proposal(uncovered)
 
 
 def detect_crash_cluster() -> Optional[Pattern]:
@@ -691,37 +747,49 @@ def detect_crash_cluster() -> Optional[Pattern]:
 
 # ── Proposal deduplication ──────────────────────────────────────────────────
 
-def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
-    """Check if a pattern was already proposed (GR6 enforcement + cross-day dedup).
+def _entry_same_day_match(entry: Dict, pattern_key: str, short_key: str, bare_kind: Optional[str]) -> bool:
+    """Return True if a same-day entry blocks re-proposal of pattern_key."""
+    if entry.get("pattern_key") == pattern_key:
+        return True
+    # Kind-prefix match: when pattern_key is a bare kind
+    # (e.g. "missing_test_coverage"), match against the
+    # recorded pattern_kind field or pattern_key prefix.
+    # Fixes OBJ-16: detect_missing_test_coverage() and
+    # detect_crash_cluster() pass bare kinds, but
+    # record_proposal() records "kind:evidence".
+    if bare_kind:
+        if entry.get("pattern_kind", "") == bare_kind:
+            return True
+        if entry.get("pattern_key", "").startswith(bare_kind + ":"):
+            return True
+    if pattern_key in entry.get("title", "").lower():
+        return True
+    # Also check evidence field (pattern_key includes evidence)
+    if short_key and short_key in entry.get("evidence", "").lower():
+        return True
+    return False
 
-    Checks ALL entries in the proposals file (both allowed and rejected).
-    A rejected entry still means "we already saw this pattern and decided
-    not to propose it" — re-proposing it every tick wastes the GR6 daily
-    quota and clutters the proposals file with duplicates.
 
-    By default (*cross_day=True*), also checks if the same pattern appeared
-    on a **previous** day within the analysis window. This prevents the
-    proposer from re-proposing the same error every day when stale errors
-    remain in the 7-day observation window but have already been addressed
-    by a prior task.
+def _entry_cross_day_match(entry: Dict, short_key: str, bare_kind: Optional[str]) -> bool:
+    """Return True if a previous-day entry blocks re-proposal of pattern_key."""
+    # Kind-prefix match for bare-kind pattern_keys
+    if bare_kind and entry.get("pattern_kind", "") == bare_kind:
+        return True
+    entry_text = (
+        entry.get("evidence", "") + " " + entry.get("title", "")
+    ).lower()
+    if short_key and short_key in entry_text:
+        return True
+    return False
 
-    The cross-day check matches on the ``pattern_key`` substring (e.g.
-    ``recurring_error:Error 'nanogpt: HTTP Error N: Forbidden'``) appearing
-    in the ``evidence`` or ``title`` of any past entry.
+
+def _scan_proposals_file(pattern_key: str, short_key: str, bare_kind: Optional[str], cross_day: bool) -> bool:
+    """Scan the proposals file for entries matching pattern_key.
+
+    Checks both same-day (any entry blocks) and, when *cross_day* is True,
+    previous-day entries. Skips unparseable lines.
     """
-    if not os.path.exists(PROPOSALS_FILE):
-        return False
-
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # Extract a short normalized key from pattern_key for fuzzy matching.
-    # pattern_key looks like: "recurring_error:Error 'nanogpt: HTTP Error N: Forbidden' appeared 4 times in 7d"
-    # We extract the core error signature for cross-day matching.
-    short_key = pattern_key.split(":", 1)[-1][:60].lower() if ":" in pattern_key else pattern_key[:60].lower()
-    # For bare-kind pattern_keys (no colon, e.g. "missing_test_coverage"),
-    # derive the kind for prefix matching against recorded entries.
-    # record_proposal() stores pattern_key as "kind:evidence", so a bare
-    # kind argument will never exactly match — we need prefix matching.
-    bare_kind = pattern_key if ":" not in pattern_key else None
 
     try:
         with open(PROPOSALS_FILE, "r", encoding="utf-8") as f:
@@ -736,39 +804,15 @@ def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
                     # Same-day dedup: any entry (allowed OR rejected) with the
                     # same pattern blocks re-proposal today. This prevents the
                     # 2h-cron from re-proposing a rejected pattern every tick.
-                    if entry_date == today:
-                        if entry.get("pattern_key") == pattern_key:
-                            return True
-                        # Kind-prefix match: when pattern_key is a bare kind
-                        # (e.g. "missing_test_coverage"), match against the
-                        # recorded pattern_kind field or pattern_key prefix.
-                        # Fixes OBJ-16: detect_missing_test_coverage() and
-                        # detect_crash_cluster() pass bare kinds, but
-                        # record_proposal() records "kind:evidence".
-                        if bare_kind:
-                            if entry.get("pattern_kind", "") == bare_kind:
-                                return True
-                            if entry.get("pattern_key", "").startswith(bare_kind + ":"):
-                                return True
-                        if pattern_key in entry.get("title", "").lower():
-                            return True
-                        # Also check evidence field (pattern_key includes evidence)
-                        if short_key and short_key in entry.get("evidence", "").lower():
-                            return True
+                    if entry_date == today and _entry_same_day_match(entry, pattern_key, short_key, bare_kind):
+                        return True
 
                     # Cross-day dedup: if the same pattern was seen on a
                     # previous day (allowed OR rejected), don't re-propose.
                     # This prevents stale errors in the observation window
                     # from generating duplicate tasks across days.
-                    if cross_day and entry_date < today:
-                        # Kind-prefix match for bare-kind pattern_keys
-                        if bare_kind and entry.get("pattern_kind", "") == bare_kind:
-                            return True
-                        entry_text = (
-                            entry.get("evidence", "") + " " + entry.get("title", "")
-                        ).lower()
-                        if short_key and short_key in entry_text:
-                            return True
+                    if cross_day and entry_date < today and _entry_cross_day_match(entry, short_key, bare_kind):
+                        return True
 
                 except json.JSONDecodeError:
                     continue
@@ -776,6 +820,29 @@ def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
         pass
 
     return False
+
+
+def _already_proposed(pattern_key: str, *, cross_day: bool = True) -> bool:
+    """Check if a pattern was already proposed (GR6 enforcement + cross-day dedup).
+
+    Checks ALL entries in the proposals file (both allowed and rejected).
+    A rejected entry still means "we already saw this pattern and decided
+    not to propose it" — re-proposing it every tick wastes the GR6 daily
+    quota and clutters the proposals file with duplicates.
+    """
+    if not os.path.exists(PROPOSALS_FILE):
+        return False
+
+    # Extract a short normalized key from pattern_key for fuzzy matching.
+    # We extract the core error signature for cross-day matching.
+    short_key = pattern_key.split(":", 1)[-1][:60].lower() if ":" in pattern_key else pattern_key[:60].lower()
+    # For bare-kind pattern_keys (no colon, e.g. "missing_test_coverage"),
+    # derive the kind for prefix matching against recorded entries.
+    # record_proposal() stores pattern_key as "kind:evidence", so a bare
+    # kind argument will never exactly match — we need prefix matching.
+    bare_kind = pattern_key if ":" not in pattern_key else None
+
+    return _scan_proposals_file(pattern_key, short_key, bare_kind, cross_day)
 
 
 # ── Guardrails validation ───────────────────────────────────────────────────
@@ -835,6 +902,61 @@ def validate_proposal(title: str, body: str) -> Tuple[bool, List[Dict], List[Dic
 
 # ── Proposal recording ───────────────────────────────────────────────────────
 
+def _kind_recorded_today(kind: str) -> bool:
+    """Return True if an entry with the same pattern_kind was recorded today."""
+    if not os.path.exists(PROPOSALS_FILE):
+        return False
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    try:
+        with open(PROPOSALS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    existing = json.loads(line)
+                    if (existing.get("date", "") == today
+                            and existing.get("pattern_kind", "") == kind):
+                        # Already recorded this pattern_kind today — skip.
+                        return True
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+
+    return False
+
+
+def _build_proposal_entry(
+    pattern: Pattern,
+    allowed: bool,
+    violations: List[Dict],
+    warnings: List[Dict],
+    task_id: Optional[str],
+) -> Dict:
+    """Build the JSON entry dict for a proposal record."""
+    now = datetime.now(timezone.utc)
+    entry = {
+        "timestamp": now.isoformat(),
+        "date": now.strftime("%Y-%m-%d"),
+        "title": pattern.title,
+        "pattern_kind": pattern.kind,
+        "pattern_key": f"{pattern.kind}:{pattern.evidence[:80]}",
+        "allowed": allowed,
+        "violations": violations,
+        "warnings": warnings,
+        "requires_human_approval": len(warnings) > 0,
+        "evidence": pattern.evidence,
+        "source": pattern.source,
+        "severity": pattern.severity,
+    }
+    if task_id:
+        entry["task_id"] = task_id
+    return entry
+
+
 def record_proposal(
     pattern: Pattern,
     allowed: bool,
@@ -857,43 +979,11 @@ def record_proposal(
     """
     os.makedirs(os.path.dirname(PROPOSALS_FILE), exist_ok=True)
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     # Dedup: check if an entry with the same pattern_kind already exists today.
-    if os.path.exists(PROPOSALS_FILE):
-        try:
-            with open(PROPOSALS_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        existing = json.loads(line)
-                        if (existing.get("date", "") == today
-                                and existing.get("pattern_kind", "") == pattern.kind):
-                            # Already recorded this pattern_kind today — skip.
-                            return
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            pass
+    if _kind_recorded_today(pattern.kind):
+        return
 
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "date": today,
-        "title": pattern.title,
-        "pattern_kind": pattern.kind,
-        "pattern_key": f"{pattern.kind}:{pattern.evidence[:80]}",
-        "allowed": allowed,
-        "violations": violations,
-        "warnings": warnings,
-        "requires_human_approval": len(warnings) > 0,
-        "evidence": pattern.evidence,
-        "source": pattern.source,
-        "severity": pattern.severity,
-    }
-    if task_id:
-        entry["task_id"] = task_id
+    entry = _build_proposal_entry(pattern, allowed, violations, warnings, task_id)
 
     try:
         with open(PROPOSALS_FILE, "a", encoding="utf-8") as f:
@@ -994,6 +1084,28 @@ def run_analysis() -> List[Pattern]:
     return patterns
 
 
+def _create_and_record(
+    pattern: Pattern,
+    allowed: bool,
+    violations: List[Dict],
+    warnings: List[Dict],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Create a triage task and record the proposal on success.
+
+    Returns (task_id, error). On failure the proposal is NOT recorded —
+    a task wasn't created, so GR6 should not count it.
+    """
+    task_id = create_triage_task(pattern.title, pattern.body)
+    if task_id:
+        log(f"Created triage task {task_id}: {pattern.title}")
+        # Record the proposal (only when task was actually created)
+        record_proposal(pattern, allowed, violations, warnings, task_id=task_id)
+        return task_id, None
+
+    log(f"Failed to create triage task: {pattern.title}", "ERROR")
+    return None, "Task creation failed"
+
+
 def propose_objective(
     pattern: Pattern,
     execute: bool = False,
@@ -1027,16 +1139,9 @@ def propose_objective(
 
     # Guardrails passed — create triage task if --execute
     if execute:
-        task_id = create_triage_task(pattern.title, pattern.body)
+        task_id, error = _create_and_record(pattern, allowed, violations, warnings)
         result.task_id = task_id
-        if task_id:
-            log(f"Created triage task {task_id}: {pattern.title}")
-            # Record the proposal (only when task was actually created)
-            record_proposal(pattern, allowed, violations, warnings, task_id=result.task_id)
-        else:
-            log(f"Failed to create triage task: {pattern.title}", "ERROR")
-            result.error = "Task creation failed"
-            # Do NOT record — task wasn't created, so GR6 should not count it
+        result.error = error
     else:
         log(f"Dry-run — would create triage task: {pattern.title}")
         # Do NOT record in dry-run mode: GR6 counts recorded proposals
@@ -1048,9 +1153,8 @@ def propose_objective(
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
-def main():
-    global VERBOSE
-
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="OBJ-16: Autonomous objective proposer with guardrails."
     )
@@ -1071,7 +1175,70 @@ def main():
         default=ANALYSIS_WINDOW_DAYS,
         help=f"Analysis window in days (default: {ANALYSIS_WINDOW_DAYS})",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _print_proposal_result(result: ProposalResult, execute: bool) -> None:
+    """Print the summary for a proposed (allowed) pattern."""
+    if result.task_id:
+        print(f"PROPOSED: {result.pattern.title}")
+        print(f"  Task: {result.task_id}")
+        print(f"  Evidence: {result.pattern.evidence}")
+        if result.warnings:
+            print(f"  Warnings: {[w['id'] for w in result.warnings]}")
+    else:
+        status = "would create" if not execute else "FAILED to create"
+        print(f"PROPOSED (dry-run): {result.pattern.title}")
+        print(f"  Status: {status}")
+        print(f"  Evidence: {result.pattern.evidence}")
+        if result.warnings:
+            print(f"  Warnings: {[w['id'] for w in result.warnings]}")
+
+
+def _process_patterns(patterns: List[Pattern], execute: bool, verbose: bool) -> Tuple[bool, int]:
+    """Process patterns in priority order; return (proposed, analyzed_count).
+
+    GR6 limits to 1 proposal per day, so we try patterns in order and stop
+    after the first one that passes guardrails.
+    """
+    results: List[ProposalResult] = []
+    proposed = False
+
+    for pattern in patterns:
+        if verbose:
+            print(f"\n--- Pattern: {pattern.kind} (severity: {pattern.severity}) ---")
+            print(f"Title: {pattern.title}")
+            print(f"Evidence: {pattern.evidence}")
+            print()
+
+        result = propose_objective(pattern, execute=execute)
+        results.append(result)
+
+        if result.allowed:
+            proposed = True
+            # Print summary for cron delivery
+            _print_proposal_result(result, execute)
+
+            # GR6: max 1 proposal per day — stop after first success
+            break
+        else:
+            if verbose:
+                print(f"BLOCKED: {result.pattern.title}")
+                print(f"  Violations: {[v['id'] for v in result.violations]}")
+
+            # If blocked by GR6 (daily limit), stop trying
+            gr6_blocked = any(v["id"] == "GR6" for v in result.violations)
+            if gr6_blocked:
+                log("GR6 daily limit reached — stopping", "INFO")
+                break
+
+    return proposed, len(results)
+
+
+def main():
+    global VERBOSE
+
+    args = _parse_args()
     VERBOSE = args.verbose
 
     log(f"objective-proposer started (execute={args.execute}, window={args.window_days}d)")
@@ -1085,58 +1252,10 @@ def main():
         sys.exit(0)
 
     # Process patterns in priority order
-    # GR6 limits to 1 proposal per day, so we try patterns in order
-    # and stop after the first one that passes guardrails
-    results: List[ProposalResult] = []
-    proposed = False
-
-    for pattern in patterns:
-        if VERBOSE:
-            print(f"\n--- Pattern: {pattern.kind} (severity: {pattern.severity}) ---")
-            print(f"Title: {pattern.title}")
-            print(f"Evidence: {pattern.evidence}")
-            print()
-
-        result = propose_objective(pattern, execute=args.execute)
-        results.append(result)
-
-        if result.allowed:
-            proposed = True
-            # Print summary for cron delivery
-            if result.task_id:
-                print(f"PROPOSED: {result.pattern.title}")
-                print(f"  Task: {result.task_id}")
-                print(f"  Evidence: {result.pattern.evidence}")
-                if result.warnings:
-                    print(f"  Warnings: {[w['id'] for w in result.warnings]}")
-            else:
-                status = "would create" if not args.execute else "FAILED to create"
-                print(f"PROPOSED (dry-run): {result.pattern.title}")
-                print(f"  Status: {status}")
-                print(f"  Evidence: {result.pattern.evidence}")
-                if result.warnings:
-                    print(f"  Warnings: {[w['id'] for w in result.warnings]}")
-
-            # GR6: max 1 proposal per day — stop after first success
-            break
-        else:
-            if VERBOSE:
-                print(f"BLOCKED: {result.pattern.title}")
-                print(f"  Violations: {[v['id'] for v in result.violations]}")
-
-            # If blocked by GR6 (daily limit), stop trying
-            gr6_blocked = any(v["id"] == "GR6" for v in result.violations)
-            if gr6_blocked:
-                log("GR6 daily limit reached — stopping", "INFO")
-                break
-
-    # Summary
-    if not proposed and not VERBOSE:
-        # No proposal was made and not verbose — stay silent
-        pass
+    proposed, analyzed = _process_patterns(patterns, args.execute, VERBOSE)
 
     log(
-        f"objective-proposer finished: {len(results)} patterns analyzed, "
+        f"objective-proposer finished: {analyzed} patterns analyzed, "
         f"{'1 proposed' if proposed else '0 proposed'}"
     )
 
