@@ -360,16 +360,20 @@ def _read_backlog_guard(hermes_home=None, now=None) -> tuple:
     return None, None
 
 
-def build_board_screen(hermes_home=None) -> str:
-    """Board state: counts by status + active tasks + done in last 24h."""
+def _collect_board_state(hermes_home=None) -> tuple:
+    """Query the board db: status counts, active tasks, done in last 24h.
+
+    Returns (ok, counts, active, done24). ``ok`` is False when the db is
+    missing/unreadable (fail open — every reader), in which case the other
+    values are empty."""
     db = kanban_db_path(hermes_home)
     if not db.exists():
-        return ""
+        return False, {}, [], []
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
     except sqlite3.Error:
-        return ""
+        return False, {}, [], []
     try:
         counts = {}
         for r in con.execute(
@@ -385,10 +389,17 @@ def build_board_screen(hermes_home=None) -> str:
             "WHERE status='done' AND completed_at > ? "
             "ORDER BY completed_at DESC", (now - 86400,)).fetchall()
     except sqlite3.Error:
-        return ""
+        return False, {}, [], []
     finally:
         con.close()
+    return True, counts, active, done24
 
+
+def build_board_screen(hermes_home=None) -> str:
+    """Board state: counts by status + active tasks + done in last 24h."""
+    ok, counts, active, done24 = _collect_board_state(hermes_home)
+    if not ok:
+        return ""
     lines = ["BOARD"]
     total = sum(counts.values())
     status_s = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
@@ -474,51 +485,53 @@ def gpu_alerts(hermes_home=None, now=None) -> list:
     return alerts
 
 
-def build_alerts_screen(hermes_home=None) -> str:
-    """F2 alerts — ONLY when there is an anomaly. Else 'sin incidencias'."""
-    alerts = gpu_alerts(hermes_home)
+def _unattributed_alert(hermes_home=None) -> str | None:
+    """Alert if unattributed spend > UNATTRIBUTED_SPEND_PCT of the trace spend."""
+    total = 0.0
+    unatt = 0.0
+    for r in _read_jsonl(trace_path(hermes_home)):
+        total += r.get("costUsd") or 0
+        if r.get("objective") == "unattributed":
+            unatt += r.get("costUsd") or 0
+    if total > 0 and (unatt / total * 100) > UNATTRIBUTED_SPEND_PCT:
+        return ("unattributed > {:.0f}% del gasto: {:.1f}% (hueco de join)"
+                .format(UNATTRIBUTED_SPEND_PCT, unatt / total * 100))
+    return None
 
-    # 1. unattributed > 20% of spend
-    rows = _read_jsonl(trace_path(hermes_home))
-    has_trace = bool(rows)
-    if rows:
-        total = sum(r.get("costUsd") or 0 for r in rows)
-        unatt = sum(r.get("costUsd") or 0 for r in rows
-                    if r.get("objective") == "unattributed")
-        if total > 0 and (unatt / total * 100) > UNATTRIBUTED_SPEND_PCT:
-            alerts.append(
-                f"unattributed > {UNATTRIBUTED_SPEND_PCT:.0f}% del gasto: "
-                f"{unatt / total * 100:.1f}% (hueco de join)")
 
-    # 2. crash loop in last 24h
+def _crash_loop_alert(hermes_home=None) -> str | None:
+    """Alert if >= CRASH_LOOP_MIN failing task_runs in the last 24h."""
     db = kanban_db_path(hermes_home)
-    has_board = db.exists()
-    if db.exists():
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                now = time.time()
-                n = con.execute(
-                    "SELECT COUNT(*) c FROM task_runs "
-                    "WHERE started_at > ? AND outcome IN "
-                    "('crashed','timed_out','spawn_failed','gave_up')",
-                    (now - 86400,)).fetchone()[0]
-                if n >= CRASH_LOOP_MIN:
-                    alerts.append(f"loop de crashes: {n} en 24h")
-            finally:
-                con.close()
-        except sqlite3.Error:
-            pass
+            now = time.time()
+            n = con.execute(
+                "SELECT COUNT(*) c FROM task_runs "
+                "WHERE started_at > ? AND outcome IN "
+                "('crashed','timed_out','spawn_failed','gave_up')",
+                (now - 86400,)).fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if n >= CRASH_LOOP_MIN:
+        return f"loop de crashes: {n} en 24h"
+    return None
 
-    # 3. burn over threshold (eta_90 < 1h or < reset - 2h)
+
+def _burn_alerts(hermes_home=None) -> list:
+    """list of burn-threshold alerts (one per provider with eta_90)."""
     fc = _read_json(forecast_path(hermes_home))
     provs = fc.get("providers", {})
-    has_forecast = bool(provs)
     reset_h = fc.get("hours_to_reset")
     try:
         reset_h = float(reset_h) if reset_h is not None else None
     except (TypeError, ValueError):
         reset_h = None
+    out = []
     for name in sorted(provs):
         p = provs[name]
         eta90 = p.get("eta_90_hours")
@@ -529,14 +542,36 @@ def build_alerts_screen(hermes_home=None) -> str:
         if eta90 is None or eta90 < 0:
             continue
         if eta90 < BURN_ETA90_H:
-            alerts.append(f"burn {name}: eta_90={eta90:.1f}h (<1h) -> board off")
+            out.append(f"burn {name}: eta_90={eta90:.1f}h (<1h) -> board off")
         elif reset_h is not None and eta90 < (reset_h - BURN_COLCHON_H):
-            alerts.append(f"burn {name}: eta_90={eta90:.1f}h < margen reset "
-                          f"({reset_h:.1f}h) -> reducir workers")
+            out.append(f"burn {name}: eta_90={eta90:.1f}h < margen reset "
+                       f"({reset_h:.1f}h) -> reducir workers")
+    return out
+
+
+def build_alerts_screen(hermes_home=None) -> str:
+    """F2 alerts — ONLY when there is an anomaly. Else 'sin incidencias'."""
+    alerts = gpu_alerts(hermes_home)
+
+    # 1. unattributed > 20% of spend
+    un_alert = _unattributed_alert(hermes_home)
+    if un_alert:
+        alerts.append(un_alert)
+
+    # 2. crash loop in last 24h
+    cr_alert = _crash_loop_alert(hermes_home)
+    if cr_alert:
+        alerts.append(cr_alert)
+
+    # 3. burn over threshold (eta_90 < 1h or < reset - 2h)
+    alerts.extend(_burn_alerts(hermes_home))
 
     # GPU ml-host alerts (t_27e6f8f8 2c): fresh gpu-health.json cache counts
     # as a source; stale/absent cache does not (watchdog pattern).
     gpu_cache = _gpu_cache_raw(hermes_home)
+    has_trace = bool(_read_jsonl(trace_path(hermes_home)))
+    has_board = kanban_db_path(hermes_home).exists()
+    has_forecast = bool(_read_json(forecast_path(hermes_home)).get("providers"))
 
     # No sources at all -> stay silent (watchdog pattern), don't claim 'ok'.
     if not (has_trace or has_board or has_forecast or gpu_cache is not None):
@@ -556,6 +591,69 @@ def _fmt_dur(hours: float) -> str:
     return f"{hours:.1f}h"
 
 
+def _flight_rows(hermes_home=None, now=None) -> list | None:
+    """done tasks in the last 7 days from kanban.db, else None (no db)."""
+    now = time.time() if now is None else float(now)
+    db = kanban_db_path(hermes_home)
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return None
+    week_start = now - 7 * 86400
+    try:
+        rows = con.execute(
+            "SELECT id, title, body, completed_at FROM tasks "
+            "WHERE status='done' AND completed_at > ? "
+            "ORDER BY completed_at", (week_start,)).fetchall()
+    except sqlite3.Error:
+        rows = None
+    finally:
+        con.close()
+    return rows
+
+
+def _group_closures_by_objective(rows: list) -> dict:
+    """Group done-task rows by their `objective:` tag (or 'sin etiqueta').
+
+    MEDIATOR t_4fa0a4b5: the id namespace includes the approved_ objectives
+    TABLE ids (OBJ-AUTODEV, OBJ-CODEQUALITY, ...), so the regex covers both
+    `OBJ-` numeric ids and `OBJ-<word>` table ids."""
+    by_obj = {}
+    for r in rows:
+        m = re.search(r"objective:\s*(OBJ-[A-Za-z0-9._-]+)", r["body"] or "")
+        obj = m.group(1) if m else "sin etiqueta"
+        by_obj.setdefault(obj, []).append(r)
+    return by_obj
+
+
+def _balance_spent_since(hermes_home=None, week_start: float = 0.0) -> float:
+    """Balance-billed USD from the trace after ``week_start`` (costUsd > 0)."""
+    trace_rows = _read_jsonl(trace_path(hermes_home))
+    return sum(r.get("costUsd") or 0 for r in trace_rows
+               if (r.get("ts_epoch_utc") or 0) > week_start
+               and (r.get("costUsd") or 0) > 0)
+
+
+def _render_flight_lines(by_obj: dict, total: int, spent: float) -> str:
+    """Render the VUELO block lines from the aggregated closures."""
+    lines = ["VUELO (rendicion semanal del mandato — OBJ-42)",
+             f"  cerradas 7d: {total} | gasto balance 7d: {_fmt_usd(spent)}"]
+    if total:
+        for obj in sorted(by_obj):
+            ids = [r["id"] for r in by_obj[obj]]
+            shown = ", ".join(ids[:6])
+            if len(ids) > 6:
+                shown += f", +{len(ids) - 6} mas"
+            lines.append(f"  {obj}: {len(ids)} cerradas ({shown})")
+    else:
+        lines.append("  sin cierres en 7d — verificar que el vuelo repite, "
+                     "no que se detuvo (constitution 24c)")
+    return "\n".join(lines)
+
+
 def build_flight_report(hermes_home=None, now=None) -> str:
     """OBJ-42 weekly flight rendition — VUELO section for the Monday report.
 
@@ -571,59 +669,13 @@ def build_flight_report(hermes_home=None, now=None) -> str:
     local_now = dt.datetime.fromtimestamp(now, CEST)
     if local_now.weekday() != 0:
         return ""
-    db = kanban_db_path(hermes_home)
-    if not db.exists():
-        return ""
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        con.row_factory = sqlite3.Row
-    except sqlite3.Error:
+    rows = _flight_rows(hermes_home, float(now))
+    if rows is None:
         return ""
     week_start = now - 7 * 86400
-    try:
-        rows = con.execute(
-            "SELECT id, title, body, completed_at FROM tasks "
-            "WHERE status='done' AND completed_at > ? "
-            "ORDER BY completed_at", (week_start,)).fetchall()
-    except sqlite3.Error:
-        con.close()
-        return ""
-    finally:
-        con.close()
-
-    # Group by objective: tag header `objective:OBJ-NN` in the body (the
-    # OBJ-08 convention). Untagged closures group under 'sin etiqueta'.
-    # MEDIATOR t_4fa0a4b5: the id namespace now includes the approved_
-    # objectives TABLE ids (OBJ-AUTODEV, OBJ-CODEQUALITY, ...), so the
-    # regex covers `OBJ-` ids AND `OBJ-<word>` table ids.
-    by_obj = {}
-    for r in rows:
-        m = re.search(r"objective:\s*(OBJ-[A-Za-z0-9._-]+)",
-                      r["body"] or "")
-        obj = m.group(1) if m else "sin etiqueta"
-        by_obj.setdefault(obj, []).append(r)
-
-    # Balance-billed spend over the same window from the trace
-    # (costUsd > 0 rows = balance-billed per x_nanogpt_pricing semantics).
-    trace_rows = _read_jsonl(trace_path(hermes_home))
-    spent = sum(r.get("costUsd") or 0 for r in trace_rows
-                if (r.get("ts_epoch_utc") or 0) > week_start
-                and (r.get("costUsd") or 0) > 0)
-
-    total = len(rows)
-    lines = ["VUELO (rendicion semanal del mandato — OBJ-42)",
-             f"  cerradas 7d: {total} | gasto balance 7d: {_fmt_usd(spent)}"]
-    if total:
-        for obj in sorted(by_obj):
-            ids = [r["id"] for r in by_obj[obj]]
-            shown = ", ".join(ids[:6])
-            if len(ids) > 6:
-                shown += f", +{len(ids) - 6} mas"
-            lines.append(f"  {obj}: {len(ids)} cerradas ({shown})")
-    else:
-        lines.append("  sin cierres en 7d — verificar que el vuelo repite, "
-                     "no que se detuvo (constitution 24c)")
-    return "\n".join(lines)
+    by_obj = _group_closures_by_objective(rows)
+    spent = _balance_spent_since(hermes_home, float(week_start))
+    return _render_flight_lines(by_obj, len(rows), spent)
 
 
 def build_efficiency_screen(hermes_home=None) -> str:
@@ -723,6 +775,40 @@ def _free_quota_line(hermes_home=None) -> str:
     return f"  Cuota gratis:            {', '.join(parts)} ({estado})"
 
 
+def _approved_objectives_rows(hermes_home=None) -> list | None:
+    """approved_objectives TABLE rows from the root kanban.db, else None."""
+    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
+    db = base / "kanban.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            return con.execute(
+                "SELECT id, name, status, budget_daily, spent_today, spent_total "
+                "FROM approved_objectives ORDER BY id").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def _objective_color(pct: float, budget: float) -> str:
+    """Traffic-light dot for an objective based on its spend ratio."""
+    dot = {"green": "[VERDE]", "yellow": "[AMBAR]", "orange": "[NARANJA]",
+           "red": "[ROJO]"}
+    if budget <= 0:
+        return dot["red"]
+    if pct < 0.5:
+        return dot["green"]
+    if pct < 0.8:
+        return dot["yellow"]
+    if pct < 1.0:
+        return dot["orange"]
+    return dot["red"]
+
+
 def build_objectives_screen(hermes_home=None) -> str:
     """OBJETIVOS APROBADOS (MEDIATOR 2026-09-14): inventory + spend + colors.
 
@@ -731,24 +817,9 @@ def build_objectives_screen(hermes_home=None) -> str:
     render (degraded mode is alarmed by the health-check, not here).
     t_7626791f: gasto contra balance (ruta A) shown separately from the
     free-quota state (last quota_tick observation)."""
-    import sqlite3
-    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
-    db = base / "kanban.db"
-    if not db.exists():
-        return ""
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT id, name, status, budget_daily, spent_today, spent_total "
-            "FROM approved_objectives ORDER BY id").fetchall()
-        con.close()
-    except sqlite3.Error:
-        return ""
+    rows = _approved_objectives_rows(hermes_home)
     if not rows:
         return ""
-    dot = {"green": "[VERDE]", "yellow": "[AMBAR]", "orange": "[NARANJA]",
-           "red": "[ROJO]"}
     lines = ["OBJETIVOS APROBADOS:"]
     tot_spend = tot_budget = 0.0
     for r in rows:
@@ -757,16 +828,7 @@ def build_objectives_screen(hermes_home=None) -> str:
         tot_spend += spent
         tot_budget += budget
         pct = (spent / budget) if budget > 0 else 0.0
-        if budget <= 0:
-            color = dot["red"]
-        elif pct < 0.5:
-            color = dot["green"]
-        elif pct < 0.8:
-            color = dot["yellow"]
-        elif pct < 1.0:
-            color = dot["orange"]
-        else:
-            color = dot["red"]
+        color = _objective_color(pct, budget)
         name = (r["name"] or "")[:36]
         lines.append(f"  {r['id']:<14} {r['status']:<9} "
                      f"${spent:.2f}/${budget:.2f}   {color}  ({name})")
@@ -777,13 +839,8 @@ def build_objectives_screen(hermes_home=None) -> str:
     return "\n".join(lines)
 
 
-def build_approval_screen(hermes_home=None) -> str:
-    """APPROVAL-READY (P5): triage tasks stamped [APPROVAL: pending].
-
-    Reads approval_gate from the same dir (import; fail-open if absent —
-    the section simply does not render). Lists id/title/package-gap so the
-    owner can say si/no/condicion in chat."""
-    gate = None
+def _load_approval_gate():
+    """Import approval_gate.py from the script dir or ~/.hermes/scripts."""
     here = Path(__file__).resolve().parent
     for cand in (here / "approval_gate.py",
                  here.parent / "approval_gate.py",
@@ -797,9 +854,39 @@ def build_approval_screen(hermes_home=None) -> str:
                     continue
                 gate = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(gate)
-                break
+                return gate
             except Exception:
                 continue
+    return None
+
+
+def _render_approval_lines(pend: list, gate) -> str:
+    """Render APPROVAL-READY pending list with package-gap annotations."""
+    lines = ["APPROVAL-READY (pendientes de tu ok):"]
+    n = 0
+    for t in pend:
+        body = t["body"] or ""
+        missing = gate.package_missing(body)
+        obj_m = gate.PACKAGE_FIELDS[6][1].search(body)
+        budget_m = gate.PACKAGE_FIELDS[0][1].search(body)
+        obj = obj_m.group(1) if obj_m else "-"
+        budget = budget_m.group(1).strip()[:28] if budget_m else "-"
+        gap = "" if not missing else f"  [falta {', '.join(missing)}]"
+        n += 1
+        lines.append(f"  {n}. {obj}: {(t['title'] or '')[:64]} — "
+                     f"{budget}{gap}")
+    lines.append('  -> Di "sí" en chat para arrancar, "no" para archivar,')
+    lines.append('     o "sí pero con <condición>".')
+    return "\n".join(lines)
+
+
+def build_approval_screen(hermes_home=None) -> str:
+    """APPROVAL-READY (P5): triage tasks stamped [APPROVAL: pending].
+
+    Reads approval_gate from the same dir (import; fail-open if absent —
+    the section simply does not render). Lists id/title/package-gap so the
+    owner can say si/no/condicion in chat."""
+    gate = _load_approval_gate()
     if gate is None:
         return ""
     # Hermetic resolution (t_7626791f): respect the caller's hermes_home —
@@ -814,24 +901,9 @@ def build_approval_screen(hermes_home=None) -> str:
         db = gate.kanban_db_path()
     pend = gate.fetch_pending(db)
     if not pend:
-        return "APPROVAL-READY (pendientes de tu ok)\n  sin iniciativas pendientes de aprobacion"
-    lines = ["APPROVAL-READY (pendientes de tu ok):"]
-    n = 0
-    for t in pend:
-        body = t["body"] or ""
-        missing = gate.package_missing(body)
-        obj_m = gate.PACKAGE_FIELDS[6][1].search(body)
-        budget_m = gate.PACKAGE_FIELDS[0][1].search(body)
-        obj = obj_m.group(1) if obj_m else "-"
-        budget = budget_m.group(1).strip()[:28] if budget_m else "-"
-        gap = "" if not missing else \
-            f"  [falta {', '.join(missing)}]"
-        n += 1
-        lines.append(f"  {n}. {obj}: {(t['title'] or '')[:64]} — "
-                     f"{budget}{gap}")
-    lines.append('  -> Di "sí" en chat para arrancar, "no" para archivar,')
-    lines.append('     o "sí pero con <condición>".')
-    return "\n".join(lines)
+        return ("APPROVAL-READY (pendientes de tu ok)"
+                "\n  sin iniciativas pendientes de aprobacion")
+    return _render_approval_lines(pend, gate)
 
 
 # ---------------------------------------------------------------------------
