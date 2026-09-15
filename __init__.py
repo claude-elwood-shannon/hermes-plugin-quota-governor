@@ -218,35 +218,62 @@ def _on_kanban_dispatch_tick(
     outcome: str = "ok",
     **_: Any,
 ) -> None:
-    """Dispatcher fires this after each dispatch tick.
+    """Dispatcher hook after each tick.
 
-    OBJ-18 follow-up: deterministically reassign privacy:high tasks that
-    the cron LLM agent misrouted to pr-ollama instead of pr-nanogpt.  The
-    LLM agent consistently skips the Phase 2 privacy-gate.sh re-run, so
-    we enforce correct routing here instead of relying on prompt compliance.
-
-    Non-blocking: spawns privacy-router-fix.py in the background. The
-    script reads the kanban DB directly, runs privacy-gate.sh, and
-    reassigns mismatched tasks via `hermes kanban assign`.
-
-    Best-effort: if the script is missing or the spawn fails, the no-agent
-    cron job (every 5 minutes) still catches misrouted tasks.
+    Delegates to :func:`_handle_dispatch_tick`. The wrapper is <50 lines.
     """
-    if not os.path.exists(_PRIVACY_ROUTER_SCRIPT):
-        logger.debug("privacy-router-fix.py not found at %s — skipping", _PRIVACY_ROUTER_SCRIPT)
-        return
+    _handle_dispatch_tick(board, profile_name, dry_run, outcome)
 
-    try:
-        subprocess.Popen(
-            ["python3", _PRIVACY_ROUTER_SCRIPT],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,  # detach from dispatcher process group
-        )
-        logger.debug("privacy-router-fix.py spawned after dispatch tick")
-    except Exception as exc:
-        logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
+
++def _handle_dispatch_tick(
++    board: Optional[str], profile_name: str, dry_run: bool, outcome: str
++):
++    """Perform privacy, assignee, and approval fixes.
++
++    Spawns each missing script in the background; any failure is logged.
++    All subprocesses are detached to keep the dispatcher responsive.
++    """
++    # privacy-router
++    if os.path.exists(_PRIVACY_ROUTER_SCRIPT):
++        try:
++            subprocess.Popen(
++                ["python3", _PRIVACY_ROUTER_SCRIPT],
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                stdin=subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            logger.debug("privacy-router-fix.py spawned after dispatch tick")
++        except Exception as exc:
++            logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
++
++    # assignee‑fix
++    if os.path.exists(_ASSIGNEE_FIX_SCRIPT):
++        try:
++            subprocess.Popen(
++                ["python3", _ASSIGNEE_FIX_SCRIPT],
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                stdin=subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            logger.debug("assignee-fix.py spawned after dispatch tick")
++        except Exception as exc:
++            logger.debug("failed to spawn assignee-fix.py: %s", exc)
++
++    # approval‑ready
++    if os.path.exists(_APPROVAL_FIX_SCRIPT):
++        try:
++            subprocess.Popen(
++                ["/usr/bin/python3.12", _APPROVAL_FIX_SCRIPT, "--execute"],
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                stdin=subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            logger.debug("approval-ready-fix.py spawned after dispatch tick")
++        except Exception as exc:
++            logger.debug("failed to spawn approval-ready-fix.py: %s", exc)
 
     # OBJ-08: deterministically reassign tasks whose assignee is not a valid
     # profile (e.g. the LLM agent invented 'alice').  Same pattern as the
