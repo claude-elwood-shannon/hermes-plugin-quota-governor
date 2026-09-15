@@ -44,7 +44,9 @@ Gate integration (see quota-gate.py ``nanogpt_budget_context``):
         "request_covered_usd": 0.0,   # OBJ-26a: per-request capture sums
         "request_balance_usd": 0.03,  # (separate from probe-derived spend)
         "level": "ok" | "warn" | "stop",
-        "covered_models": ["z-ai/glm-5.3-flash", ...],
+        "covered_model_count": 292,   # MEDIATOR t_4fa0a4b5: count only —
+                                      # the raw list left the snapshot
+                                      # (data_inspection 400, see below)
         "coverage_unknown": false,
         "source": "probe"|"cache"|"unavailable",
     }
@@ -641,7 +643,15 @@ def budget_context(max_spend_usd=None, warn_fraction=None, hermes_home=None):
             "request_covered_usd": (req_totals or {}).get("request_covered_usd"),
             "request_balance_usd": (req_totals or {}).get("request_balance_usd"),
             "level": level,
-            "covered_models": sorted(covered) if covered is not None else [],
+            # MEDIATOR t_4fa0a4b5: the full covered-model LIST no longer
+            # travels in the gate snapshot. It inflated the cron prompt by
+            # ~20 KB with model names like "uncensored"/"obliterated",
+            # which trips the upstream data_inspection filter of
+            # Console Go (HTTP 400) intermittently and killed the creator
+            # before it could answer. Consumers only need the COUNT plus
+            # a targeted membership probe.
+            "covered_model_count": (len(covered)
+                                    if covered is not None else None),
             "coverage_unknown": covered is None,
             "source": snap.get("source"),
         }
