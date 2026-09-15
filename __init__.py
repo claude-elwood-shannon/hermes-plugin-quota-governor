@@ -225,55 +225,55 @@ def _on_kanban_dispatch_tick(
     _handle_dispatch_tick(board, profile_name, dry_run, outcome)
 
 
-+def _handle_dispatch_tick(
-+    board: Optional[str], profile_name: str, dry_run: bool, outcome: str
-+):
-+    """Perform privacy, assignee, and approval fixes.
-+
-+    Spawns each missing script in the background; any failure is logged.
-+    All subprocesses are detached to keep the dispatcher responsive.
-+    """
-+    # privacy-router
-+    if os.path.exists(_PRIVACY_ROUTER_SCRIPT):
-+        try:
-+            subprocess.Popen(
-+                ["python3", _PRIVACY_ROUTER_SCRIPT],
-+                stdout=subprocess.DEVNULL,
-+                stderr=subprocess.DEVNULL,
-+                stdin=subprocess.DEVNULL,
-+                start_new_session=True,
-+            )
-+            logger.debug("privacy-router-fix.py spawned after dispatch tick")
-+        except Exception as exc:
-+            logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
-+
-+    # assignee‑fix
-+    if os.path.exists(_ASSIGNEE_FIX_SCRIPT):
-+        try:
-+            subprocess.Popen(
-+                ["python3", _ASSIGNEE_FIX_SCRIPT],
-+                stdout=subprocess.DEVNULL,
-+                stderr=subprocess.DEVNULL,
-+                stdin=subprocess.DEVNULL,
-+                start_new_session=True,
-+            )
-+            logger.debug("assignee-fix.py spawned after dispatch tick")
-+        except Exception as exc:
-+            logger.debug("failed to spawn assignee-fix.py: %s", exc)
-+
-+    # approval‑ready
-+    if os.path.exists(_APPROVAL_FIX_SCRIPT):
-+        try:
-+            subprocess.Popen(
-+                ["/usr/bin/python3.12", _APPROVAL_FIX_SCRIPT, "--execute"],
-+                stdout=subprocess.DEVNULL,
-+                stderr=subprocess.DEVNULL,
-+                stdin=subprocess.DEVNULL,
-+                start_new_session=True,
-+            )
-+            logger.debug("approval-ready-fix.py spawned after dispatch tick")
-+        except Exception as exc:
-+            logger.debug("failed to spawn approval-ready-fix.py: %s", exc)
+def _handle_dispatch_tick(
+    board: Optional[str], profile_name: str, dry_run: bool, outcome: str
+):
+    """Perform privacy, assignee, and approval fixes.
+
+    Spawns each missing script in the background; any failure is logged.
+    All subprocesses are detached to keep the dispatcher responsive.
+    """
+    # privacy-router
+    if os.path.exists(_PRIVACY_ROUTER_SCRIPT):
+        try:
+            subprocess.Popen(
+                ["python3", _PRIVACY_ROUTER_SCRIPT],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.debug("privacy-router-fix.py spawned after dispatch tick")
+        except Exception as exc:
+            logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
+
+    # assignee‑fix
+    if os.path.exists(_ASSIGNEE_FIX_SCRIPT):
+        try:
+            subprocess.Popen(
+                ["python3", _ASSIGNEE_FIX_SCRIPT],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.debug("assignee-fix.py spawned after dispatch tick")
+        except Exception as exc:
+            logger.debug("failed to spawn assignee-fix.py: %s", exc)
+
+    # approval‑ready
+    if os.path.exists(_APPROVAL_FIX_SCRIPT):
+        try:
+            subprocess.Popen(
+                ["/usr/bin/python3.12", _APPROVAL_FIX_SCRIPT, "--execute"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.debug("approval-ready-fix.py spawned after dispatch tick")
+        except Exception as exc:
+            logger.debug("failed to spawn approval-ready-fix.py: %s", exc)
 
     # OBJ-08: deterministically reassign tasks whose assignee is not a valid
     # profile (e.g. the LLM agent invented 'alice').  Same pattern as the
