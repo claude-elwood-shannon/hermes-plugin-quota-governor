@@ -46,17 +46,98 @@ def check(desc, condition, detail=""):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: parse_privacy_tag
+# Shared fixture provider lists
 # ---------------------------------------------------------------------------
+MOCK_PROVIDERS = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 60.0, "bottleneck_pct": 40.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+    {"profile": "pr-openrouter", "provider": "openrouter", "model": "z-ai/glm-5.2:free",
+     "availability": 90.0, "bottleneck_pct": 10.0, "bottleneck_window": "weekly_usd",
+     "error": "", "raw": {}},
+]
 
-def main():
-    """Run the 15 privacy-routing check groups. Returns 0/1.
+MOCK_PROVIDERS_SENSITIVE = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 50.0, "bottleneck_pct": 50.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 70.0, "bottleneck_pct": 30.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+    {"profile": "pr-openrouter", "provider": "openrouter", "model": "z-ai/glm-5.2:free",
+     "availability": 95.0, "bottleneck_pct": 5.0, "bottleneck_window": "weekly_usd",
+     "error": "", "raw": {}},
+]
 
-    pytest collection safety: mutates os.environ (QUOTA_GATE_PRIVACY)
-    and sys.argv, and runs quota-gate.py as subprocess — none of it
-    may leak into the pytest interpreter collecting sibling files
-    (importlib mode). Runs on explicit invocation only.
-    """
+MOCK_CLOUD_ONLY = [
+    {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+     "availability": 90.0, "bottleneck_pct": 10.0, "bottleneck_window": "session",
+     "error": "", "raw": {}},
+    {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+     "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "daily",
+     "error": "", "raw": {}},
+]
+
+
+def simulate_main(providers_list, privacy_level):
+    """Simulate the main() flow without live API calls."""
+    warnings = []
+    recommended = quota_gate.select_provider(providers_list, privacy_level=privacy_level)
+    if recommended is None and privacy_level:
+        capable = quota_gate.PRIVACY_CAPABILITIES.get(privacy_level, set())
+        available = [p["provider"] for p in providers_list if not p["error"]]
+        warnings.append(
+            f"privacy:{privacy_level} excludes all available providers "
+            f"(available: {available}, capable: {sorted(capable)})"
+        )
+    if recommended is None:
+        return {
+            "wakeAgent": False,
+            "context": {
+                "privacy_level": privacy_level or "none",
+                "warning": "; ".join(warnings) if warnings else "all providers exhausted",
+            },
+        }
+    return {
+        "wakeAgent": True,
+        "context": {
+            "recommended_profile": recommended["profile"],
+            "recommended_model": recommended["model"],
+            "privacy_level": privacy_level or "none",
+            "warning": "; ".join(warnings) if warnings else None,
+        },
+    }
+
+
+def _parse_privacy_via_stdin(json_str):
+    """Run parse_privacy_level with stdin JSON (no env var set)."""
+    code = (
+        "import sys, json, os, importlib.util\n"
+        "os.environ.pop('QUOTA_GATE_PRIVACY', None)\n"
+        f"_spec = importlib.util.spec_from_file_location('qg', "
+        f"'{os.path.join(SCRIPTS_DIR, 'quota-gate.py')}')\n"
+        "qg = importlib.util.module_from_spec(_spec)\n"
+        "_spec.loader.exec_module(qg)\n"
+        "print(qg.parse_privacy_level())\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        input=json_str, capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        return None
+    val = proc.stdout.strip()
+    return val if val != "None" else None
+
+
+# ---------------------------------------------------------------------------
+# Test group helpers
+# ---------------------------------------------------------------------------
+def _test1_parse_privacy_tag():
+    """Test 1: parse_privacy_tag extracts the privacy level from task text."""
     print("\n--- Test 1: parse_privacy_tag ---")
 
     check("public tag",
@@ -101,9 +182,8 @@ def main():
           quota_gate.parse_privacy_tag("objective:OBJ-18\nprivacy:medium\nauto_created:true") == "sensitive")
 
 
-    # ---------------------------------------------------------------------------
-    # Test 2: parse_privacy_level (env var)
-    # ---------------------------------------------------------------------------
+def _test2_env_var():
+    """Test 2: parse_privacy_level resolves from the QUOTA_GATE_PRIVACY env var."""
     print("\n--- Test 2: parse_privacy_level (env var) ---")
 
     os.environ["QUOTA_GATE_PRIVACY"] = "sensitive"
@@ -142,78 +222,50 @@ def main():
     del os.environ["QUOTA_GATE_PRIVACY"]
 
 
-    # ---------------------------------------------------------------------------
-    # Test 3: select_provider with no privacy filtering (baseline)
-    # ---------------------------------------------------------------------------
+def _test3_no_privacy_baseline():
+    """Test 3: select_provider with no privacy filtering (baseline)."""
     print("\n--- Test 3: select_provider (no privacy, baseline) ---")
 
-    # Build a mock providers list
-    mock_providers = [
-        {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
-         "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "session",
-         "error": "", "raw": {}},
-        {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
-         "availability": 60.0, "bottleneck_pct": 40.0, "bottleneck_window": "daily",
-         "error": "", "raw": {}},
-        {"profile": "pr-openrouter", "provider": "openrouter", "model": "z-ai/glm-5.2:free",
-         "availability": 90.0, "bottleneck_pct": 10.0, "bottleneck_window": "weekly_usd",
-         "error": "", "raw": {}},
-    ]
-
-    result = quota_gate.select_provider(mock_providers, privacy_level=None)
+    result = quota_gate.select_provider(MOCK_PROVIDERS, privacy_level=None)
     # OBJ-26: preference-first for ALL levels — pr-nanogpt (pref 0) wins even
     # with lower availability (openrouter 90% is no longer first).
     check("no privacy → preference-first picks pr-nanogpt (OBJ-26)",
           result is not None and result["profile"] == "pr-nanogpt",
           f"got {result['profile'] if result else 'None'}")
 
-    result = quota_gate.select_provider(mock_providers, privacy_level="public")
+    result = quota_gate.select_provider(MOCK_PROVIDERS, privacy_level="public")
     check("public → same preference-first (pr-nanogpt, OBJ-26)",
           result is not None and result["profile"] == "pr-nanogpt",
           f"got {result['profile'] if result else 'None'}")
 
 
-    # ---------------------------------------------------------------------------
-    # Test 4: select_provider with sensitive (excludes OpenRouter)
-    # ---------------------------------------------------------------------------
+def _test4_sensitive():
+    """Test 4: select_provider with sensitive excludes OpenRouter."""
     print("\n--- Test 4: select_provider (sensitive) ---")
 
-    result = quota_gate.select_provider(mock_providers, privacy_level="sensitive")
+    result = quota_gate.select_provider(MOCK_PROVIDERS, privacy_level="sensitive")
     check("sensitive → excludes openrouter, picks nanogpt (preference-first over ollama 80%)",
           result is not None and result["profile"] == "pr-nanogpt",
           f"got {result['profile'] if result else 'None'}")
 
-    # Make nanogpt higher than ollama
-    mock_providers_sensitive = [
-        {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
-         "availability": 50.0, "bottleneck_pct": 50.0, "bottleneck_window": "session",
-         "error": "", "raw": {}},
-        {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
-         "availability": 70.0, "bottleneck_pct": 30.0, "bottleneck_window": "daily",
-         "error": "", "raw": {}},
-        {"profile": "pr-openrouter", "provider": "openrouter", "model": "z-ai/glm-5.2:free",
-         "availability": 95.0, "bottleneck_pct": 5.0, "bottleneck_window": "weekly_usd",
-         "error": "", "raw": {}},
-    ]
-    result = quota_gate.select_provider(mock_providers_sensitive, privacy_level="sensitive")
+    result = quota_gate.select_provider(MOCK_PROVIDERS_SENSITIVE, privacy_level="sensitive")
     check("sensitive → picks nanogpt (70%) over openrouter (95%, excluded)",
           result is not None and result["profile"] == "pr-nanogpt",
           f"got {result['profile'] if result else 'None'}")
 
 
-    # ---------------------------------------------------------------------------
-    # Test 5: select_provider with confidential (only local/custom)
-    # ---------------------------------------------------------------------------
+def _test5_confidential():
+    """Test 5: select_provider with confidential only allows local/custom."""
     print("\n--- Test 5: select_provider (confidential) ---")
 
     # No local provider in the mock list → should return None
-    result = quota_gate.select_provider(mock_providers, privacy_level="confidential")
+    result = quota_gate.select_provider(MOCK_PROVIDERS, privacy_level="confidential")
     check("confidential → no local provider → None",
           result is None,
           f"got {result}")
 
     # Add a local provider
-    mock_with_local = mock_providers + [
+    mock_with_local = MOCK_PROVIDERS + [
         {"profile": "pr-local", "provider": "custom", "model": "llama3.2:3b",
          "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "local",
          "error": "", "raw": {}},
@@ -224,9 +276,8 @@ def main():
           f"got {result['provider'] if result else 'None'}")
 
 
-    # ---------------------------------------------------------------------------
-    # Test 6: select_provider with errored providers
-    # ---------------------------------------------------------------------------
+def _test6_errored():
+    """Test 6: select_provider with errored providers + privacy."""
     print("\n--- Test 6: select_provider (errored + privacy) ---")
 
     mock_errored = [
@@ -251,9 +302,8 @@ def main():
           result is None)
 
 
-    # ---------------------------------------------------------------------------
-    # Test 7: Privacy capability mapping consistency
-    # ---------------------------------------------------------------------------
+def _test7_capabilities():
+    """Test 7: PRIVACY_CAPABILITIES mapping is internally consistent."""
     print("\n--- Test 7: PRIVACY_CAPABILITIES consistency ---")
 
     check("public allows ollama-cloud",
@@ -283,46 +333,16 @@ def main():
           "confidential" in quota_gate._PROVIDER_PRIVACY["custom"])
 
 
-    # ---------------------------------------------------------------------------
-    # Test 8: End-to-end via main() with env var
-    # ---------------------------------------------------------------------------
+def _test8_e2e():
+    """Test 8: End-to-end via main() with env var."""
     print("\n--- Test 8: End-to-end via main() ---")
 
     # We can't call main() directly because it queries live APIs.
     # Instead, we test the select_provider + privacy_level flow by simulating
     # the main() logic with mock providers.
 
-    def simulate_main(providers_list, privacy_level):
-        """Simulate the main() flow without live API calls."""
-        warnings = []
-        recommended = quota_gate.select_provider(providers_list, privacy_level=privacy_level)
-        if recommended is None and privacy_level:
-            capable = quota_gate.PRIVACY_CAPABILITIES.get(privacy_level, set())
-            available = [p["provider"] for p in providers_list if not p["error"]]
-            warnings.append(
-                f"privacy:{privacy_level} excludes all available providers "
-                f"(available: {available}, capable: {sorted(capable)})"
-            )
-        if recommended is None:
-            return {
-                "wakeAgent": False,
-                "context": {
-                    "privacy_level": privacy_level or "none",
-                    "warning": "; ".join(warnings) if warnings else "all providers exhausted",
-                },
-            }
-        return {
-            "wakeAgent": True,
-            "context": {
-                "recommended_profile": recommended["profile"],
-                "recommended_model": recommended["model"],
-                "privacy_level": privacy_level or "none",
-                "warning": "; ".join(warnings) if warnings else None,
-            },
-        }
-
     # Public → wakeAgent true, preference-first → pr-nanogpt (OBJ-26)
-    out = simulate_main(mock_providers, "public")
+    out = simulate_main(MOCK_PROVIDERS, "public")
     check("e2e public → wakeAgent:true",
           out["wakeAgent"] is True)
     check("e2e public → profile pr-nanogpt (preference-first, OBJ-26)",
@@ -332,7 +352,7 @@ def main():
           out["context"]["privacy_level"] == "public")
 
     # Sensitive → wakeAgent true, picks nanogpt (preference-first, openrouter excluded)
-    out = simulate_main(mock_providers, "sensitive")
+    out = simulate_main(MOCK_PROVIDERS, "sensitive")
     check("e2e sensitive → wakeAgent:true",
           out["wakeAgent"] is True)
     check("e2e sensitive → profile pr-nanogpt (preference-first)",
@@ -342,7 +362,7 @@ def main():
           out["context"]["privacy_level"] == "sensitive")
 
     # Confidential → wakeAgent false (no local provider)
-    out = simulate_main(mock_providers, "confidential")
+    out = simulate_main(MOCK_PROVIDERS, "confidential")
     check("e2e confidential → wakeAgent:false",
           out["wakeAgent"] is False)
     check("e2e confidential → privacy_level confidential",
@@ -352,16 +372,15 @@ def main():
           f"warning: {out['context']['warning']}")
 
     # None → behaves as before (no privacy field shown as "none")
-    out = simulate_main(mock_providers, None)
+    out = simulate_main(MOCK_PROVIDERS, None)
     check("e2e none → wakeAgent:true",
           out["wakeAgent"] is True)
     check("e2e none → privacy_level none",
           out["context"]["privacy_level"] == "none")
 
 
-    # -----------------------------------------------------------------------#
-    # Test 9: Alias routing (OBJ-18: high→NanoGPT, low→Ollama)
-    # -----------------------------------------------------------------------
+def _test9_alias_high():
+    """Test 9a: privacy:high → sensitive → NanoGPT routing."""
     print("\n--- Test 9: Alias routing (high→NanoGPT, low→Ollama) ---")
 
     # Use mock_providers_sensitive where nanogpt has higher availability
@@ -374,7 +393,7 @@ def main():
           high_level == "sensitive",
           f"got {high_level}")
 
-    out_high = simulate_main(mock_providers_sensitive, high_level)
+    out_high = simulate_main(MOCK_PROVIDERS_SENSITIVE, high_level)
     check("e2e high → wakeAgent:true",
           out_high["wakeAgent"] is True)
     check("e2e high → routes to pr-nanogpt (sensitive, NanoGPT)",
@@ -383,6 +402,9 @@ def main():
     check("e2e high → privacy_level sensitive",
           out_high["context"]["privacy_level"] == "sensitive")
 
+
+def _test9_alias_low_medium():
+    """Test 9b: privacy:low → public and privacy:medium → sensitive routing."""
     # privacy:low → public → Ollama (all providers eligible, openrouter 90% wins)
     # BUT OBJ-18 criterion says "low → Ollama". In the public lane, the
     # highest-availability provider wins. With mock_providers (openrouter 90%),
@@ -422,18 +444,16 @@ def main():
           medium_level == "sensitive",
           f"got {medium_level}")
 
-    out_medium = simulate_main(mock_providers_sensitive, medium_level)
+    out_medium = simulate_main(MOCK_PROVIDERS_SENSITIVE, medium_level)
     check("e2e medium → routes to pr-nanogpt (sensitive)",
           out_medium["context"]["recommended_profile"] == "pr-nanogpt",
           f"got {out_medium['context']['recommended_profile']}")
 
 
-    # -----------------------------------------------------------------------
-    # Test 10: Preference-first routing (OBJ-18 Phase 3)
-    # -----------------------------------------------------------------------
+def _test10_preference_first_a():
+    """Test 10a: preference-first routing (sensitive → NanoGPT always) — wins."""
     # The OBJ-18 completion criterion requires privacy:high → NanoGPT even
     # when Ollama has MORE availability.  This is preference-first routing.
-    # -----------------------------------------------------------------------
     print("\n--- Test 10: Preference-first routing (sensitive → NanoGPT always) ---")
 
     # Mock where Ollama has MUCH more availability than NanoGPT.
@@ -474,7 +494,10 @@ def main():
           result_pub is not None and result_pub["profile"] == "pr-nanogpt",
           f"got {result_pub['profile'] if result_pub else 'None'}")
 
-    # Fallback: nanogpt errored → ollama selected (preference-first respects errors)
+
+def _test10_preference_first_b():
+    """Test 10b: preference-first fallbacks and PRIVACY_PROVIDER_PREFERENCE."""
+    # Fallback: nanogpt errored → ollama
     mock_nanogpt_err = [
         {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
          "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "session",
@@ -487,7 +510,6 @@ def main():
     check("sensitive preference-first: nanogpt errored → fallback to ollama",
           result is not None and result["profile"] == "pr-ollama",
           f"got {result['profile'] if result else 'None'}")
-
     # Fallback: nanogpt availability=0 (no error, exhausted quota) → ollama
     mock_nanogpt_zero = [
         {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
@@ -501,8 +523,15 @@ def main():
     check("sensitive preference-first: nanogpt availability=0 → fallback to ollama",
           result is not None and result["profile"] == "pr-ollama",
           f"got {result['profile'] if result else 'None'}")
-
     # E2E: privacy:high → sensitive → NanoGPT wins (preference-first)
+    mock_pref = [
+        {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
+         "availability": 95.0, "bottleneck_pct": 5.0, "bottleneck_window": "session",
+         "error": "", "raw": {}},
+        {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
+         "availability": 30.0, "bottleneck_pct": 70.0, "bottleneck_window": "daily",
+         "error": "", "raw": {}},
+    ]
     out_high_pref = simulate_main(mock_pref, "sensitive")
     check("e2e high (preference-first): ollama=95, nanogpt=30 → nanogpt",
           out_high_pref["context"]["recommended_profile"] == "pr-nanogpt",
@@ -518,9 +547,8 @@ def main():
           "confidential" in quota_gate.PRIVACY_PROVIDER_PREFERENCE)
 
 
-    # -----------------------------------------------------------------------
-    # Test 11: Preference-first with 3 providers (sensitive excludes openrouter)
-    # -----------------------------------------------------------------------
+def _test11_three_providers():
+    """Test 11: Preference-first with 3 providers (sensitive excludes openrouter)."""
     print("\n--- Test 11: Preference-first with 3 providers ---")
 
     mock_3 = [
@@ -548,34 +576,12 @@ def main():
           f"got {result['profile'] if result else 'None'}")
 
 
-    # ---------------------------------------------------------------------------#
-    # Test 12: stdin JSON privacy level (OBJ-18 S2)
-    # ---------------------------------------------------------------------------#
+def _test12_stdin():
+    """Test 12: parse_privacy_level reads the privacy level from stdin JSON."""
     print("\n--- Test 12: stdin JSON privacy level ---")
 
     # parse_privacy_level reads from stdin JSON when env var is not set.
     # We simulate this by piping JSON to a subprocess that calls the function.
-    import subprocess as _sp
-
-    def _parse_privacy_via_stdin(json_str):
-        """Run parse_privacy_level with stdin JSON (no env var set)."""
-        code = (
-            "import sys, json, os, importlib.util\n"
-            "os.environ.pop('QUOTA_GATE_PRIVACY', None)\n"
-            f"_spec = importlib.util.spec_from_file_location('qg', "
-            f"'{os.path.join(SCRIPTS_DIR, 'quota-gate.py')}')\n"
-            "qg = importlib.util.module_from_spec(_spec)\n"
-            "_spec.loader.exec_module(qg)\n"
-            "print(qg.parse_privacy_level())\n"
-        )
-        proc = _sp.run(
-            [sys.executable, "-c", code],
-            input=json_str, capture_output=True, text=True, timeout=10,
-        )
-        if proc.returncode != 0:
-            return None
-        val = proc.stdout.strip()
-        return val if val != "None" else None
 
     # Note: parse_privacy_level reads stdin only when not a tty.
     # In subprocess, stdin is a pipe (not a tty), so it reads the JSON.
@@ -595,22 +601,12 @@ def main():
           _parse_privacy_via_stdin('{}') is None)
 
 
-    # ---------------------------------------------------------------------------#
-    # Test 13: Confidential routing (OBJ-18 S2 — harden)
-    # ---------------------------------------------------------------------------#
+def _test13_confidential_hardened_a():
+    """Test 13a: confidential with no local provider → None + capability matrix."""
     print("\n--- Test 13: Confidential routing ---")
 
     # Confidential with no local provider → None (wakeAgent:false)
-    mock_cloud_only = [
-        {"profile": "pr-ollama", "provider": "ollama-cloud", "model": "glm-5.2",
-         "availability": 90.0, "bottleneck_pct": 10.0, "bottleneck_window": "session",
-         "error": "", "raw": {}},
-        {"profile": "pr-nanogpt", "provider": "nanogpt", "model": "zai-org/glm-5.2",
-         "availability": 80.0, "bottleneck_pct": 20.0, "bottleneck_window": "daily",
-         "error": "", "raw": {}},
-    ]
-
-    result = quota_gate.select_provider(mock_cloud_only, privacy_level="confidential")
+    result = quota_gate.select_provider(MOCK_CLOUD_ONLY, privacy_level="confidential")
     check("confidential → no local provider → None",
           result is None,
           f"got {result}")
@@ -626,15 +622,18 @@ def main():
           "confidential" in quota_gate._PROVIDER_PRIVACY.get("custom", set()))
 
     # E2E: confidential → wakeAgent:false with warning
-    out_conf = simulate_main(mock_cloud_only, "confidential")
+    out_conf = simulate_main(MOCK_CLOUD_ONLY, "confidential")
     check("e2e confidential → wakeAgent:false",
           out_conf["wakeAgent"] is False)
     check("e2e confidential → warning mentions privacy exclusion",
           "privacy:confidential excludes" in (out_conf["context"]["warning"] or ""),
           f"warning: {out_conf['context']['warning']}")
 
+
+def _test13_confidential_hardened_b():
+    """Test 13b: confidential with local provider → picks custom, alias tags."""
     # Confidential with local provider → picks custom (preference-first)
-    mock_with_local_conf = mock_cloud_only + [
+    mock_with_local_conf = MOCK_CLOUD_ONLY + [
         {"profile": "pr-local", "provider": "custom", "model": "llama3.2:3b",
          "availability": 100.0, "bottleneck_pct": 0.0, "bottleneck_window": "local",
          "error": "", "raw": {}},
@@ -671,9 +670,8 @@ def main():
           f"got {intimo_level}")
 
 
-    # ---------------------------------------------------------------------------#
-    # Test 14: Sensitive excludes OpenCode Go (OBJ-18 S2 — harden)
-    # ---------------------------------------------------------------------------#
+def _test14_opencode():
+    """Test 14: sensitive excludes OpenCode Go provider."""
     print("\n--- Test 14: Sensitive excludes OpenCode Go ---")
 
     # OpenCode Go (opencode-go) is public-only per the privacy matrix.
@@ -707,9 +705,8 @@ def main():
           f"got {result['profile'] if result else 'None'}")
 
 
-    # ---------------------------------------------------------------------------#
-    # Test 15: No privacy degradation (sensitive never falls back to public-only)
-    # ---------------------------------------------------------------------------#
+def _test15_no_degradation():
+    """Test 15: sensitive never falls back to public-only providers."""
     print("\n--- Test 15: No privacy degradation ---")
 
     # If all sensitive-capable providers are exhausted, the gate must NOT
@@ -741,12 +738,40 @@ def main():
           f"warning: {out_sens_exhausted['context']['warning']}")
 
 
-    # ---------------------------------------------------------------------------#
-    # Results
-    # ---------------------------------------------------------------------------#
+def _print_results():
+    """Print the cumulative PASS/FAIL summary block."""
     print(f"\n{'='*60}")
     print(f"Results: {passed} passed, {failed} failed")
     print(f"{'='*60}")
+
+
+def main():
+    """Run the 15 privacy-routing check groups. Returns 0/1.
+
+    pytest collection safety: mutates os.environ (QUOTA_GATE_PRIVACY)
+    and sys.argv, and runs quota-gate.py as subprocess — none of it
+    may leak into the pytest interpreter collecting sibling files
+    (importlib mode). Runs on explicit invocation only.
+    """
+    _test1_parse_privacy_tag()
+    _test2_env_var()
+    _test3_no_privacy_baseline()
+    _test4_sensitive()
+    _test5_confidential()
+    _test6_errored()
+    _test7_capabilities()
+    _test8_e2e()
+    _test9_alias_high()
+    _test9_alias_low_medium()
+    _test10_preference_first_a()
+    _test10_preference_first_b()
+    _test11_three_providers()
+    _test12_stdin()
+    _test13_confidential_hardened_a()
+    _test13_confidential_hardened_b()
+    _test14_opencode()
+    _test15_no_degradation()
+    _print_results()
 
     print(f"\n{'='*60}")
     print(f"Results: {passed} passed, {failed} failed")
