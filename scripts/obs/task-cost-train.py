@@ -286,20 +286,8 @@ def estimate_group_cost(group: dict, prices=None) -> float:
         return 0.0
 
 
-def build_row(task: dict, usage_rows: list, session_tasks: int,
-              prices=None, now=None, estimate_row=None) -> dict:
-    """One training row for one closed task.
-
-    estimate_row (optional): the P3 prediction captured at creation time
-    {"p50","p90","stage","model","captured_at"} — carried through for the
-    estimated-vs-real comparison (P3 accuracy loop).
-    """
-    sid = task.get("session_id")
-    body = task.get("body") or ""
-    objective = parse_objective(body)
-    cost_class = parse_cost_class(body)
-    clase = parse_clase(body)
-
+def _aggregate_usage_groups(usage_rows: list) -> dict:
+    """Aggregate usage rows by (profile, model, billing_provider)."""
     groups = {}
     for u in usage_rows:
         key = (u["profile"], u["model"], u["billing_provider"])
@@ -316,7 +304,11 @@ def build_row(task: dict, usage_rows: list, session_tasks: int,
         g["cache_read"] += u["cache_read"]
         g["reasoning"] += u["reasoning"]
         g["rows"] += 1
+    return groups
 
+
+def _build_model_groups(groups: dict, prices) -> list:
+    """Costed model groups (catalog USD per group), priciest first."""
     model_groups = []
     for g in groups.values():
         model_groups.append({
@@ -328,19 +320,37 @@ def build_row(task: dict, usage_rows: list, session_tasks: int,
             "costUsd": round(estimate_group_cost(g, prices), 6),
         })
     model_groups.sort(key=lambda m: -m["costUsd"])
+    return model_groups
 
-    dominant = model_groups[0] if model_groups else None
-    total_cost = sum(m["costUsd"] for m in model_groups)
-    created = task.get("created_at")
-    completed = task.get("completed_at")
+
+def _usage_totals(usage_rows: list, model_groups: list) -> dict:
+    """Row-count and token/call sums across all model groups."""
+    return {
+        "usage_rows": len(usage_rows),
+        "api_calls": sum(m["api_calls"] for m in model_groups),
+        "tokens_in": sum(m["tokens_in"] for m in model_groups),
+        "tokens_out": sum(m["tokens_out"] for m in model_groups),
+        "cache_read": sum(m["cache_read"] for m in model_groups),
+        "reasoning": sum(m["reasoning"] for m in model_groups),
+    }
+
+
+def _task_duration(created, completed):
+    """Whole-second duration, None when dates are missing or unparseable."""
     duration = None
     try:
         if created is not None and completed is not None:
             duration = int(round(float(completed) - float(created)))
     except (TypeError, ValueError):
         duration = None
+    return duration
 
-    attributed = bool(sid) and dominant is not None and MCL_OK
+
+def _base_fields(task: dict, objective, cost_class, clase, sid,
+                 session_tasks) -> dict:
+    """Identity, tags, timing and session fields of a training row."""
+    created = task.get("created_at")
+    completed = task.get("completed_at")
     return {
         "kind": "task",
         "task_id": task["id"],
@@ -351,28 +361,49 @@ def build_row(task: dict, usage_rows: list, session_tasks: int,
         "resultado": task.get("status") or "done",
         "created_at": created,
         "completed_at": completed,
-        "duration_s": duration,
+        "duration_s": _task_duration(created, completed),
         "runs": task.get("runs") or 0,
         "crashes": task.get("crashes") or 0,
         "session_id": sid,
         "session_tasks": session_tasks if sid else None,
         "shared_session": bool(sid and session_tasks and session_tasks > 1),
-        "attributed": attributed,
-        "usage_rows": len(usage_rows),
-        "profile": dominant["profile"] if dominant else None,
-        "model": dominant["model"] if dominant else None,
-        "billing_provider": dominant["billing_provider"] if dominant else None,
-        "api_calls": sum(m["api_calls"] for m in model_groups),
-        "tokens_in": sum(m["tokens_in"] for m in model_groups),
-        "tokens_out": sum(m["tokens_out"] for m in model_groups),
-        "cache_read": sum(m["cache_read"] for m in model_groups),
-        "reasoning": sum(m["reasoning"] for m in model_groups),
-        "costUsd": round(total_cost, 6) if attributed else None,
-        "cost_source": "estimated-catalog" if attributed else "none",
-        "estimate": estimate_row if estimate_row else None,
-        "models": model_groups,
-        "ts": now if now is not None else time.time(),
     }
+
+
+def build_row(task: dict, usage_rows: list, session_tasks: int,
+              prices=None, now=None, estimate_row=None) -> dict:
+    """One training row for one closed task.
+
+    estimate_row (optional): the P3 prediction captured at creation time
+    {"p50","p90","stage","model","captured_at"} — carried through for the
+    estimated-vs-real comparison (P3 accuracy loop).
+    """
+    sid = task.get("session_id")
+    body = task.get("body") or ""
+    objective = parse_objective(body)
+    cost_class = parse_cost_class(body)
+    clase = parse_clase(body)
+
+    model_groups = _build_model_groups(_aggregate_usage_groups(usage_rows),
+                                       prices)
+    dominant = model_groups[0] if model_groups else None
+    total_cost = sum(m["costUsd"] for m in model_groups)
+    attributed = bool(sid) and dominant is not None and MCL_OK
+
+    row = _base_fields(task, objective, cost_class, clase, sid,
+                       session_tasks)
+    row["attributed"] = attributed
+    row.update(_usage_totals(usage_rows, model_groups))
+    row["profile"] = dominant["profile"] if dominant else None
+    row["model"] = dominant["model"] if dominant else None
+    row["billing_provider"] = (dominant["billing_provider"]
+                               if dominant else None)
+    row["costUsd"] = round(total_cost, 6) if attributed else None
+    row["cost_source"] = "estimated-catalog" if attributed else "none"
+    row["estimate"] = estimate_row if estimate_row else None
+    row["models"] = model_groups
+    row["ts"] = now if now is not None else time.time()
+    return row
 
 
 # ---------------------------------------------------------------------------
