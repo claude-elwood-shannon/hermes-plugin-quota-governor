@@ -271,6 +271,101 @@ def _cli(*args, timeout=30) -> tuple:
         return 1, str(exc)
 
 
+def _normalize_verdict(verdict: str) -> str:
+    """Map free-form user text to a canonical verdict ('si' | 'no' |
+    'condicion'). Returns '' when the verdict is not recognized."""
+    v = _norm(verdict)
+    if v in ("si", "sí", "yes", "arranca", "adelante", "ok"):
+        return "si"
+    if v in ("no", "archiva", "archivar"):
+        return "no"
+    if v.startswith("si ") or "condicion" in v or "condición" in v:
+        return "condicion"
+    return ""
+
+
+def _validate_or_fail(db: Path, task_id: str,
+                      v: str) -> tuple:
+    """Validation wrapper returning (task, error_dict).
+
+    On success task is set and error is None.  On failure task is None
+    and error holds the audit dict with ``applied: False``.
+    """
+    task = fetch_task(db, task_id)
+    if not task:
+        return None, {"task": task_id, "verdict": v, "applied": False,
+                      "reason": "task not found"}
+    if task["status"] != "triage":
+        return None, {"task": task_id, "verdict": v, "applied": False,
+                      "reason": f"task is {task['status']}, not triage"}
+    st = stamp_state(task["body"] or "")
+    if st == "rejected":
+        return None, {"task": task_id, "verdict": v, "applied": False,
+                      "reason": "already rejected"}
+    if st == "none":
+        return None, {"task": task_id, "verdict": v, "applied": False,
+                      "reason": "no [APPROVAL] stamp — not a Flujo B package"}
+    return task, None
+
+
+def _apply_approved(db: Path, task_id: str, v: str, note: str,
+                    iso: str) -> dict:
+    """Execute the 'si'/'condicion' path: stamp + CAS + specify + promote.
+
+    Includes race-tolerance retry and CLI-stub mode for tests.
+    """
+    task = fetch_task(db, task_id)
+    new_stamp = f"[APPROVAL: approved {iso}]" if v == "si" else \
+        f"[APPROVAL: approved-with {iso}: {note}]"
+    new_body = patch_stamp(task["body"], new_stamp,
+                           extra_line=(f"[condicion: {note}]"
+                                       if v == "condicion" and note
+                                       else ""))
+    if not _update_body_cas(db, task_id, new_body, "triage"):
+        return {"task": task_id, "verdict": v, "applied": False,
+                "reason": "CAS body update failed (status changed?)"}
+    rc1, out1 = _cli("specify", task_id, "--author", "approval-gate")
+    rc2, out2 = _cli("promote", task_id,
+                     f"APPROVAL approved {iso}"
+                     + (f" condicion: {note}" if note else ""))
+    # Race tolerance: between specify and promote the tick may have
+    # already promoted the task.  Re-read: in todo -> retry promote
+    # once; in ready -> treat as success (the goal state).
+    final = fetch_task(db, task_id)
+    final_status = final["status"] if final else "?"
+    if os.environ.get("AG_STUB_CLI", "").strip() == "simulate":
+        ok = rc1 == 0 and rc2 == 0
+        return {"task": task_id, "verdict": v, "applied": ok,
+                "status": "ready (simulated)",
+                "specify_rc": rc1, "promote_rc": rc2,
+                "detail": out1.strip()[:120]}
+    if rc2 != 0 and final_status == "todo":
+        rc2, out2 = _cli("promote", task_id,
+                         f"APPROVAL approved {iso} (retry)")
+        final = fetch_task(db, task_id)
+        final_status = final["status"] if final else "?"
+    ok = rc1 == 0 and final_status in ("ready", "todo")
+    return {"task": task_id, "verdict": v, "applied": ok,
+            "status": final_status,
+            "specify_rc": rc1, "promote_rc": rc2,
+            "detail": out1.strip()[:120] or out2.strip()[:120]}
+
+
+def _apply_rejected(db: Path, task_id: str, v: str,
+                    iso: str) -> dict:
+    """Execute the 'no' path: rejection stamp + CAS + best-effort archive."""
+    task = fetch_task(db, task_id)
+    new_body = patch_stamp(task["body"], f"[APPROVAL: rejected {iso}]")
+    if not _update_body_cas(db, task_id, new_body, "triage"):
+        return {"task": task_id, "verdict": v, "applied": False,
+                "reason": "CAS body update failed (status changed?)"}
+    rc, _ = _cli("archive", task_id)
+    _cli("comment", task_id, "rejected by user (approval-gate)")
+    return {"task": task_id, "verdict": v, "applied": True,
+            "stamp": "rejected", "archive_rc": rc,
+            "archived": rc == 0}
+
+
 def apply_verdict(db: Path, task_id: str, verdict: str,
                   note: str = "", dry: bool = False) -> dict:
     """Apply the user's verdict to a triage approval-ready task.
@@ -278,31 +373,14 @@ def apply_verdict(db: Path, task_id: str, verdict: str,
     verdict: 'si' | 'no' | 'condicion' (note = the condition / context).
     Returns an audit dict; never raises. Status-guarded at every write.
     """
-    v = _norm(verdict)
-    if v in ("si", "sí", "yes", "arranca", "adelante", "ok"):
-        v = "si"
-    elif v in ("no", "archiva", "archivar"):
-        v = "no"
-    elif v.startswith("si ") or "condicion" in v or "condición" in v:
-        v = "condicion"
-    else:
+    v = _normalize_verdict(verdict)
+    if not v:
         return {"task": task_id, "verdict": verdict,
                 "applied": False, "reason": "verdict not recognized"}
 
-    task = fetch_task(db, task_id)
-    if not task:
-        return {"task": task_id, "verdict": v, "applied": False,
-                "reason": "task not found"}
-    if task["status"] != "triage":
-        return {"task": task_id, "verdict": v, "applied": False,
-                "reason": f"task is {task['status']}, not triage"}
-    st = stamp_state(task["body"] or "")
-    if st == "rejected":
-        return {"task": task_id, "verdict": v, "applied": False,
-                "reason": "already rejected"}
-    if st == "none":
-        return {"task": task_id, "verdict": v, "applied": False,
-                "reason": "no [APPROVAL] stamp — not a Flujo B package"}
+    task, err = _validate_or_fail(db, task_id, v)
+    if err:
+        return err
 
     iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if dry:
@@ -310,61 +388,16 @@ def apply_verdict(db: Path, task_id: str, verdict: str,
                 "dry_run": True, "reason": "would apply", "iso": iso}
 
     if v in ("si", "condicion"):
-        new_stamp = f"[APPROVAL: approved {iso}]" if v == "si" else \
-            f"[APPROVAL: approved-with {iso}: {note}]"
-        new_body = patch_stamp(task["body"], new_stamp,
-                               extra_line=(f"[condicion: {note}]"
-                                           if v == "condicion" and note
-                                           else ""))
-        if not _update_body_cas(db, task_id, new_body, "triage"):
-            return {"task": task_id, "verdict": v, "applied": False,
-                    "reason": "CAS body update failed (status changed?)"}
-        rc1, out1 = _cli("specify", task_id, "--author", "approval-gate")
-        rc2, out2 = _cli("promote", task_id,
-                         f"APPROVAL approved {iso}"
-                         + (f" condicion: {note}" if note else ""))
-        # Race tolerance: between specify and promote the tick may have
-        # already assigned/promoted the task. Re-read: in todo -> retry
-        # promote once; in ready -> treat as success (the goal state).
-        # CLI-stub mode (tests): the DB is not mutated by the stub, so the
-        # goal state is judged by the CLI rc (both 0 = chain applied).
-        final = fetch_task(db, task_id)
-        final_status = final["status"] if final else "?"
-        if os.environ.get("AG_STUB_CLI", "").strip() == "simulate":
-            ok = rc1 == 0 and rc2 == 0
-            return {"task": task_id, "verdict": v, "applied": ok,
-                    "status": "ready (simulated)",
-                    "specify_rc": rc1, "promote_rc": rc2,
-                    "detail": out1.strip()[:120]}
-        if rc2 != 0 and final_status == "todo":
-            rc2, out2 = _cli("promote", task_id,
-                             f"APPROVAL approved {iso} (retry)")
-            final = fetch_task(db, task_id)
-            final_status = final["status"] if final else "?"
-        ok = rc1 == 0 and final_status in ("ready", "todo")
-        return {"task": task_id, "verdict": v, "applied": ok,
-                "status": final_status,
-                "specify_rc": rc1, "promote_rc": rc2,
-                "detail": out1.strip()[:120] or out2.strip()[:120]}
-
-    # no — the stamp IS the verdict (recorded + blocks re-approval); the
-    # archive move is best-effort CLI and reported separately.
-    new_body = patch_stamp(task["body"], f"[APPROVAL: rejected {iso}]")
-    if not _update_body_cas(db, task_id, new_body, "triage"):
-        return {"task": task_id, "verdict": v, "applied": False,
-                "reason": "CAS body update failed (status changed?)"}
-    rc, out = _cli("archive", task_id)
-    _cli("comment", task_id, "rejected by user (approval-gate)")
-    return {"task": task_id, "verdict": v, "applied": True,
-            "stamp": "rejected", "archive_rc": rc,
-            "archived": rc == 0}
+        return _apply_approved(db, task_id, v, note, iso)
+    return _apply_rejected(db, task_id, v, iso)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the approval gate."""
     ap = argparse.ArgumentParser(description="P5 approval gate kernel.")
     ap.add_argument("--db", default=None)
     ap.add_argument("--pending", action="store_true")
@@ -375,36 +408,28 @@ def main(argv=None) -> int:
     ap.add_argument("--note", default="")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true")
-    args = ap.parse_args(argv)
+    return ap
 
-    db = Path(args.db) if args.db else kanban_db_path()
 
-    if args.verify:
-        task = fetch_task(db, args.verify)
-        if not task:
-            print(json.dumps({"task": args.verify, "error": "not found"}))
-            return 0
-        body = task["body"] or ""
-        print(json.dumps({
-            "task": task["id"], "status": task["status"],
-            "tag": bool(APPROVAL_TAG_RE.search(body)),
-            "missing_fields": package_missing(body),
-            "stamp": stamp_state(body),
-            "complete": not package_missing(body),
-        }, ensure_ascii=False))
+def _cli_verify(db: Path, task_id: str) -> int:
+    """Handle --verify: print package completeness for a single task."""
+    task = fetch_task(db, task_id)
+    if not task:
+        print(json.dumps({"task": task_id, "error": "not found"}))
         return 0
+    body = task["body"] or ""
+    print(json.dumps({
+        "task": task["id"], "status": task["status"],
+        "tag": bool(APPROVAL_TAG_RE.search(body)),
+        "missing_fields": package_missing(body),
+        "stamp": stamp_state(body),
+        "complete": not package_missing(body),
+    }, ensure_ascii=False))
+    return 0
 
-    if args.dedup_scan:
-        print(json.dumps(dedup_scan(db), ensure_ascii=False, indent=1))
-        return 0
 
-    if args.apply:
-        res = apply_verdict(db, args.apply, args.verdict, args.note,
-                            dry=args.dry_run)
-        print(json.dumps(res, ensure_ascii=False))
-        return 0
-
-    # default: --pending
+def _cli_pending(db: Path, as_json: bool) -> int:
+    """Handle --pending (default): list triage approval-ready tasks."""
     rows = []
     for t in fetch_pending(db):
         body = t["body"] or ""
@@ -412,7 +437,7 @@ def main(argv=None) -> int:
             "id": t["id"], "title": t["title"],
             "missing": package_missing(body), "stamp": stamp_state(body),
         })
-    if args.json:
+    if as_json:
         print(json.dumps(rows, ensure_ascii=False))
     elif not rows:
         print("sin iniciativas pendientes de aprobacion")
@@ -422,6 +447,23 @@ def main(argv=None) -> int:
                 f"[falta {', '.join(r['missing'])}]"
             print(f"{r['id']}  {(r['title'] or '')[:70]}  {mark}")
     return 0
+
+
+def main(argv=None) -> int:
+    ap = _build_arg_parser()
+    args = ap.parse_args(argv)
+    db = Path(args.db) if args.db else kanban_db_path()
+    if args.verify:
+        return _cli_verify(db, args.verify)
+    if args.dedup_scan:
+        print(json.dumps(dedup_scan(db), ensure_ascii=False, indent=1))
+        return 0
+    if args.apply:
+        res = apply_verdict(db, args.apply, args.verdict, args.note,
+                            dry=args.dry_run)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+    return _cli_pending(db, args.json)
 
 
 if __name__ == "__main__":
