@@ -1200,7 +1200,8 @@ class HermesBridge(BaseHTTPRequestHandler):
         resp_out.update(resp)
         return self._send_json(resp_out, 200)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
+        """Route GET requests to endpoint handlers."""
         path, _, query = self.path.partition("?")
         qs = parse_qs(query)
         if path == "/openapi.json":
@@ -1208,30 +1209,9 @@ class HermesBridge(BaseHTTPRequestHandler):
         elif path == "/file":
             self._handle_file(query)
         elif path == "/board":
-            stats = self._run(["hermes", "kanban", "stats", "--json"])
-            tasks = _load_tasks()
-            active = [{"id": t.get("id"), "status": t.get("status"),
-                       "title": (t.get("title") or "")[:80]}
-                      for t in tasks
-                      if t.get("status") in ("ready", "running", "blocked")]
-            self._send_json({"stats": stats, "active": active})
+            self._handle_board()
         elif path == "/snapshot":
-            stats = self._run(["hermes", "kanban", "stats", "--json"])
-            tasks = _load_tasks()
-            active, triage = [], []
-            for t in tasks:
-                s = t.get("status")
-                if s in ("ready", "running", "blocked"):
-                    active.append({"id": t.get("id"), "status": s,
-                                   "title": (t.get("title") or "")[:80]})
-                elif s == "triage":
-                    triage.append({"id": t.get("id"), "tags": _extract_tags(t),
-                                   "title": (t.get("title") or "")[:80]})
-            self._send_json({"stats": stats, "active": active, "triage": triage,
-                             "watchdog": self._read_log("logs/kanban-watchdog.log", 10),
-                             "tick": self._read_log("logs/quota-governor-tick.log", 5),
-                             "health": self._read_log("logs/cron-health-check.log", 5),
-                             "efficiency": self._read_log("logs/efficiency-ratio.log", 3)})
+            self._handle_snapshot()
         elif path == "/watchdog":
             self._send_json({"log": self._read_log("logs/kanban-watchdog.log", 15)})
         elif path == "/tick":
@@ -1250,39 +1230,8 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_backup_health()
         elif path == "/gpu/health":
             self._send_json(_GPU_HEALTH())
-        elif path == "/capabilities":
-            caps = _load_capabilities()
-            self._send_json({
-                "capabilities": [_capability_payload(c) for c in caps],
-                "count": len(caps),
-                "load_errors": _CAP_MANIFEST_CACHE["errors"]})
-        elif path.startswith("/capabilities/"):
-            m = re.fullmatch(r"/capabilities/([a-z0-9][a-z0-9_-]*)"
-                             r"(/hosts|/status)?", path)
-            if not m:
-                self._send_json({"error": "invalid capability path"}, 404)
-            else:
-                cap = _cap_find(m.group(1))
-                if cap is None:
-                    self._send_json(
-                        {"error": "capability not found",
-                         "capability": m.group(1)}, 404)
-                elif m.group(2) == "/hosts":
-                    hosts, err = _cap_hosts(cap)
-                    if err:
-                        self._send_json({"error": err}, 503)
-                    elif hosts is None:
-                        self._send_json(
-                            {"capability": cap["name"], "hosts": [],
-                             "note": "capability declares no hosts_file"})
-                    else:
-                        self._send_json({"capability": cap["name"],
-                                         "hosts": hosts,
-                                         "count": len(hosts)})
-                elif m.group(2) == "/status":
-                    self._send_json(_cap_status(cap))
-                else:
-                    self._send_json(_capability_payload(cap))
+        elif path == "/capabilities" or path.startswith("/capabilities/"):
+            self._handle_capabilities_route(path)
         elif path == "/task":
             self._handle_get_task(qs)
         elif path == "/tasks":
@@ -1292,26 +1241,99 @@ class HermesBridge(BaseHTTPRequestHandler):
         elif path == "/metrics":
             self._handle_metrics(qs)
         elif path == "/metrics-prometheus":
-            # v1.6 (t_74f5f315): texto Prometheus 0.0.4, pull-only
-            body = _metrics_prom_text().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type",
-                             "text/plain; version=0.0.4; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
+            self._handle_prometheus()
         elif path == "/objectives":
-            status = (qs.get("status") or [None])[0]
-            rows = _ao_list(status)
-            if rows is None:
-                self._send_json({"error": "approved_objectives unavailable "
-                                          "(kanban.db missing or table absent)"}, 503)
-            else:
-                self._send_json({"objectives": rows, "count": len(rows)})
+            self._handle_objectives(qs)
         else:
             self._send_json({"error": "not found"}, 404)
 
     # ---- v1.3 GET: gobernanza ----
+
+    def _handle_board(self) -> None:
+        """GET /board — kanban stats plus active (ready/running/blocked) tasks."""
+        stats = self._run(["hermes", "kanban", "stats", "--json"])
+        tasks = _load_tasks()
+        active = [{"id": t.get("id"), "status": t.get("status"),
+                   "title": (t.get("title") or "")[:80]}
+                  for t in tasks
+                  if t.get("status") in ("ready", "running", "blocked")]
+        self._send_json({"stats": stats, "active": active})
+
+    def _handle_snapshot(self) -> None:
+        """GET /snapshot — board, active, triage, and recent log tails."""
+        stats = self._run(["hermes", "kanban", "stats", "--json"])
+        tasks = _load_tasks()
+        active, triage = [], []
+        for t in tasks:
+            s = t.get("status")
+            if s in ("ready", "running", "blocked"):
+                active.append({"id": t.get("id"), "status": s,
+                               "title": (t.get("title") or "")[:80]})
+            elif s == "triage":
+                triage.append({"id": t.get("id"), "tags": _extract_tags(t),
+                               "title": (t.get("title") or "")[:80]})
+        self._send_json({
+            "stats": stats, "active": active, "triage": triage,
+            "watchdog": self._read_log("logs/kanban-watchdog.log", 10),
+            "tick": self._read_log("logs/quota-governor-tick.log", 5),
+            "health": self._read_log("logs/cron-health-check.log", 5),
+            "efficiency": self._read_log("logs/efficiency-ratio.log", 3)})
+
+    def _handle_capabilities_route(self, path: str) -> None:
+        """GET /capabilities and /capabilities/<name>[/hosts|/status]."""
+        if path == "/capabilities":
+            caps = _load_capabilities()
+            self._send_json({
+                "capabilities": [_capability_payload(c) for c in caps],
+                "count": len(caps),
+                "load_errors": _CAP_MANIFEST_CACHE["errors"]})
+            return
+        m = re.fullmatch(r"/capabilities/([a-z0-9][a-z0-9_-]*)"
+                         r"(/hosts|/status)?", path)
+        if not m:
+            self._send_json({"error": "invalid capability path"}, 404)
+            return
+        cap = _cap_find(m.group(1))
+        if cap is None:
+            self._send_json(
+                {"error": "capability not found",
+                 "capability": m.group(1)}, 404)
+        elif m.group(2) == "/hosts":
+            hosts, err = _cap_hosts(cap)
+            if err:
+                self._send_json({"error": err}, 503)
+            elif hosts is None:
+                self._send_json(
+                    {"capability": cap["name"], "hosts": [],
+                     "note": "capability declares no hosts_file"})
+            else:
+                self._send_json({"capability": cap["name"],
+                                 "hosts": hosts,
+                                 "count": len(hosts)})
+        elif m.group(2) == "/status":
+            self._send_json(_cap_status(cap))
+        else:
+            self._send_json(_capability_payload(cap))
+
+    def _handle_prometheus(self) -> None:
+        """GET /metrics-prometheus — Prometheus text 0.0.4 (pull-only)."""
+        body = _metrics_prom_text().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_objectives(self, qs: dict) -> None:
+        """GET /objectives — approved objectives inventory (optional ?status=)."""
+        status = (qs.get("status") or [None])[0]
+        rows = _ao_list(status)
+        if rows is None:
+            self._send_json({"error": "approved_objectives unavailable "
+                                      "(kanban.db missing or table absent)"}, 503)
+        else:
+            self._send_json({"objectives": rows, "count": len(rows)})
 
     def _handle_get_task(self, qs):
         task_id = (qs.get("task_id") or [""])[0].strip()
