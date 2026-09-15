@@ -245,6 +245,52 @@ def backfill_model_cost_ledger(hermes_home=None) -> list:
 # Source 3: task-events board history (created / crashes / timeouts)
 # ---------------------------------------------------------------------------
 
+def _task_event_row(tid, kind, created_at, body) -> dict:
+    """One task_events record -> canonical trace line (worker/objective join)."""
+    return {
+        "ts_epoch_utc": tr._opt_float(created_at),
+        "consumer_class": "worker",
+        "consumer_id": tid,
+        "cause": kind,
+        "model": None,
+        "provider": None,
+        "tokens_in": None,
+        "tokens_out": None,
+        "costUsd": None,
+        "requestId": None,
+        "objective": tr.parse_objective(body),
+        "source": "task-events",
+        "otel": {},
+    }
+
+
+def _task_events_from_db(con, seen) -> list:
+    """Fetch the backfill kinds from one read-only connection.
+
+    Dedupes against the shared `seen` set (natural key: task_id, kind,
+    created_at) so events already collected in another db are not repeated.
+    """
+    events = con.execute(
+        "SELECT task_id, kind, created_at FROM task_events "
+        f"WHERE kind IN ({','.join('?' * len(TASK_EVENT_KINDS))})",
+        TASK_EVENT_KINDS).fetchall()
+    rows = []
+    bodies = {}
+    for ev in events:
+        key = (ev["task_id"], ev["kind"], ev["created_at"])
+        if key in seen:
+            continue
+        seen.add(key)
+        tid = ev["task_id"]
+        if tid not in bodies:
+            row = con.execute(
+                "SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()
+            bodies[tid] = row["body"] if row else None
+        rows.append(_task_event_row(tid, ev["kind"], ev["created_at"],
+                                    bodies[tid]))
+    return rows
+
+
 def backfill_task_events(hermes_home=None, kanban_db=None) -> list:
     """task_events kinds beyond the F0 claimed/completed pair.
 
@@ -264,36 +310,7 @@ def backfill_task_events(hermes_home=None, kanban_db=None) -> list:
         except sqlite3.Error:
             continue
         try:
-            events = con.execute(
-                "SELECT task_id, kind, created_at FROM task_events "
-                f"WHERE kind IN ({','.join('?' * len(TASK_EVENT_KINDS))})",
-                TASK_EVENT_KINDS).fetchall()
-            bodies = {}
-            for ev in events:
-                key = (ev["task_id"], ev["kind"], ev["created_at"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                tid = ev["task_id"]
-                if tid not in bodies:
-                    row = con.execute(
-                        "SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()
-                    bodies[tid] = row["body"] if row else None
-                rows.append({
-                    "ts_epoch_utc": tr._opt_float(ev["created_at"]),
-                    "consumer_class": "worker",
-                    "consumer_id": tid,
-                    "cause": ev["kind"],
-                    "model": None,
-                    "provider": None,
-                    "tokens_in": None,
-                    "tokens_out": None,
-                    "costUsd": None,
-                    "requestId": None,
-                    "objective": tr.parse_objective(bodies[tid]),
-                    "source": "task-events",
-                    "otel": {},
-                })
+            rows.extend(_task_events_from_db(con, seen))
         except sqlite3.Error:
             continue
         finally:
@@ -327,15 +344,13 @@ def read_existing_keys(hermes_home=None) -> set:
     return keys
 
 
-def merge_and_write(rows: list, hermes_home=None) -> dict:
-    """Merge backfill rows into the active trace (dedup by natural key).
+def _read_trace(hermes_home=None) -> tuple:
+    """Load the active trace as (parsed_rows, undateable_raw_lines).
 
-    The file is REWRITTEN once: existing lines are kept byte-identical
-    (including corrupt lines — never silently dropped), new rows are
-    inserted sorted by (ts, key) with ts-less rows kept at the head.
-    Returns {appended, duplicates, kept_lines}.
+    Existing lines are kept byte-identical in the output; corrupt lines are
+    collected verbatim (never silently dropped) and re-emitted at the tail.
+    Never raises: a missing or unreadable trace is an empty result.
     """
-    keys = read_existing_keys(hermes_home)
     existing = []
     bad_lines = []
     try:
@@ -350,7 +365,11 @@ def merge_and_write(rows: list, hermes_home=None) -> dict:
                     bad_lines.append(s)
     except OSError:
         pass
+    return existing, bad_lines
 
+
+def _dedup_fresh(rows, keys) -> tuple:
+    """Split backfill rows into genuinely-new vs already-present keys."""
     fresh, dup = [], 0
     for r in rows:
         k = dedup_key(r)
@@ -359,14 +378,18 @@ def merge_and_write(rows: list, hermes_home=None) -> dict:
             continue
         keys.add(k)
         fresh.append(r)
+    return fresh, dup
 
-    def _order(r):
-        ts = r.get("ts_epoch_utc")
-        if not isinstance(ts, (int, float)):
-            return (0, 0.0, ())          # undatable rows first, stable
-        return (1, float(ts), tuple(str(x) for x in dedup_key(r)))
 
-    merged = sorted(existing + fresh, key=_order)
+def _order(r):
+    ts = r.get("ts_epoch_utc")
+    if not isinstance(ts, (int, float)):
+        return (0, 0.0, ())          # undatable rows first, stable
+    return (1, float(ts), tuple(str(x) for x in dedup_key(r)))
+
+
+def _write_merged(merged, bad_lines, hermes_home=None) -> tuple:
+    """Atomically rewrite the trace file; returns (success, error_or_None)."""
     path = tr.trace_path(hermes_home)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,8 +401,26 @@ def merge_and_write(rows: list, hermes_home=None) -> dict:
                 fh.write(line + "\n")
         os.replace(tmp, path)
     except OSError as exc:
+        return False, repr(exc)
+    return True, None
+
+
+def merge_and_write(rows: list, hermes_home=None) -> dict:
+    """Merge backfill rows into the active trace (dedup by natural key).
+
+    The file is REWRITTEN once: existing lines are kept byte-identical
+    (including corrupt lines — never silently dropped), new rows are
+    inserted sorted by (ts, key) with ts-less rows kept at the head.
+    Returns {appended, duplicates, kept_lines}.
+    """
+    keys = read_existing_keys(hermes_home)
+    existing, bad_lines = _read_trace(hermes_home)
+    fresh, dup = _dedup_fresh(rows, keys)
+    merged = sorted(existing + fresh, key=_order)
+    ok, error = _write_merged(merged, bad_lines, hermes_home)
+    if not ok:
         return {"appended": 0, "duplicates": dup, "kept_lines": len(existing),
-                "error": repr(exc)}
+                "error": error}
     return {"appended": len(fresh), "duplicates": dup,
             "kept_lines": len(existing), "bad_lines": len(bad_lines)}
 
@@ -388,6 +429,32 @@ def merge_and_write(rows: list, hermes_home=None) -> dict:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def _create_batches(hermes_home, before_ts):
+    return {
+        "usage-audit": backfill_usage_audit(
+            hermes_home=hermes_home, before_ts=before_ts),
+        "model-cost-ledger": backfill_model_cost_ledger(
+            hermes_home=hermes_home),
+        "task-events": backfill_task_events(hermes_home=hermes_home),
+    }
+
+
+def _update_cursors(batches, cursor, f0_cursor, hermes_home):
+    f0_dirty = False
+    for name in ("usage-audit", "model-cost-ledger"):
+        marks = [r.get("ts_epoch_utc") for r in batches.get(name, [])
+                 if isinstance(r.get("ts_epoch_utc"), (int, float))]
+        if not marks:
+            continue
+        top = max(marks)
+        if top > (cursor.get(name) or 0.0):
+            cursor[name] = top
+        if name == "usage-audit" and "usage-audit" not in f0_cursor:
+            f0_cursor["usage-audit"] = top
+            f0_dirty = True
+    _save_cursor(cursor, hermes_home=hermes_home)
+    if f0_dirty:
+        tr._save_cursor(f0_cursor, hermes_home=hermes_home)
 def run_backfill(hermes_home=None, before_ts=None, dry_run=False) -> dict:
     """Collect every backfill source, merge into the trace, save the cursor.
 
@@ -398,13 +465,7 @@ def run_backfill(hermes_home=None, before_ts=None, dry_run=False) -> dict:
     report = {"ok": True, "dry_run": bool(dry_run), "sources": {},
               "appended": 0, "duplicates": 0}
     try:
-        batches = {
-            "usage-audit": backfill_usage_audit(
-                hermes_home=hermes_home, before_ts=before_ts),
-            "model-cost-ledger": backfill_model_cost_ledger(
-                hermes_home=hermes_home),
-            "task-events": backfill_task_events(hermes_home=hermes_home),
-        }
+        batches = _create_batches(hermes_home, before_ts)
         report["sources"] = {k: len(v) for k, v in batches.items()}
         rows = [r for v in batches.values() for r in v]
         if dry_run:
@@ -414,45 +475,19 @@ def run_backfill(hermes_home=None, before_ts=None, dry_run=False) -> dict:
             report["duplicates"] = len(rows) - len(fresh)
             return report
         res = merge_and_write(rows, hermes_home=hermes_home)
-        report["appended"] = res.get("appended", 0)
-        report["duplicates"] = res.get("duplicates", 0)
-        report["kept_lines"] = res.get("kept_lines", 0)
+        report.update({"appended": res.get("appended", 0),
+                       "duplicates": res.get("duplicates", 0),
+                       "kept_lines": res.get("kept_lines", 0)})
         if res.get("error"):
             report["ok"] = False
             report["error"] = res["error"]
-
-        # cursors: per-source high-water marks (ours, never the F0 one) —
-        # plus one F0 sync for fresh adoptants: when the F0 collector has
-        # NO cursor for a source yet, the backfill's high-water mark is
-        # seeded there too. Otherwise the collector would re-append the
-        # same history after its first run and double-count it. When the
-        # F0 cursor EXISTS it is sacred and never touched.
-        cursor = _load_cursor(hermes_home)
-        f0_cursor = tr._load_cursor(hermes_home)
-        f0_dirty = False
-        for name in ("usage-audit", "model-cost-ledger"):
-            marks = [r.get("ts_epoch_utc") for r in batches.get(name, [])
-                     if isinstance(r.get("ts_epoch_utc"), (int, float))]
-            if not marks:
-                continue
-            top = max(marks)
-            if top > (cursor.get(name) or 0.0):
-                cursor[name] = top
-            if name == "usage-audit" and "usage-audit" not in f0_cursor:
-                f0_cursor["usage-audit"] = top
-                f0_dirty = True
-        _save_cursor(cursor, hermes_home=hermes_home)
-        if f0_dirty:
-            tr._save_cursor(f0_cursor, hermes_home=hermes_home)
+        _update_cursors(batches, _load_cursor(hermes_home),
+                        tr._load_cursor(hermes_home), hermes_home)
     except Exception as exc:  # fail open, like every public helper here
         report["ok"] = False
         report["error"] = repr(exc)
     return report
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
     import argparse
