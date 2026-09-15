@@ -5,6 +5,7 @@
 > **Status:** Implemented (Sep 2026)
 > **Priority:** P4 — must be completed BEFORE OBJ-16
 > **Created:** 2026-09-01
+> **Code conventions:** [coding-standards.md](coding-standards.md)
 
 ---
 
