@@ -440,87 +440,65 @@ def step3_assign_triage(triage, execute: bool = False) -> str | None:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def _cascade_steps(window, db, execute, act, state_path, ledger):
+    """Perform cascade steps.``"""
+    msg = step1_promote_next_phase(window, db, execute=execute)
+    if msg:
+        act({"ts": time.time(), "action": "step1", "detail": msg}, msg)
+        return True
+    msg = step2_structural_successor(recent_done_tasks(db), db, execute=execute)
+    if msg:
+        act({"ts": time.time(), "action": "step2", "detail": msg}, msg)
+        return True
+    msg = step3_assign_triage(triage_tasks(db), execute=execute)
+    if msg:
+        act({"ts": time.time(), "action": "step3", "detail": msg}, msg)
+        return True
+    state = _read_state(state_path)
+    empty_since = state.get("empty_since") or 0
+    empty_min = (time.time() - empty_since) / 60.0
+    note = (f"cola seca + supply_ratio: cola ready+running vacia {empty_min:.0f} min en ventana de fondo; sin fase planificada, sin sucesor estructural, sin triage clase C ready-able. Parada legitima (regla de oro: no filler).")
+    if execute:
+        comment_task(window["id"], note)
+    act({"ts": time.time(), "action": "step4-stop", "detail": note}, f"STOP: {note}")
+    return True
+
+
 def run(hermes_home=None, execute: bool = False, now=None) -> list:
     """One tick. Returns list of decision strings (empty = silent)."""
     now = time.time() if now is None else float(now)
     home = Path(hermes_home) if hermes_home else get_hermes_home()
-    # Board resolution: only pin the DB from an EXPLICIT hermes_home arg
-    # (tests pass a fixture dir). In production main() passes nothing and
-    # kanban_db_path() resolves the shared root board from the env.
     db = kanban_db_path(home) if hermes_home else kanban_db_path()
     ledger = ledger_path(home)
     state_path = state_file_path(home)
-
     decisions: list[str] = []
-
     def act(entry: dict, msg: str):
         _log(ledger, entry)
         if execute:
             decisions.append(msg)
         else:
             decisions.append(f"DRY: {msg}")
-
-    # 1. Is a fondo window active?
     windows = find_window_tasks(db)
     if not windows:
-        _log(ledger, {"ts": now, "action": "no-window",
-                      "reason": "no fondo window active"})
-        return decisions  # silent: not in a window
-
+        _log(ledger, {"ts": now, "action": "no-window", "reason": "no fondo window active"})
+        return decisions
     window = windows[0]
-
-    # 2. Is the queue empty? (exclude the window task(s) themselves — they are
-    # running but are NOT the work queue; the queue is the *other* work.)
     q = queue_counts(db, exclude_ids={w["id"] for w in windows})
     if q["ready"] + q["running"] > 0:
-        # Queue has work — reset the empty-since marker, stay silent.
         _write_state(state_path, {"empty_since": None, "window": window["id"]})
-        _log(ledger, {"ts": now, "action": "queue-nonempty",
-                      "ready": q["ready"], "running": q["running"]})
+        _log(ledger, {"ts": now, "action": "queue-nonempty", "ready": q["ready"], "running": q["running"]})
         return decisions
-
-    # 3. How long has it been empty?
     state = _read_state(state_path)
     empty_since = state.get("empty_since")
     if empty_since is None:
         _write_state(state_path, {"empty_since": now, "window": window["id"]})
-        _log(ledger, {"ts": now, "action": "queue-empty-start",
-                      "empty_since": now})
-        return decisions  # first empty tick: start the clock, wait
-
+        _log(ledger, {"ts": now, "action": "queue-empty-start", "empty_since": now})
+        return decisions
     empty_min = (now - empty_since) / 60.0
     if empty_min <= EMPTY_GRACE_MIN:
-        _log(ledger, {"ts": now, "action": "queue-empty-grace",
-                      "empty_min": round(empty_min, 1)})
-        return decisions  # within grace: keep waiting
-
-    # 4. Grace exceeded — apply the cascade (max 1 action per tick).
-    # Step 1: promote next phase of the objective with approved plan.
-    msg = step1_promote_next_phase(window, db, execute=execute)
-    if msg:
-        act({"ts": now, "action": "step1", "detail": msg}, msg)
+        _log(ledger, {"ts": now, "action": "queue-empty-grace", "empty_min": round(empty_min, 1)})
         return decisions
-
-    # Step 2: structural class-C successor of a recently closed task.
-    msg = step2_structural_successor(recent_done_tasks(db), db, execute=execute)
-    if msg:
-        act({"ts": now, "action": "step2", "detail": msg}, msg)
-        return decisions
-
-    # Step 3: assign the first ready-able class-C triage task a profile.
-    msg = step3_assign_triage(triage_tasks(db), execute=execute)
-    if msg:
-        act({"ts": now, "action": "step3", "detail": msg}, msg)
-        return decisions
-
-    # Step 4: nothing legitimate — annotate and STOP (filler forbidden).
-    note = (f"cola seca + supply_ratio: cola ready+running vacia "
-            f"{empty_min:.0f} min en ventana de fondo; sin fase planificada, "
-            f"sin sucesor estructural, sin triage clase C ready-able. "
-            f"Parada legitima (regla de oro: no filler).")
-    if execute:
-        comment_task(window["id"], note)
-    act({"ts": now, "action": "step4-stop", "detail": note}, f"STOP: {note}")
+    _cascade_steps(window, db, execute, act, state_path, ledger)
     return decisions
 
 

@@ -74,7 +74,13 @@ NANOGPT_LEDGER = os.path.join(_PLUGIN_ROOT, "scripts",
                               "nanogpt-balance-ledger.py")
 
 
-def board_counts():
+def board_counts() -> dict:
+    """Obtiene el conteo de tareas por estado del tablero.
+
+    Lee el SQLite de ka­ban en modo solo‑lectura y devuelve un diccionario con
+    las llaves ``running``, ``ready``, ``blocked`` y ``triage``.
+    """
+
     con = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True)
     n = con.execute(
         "SELECT "
@@ -88,7 +94,7 @@ def board_counts():
 VENTANA_SUPPLY_SEG = 86400  # OBJ-29: ventana rodante 24h (UTC)
 
 
-def supply_counts(now_epoch=None, db_path=None):
+def supply_counts(now_epoch: float | None = None, db_path: str | None = None) -> tuple[int, int]:
     """OBJ-29: (creadas, cerradas) en la ventana rodante de 24h UTC.
 
     created: task_events kind='created' — exactamente una por tarea
@@ -112,10 +118,10 @@ def supply_counts(now_epoch=None, db_path=None):
     return int(created), int(closed)
 
 
-def supply_ratio(created, closed):
+def supply_ratio(created: int, closed: int) -> float | None:
     """created/closed redondeado a 3 decimales; None si closed <= 0.
 
-    None NO significa deficit: sin cierres el ratio es indefinido — los
+    None NO significa déficit: sin cierres el ratio es indefinido — los
     consumidores (alarma OBJ-27 F2) miran los componentes crudos.
     """
     if not closed or closed <= 0:
@@ -123,7 +129,12 @@ def supply_ratio(created, closed):
     return round(created / closed, 3)
 
 
-def from_last_good(name):
+def from_last_good(name: str) -> dict:
+    """Return the JSON dict from a last-good snapshot.
+
+    If the file cannot be read or parsed, an empty dict is returned.
+    """
+
     try:
         d = json.load(open(LAST_GOOD_DIR / f"{name}-last-good.json"))
         return d
