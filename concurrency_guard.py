@@ -98,6 +98,63 @@ def count_live_workers() -> int:
     return len(get_live_workers())
 
 
+# SQL for _fetch_running_task_rows: every task in ``running`` status;
+# liveness (kill(pid, 0)) is decided in Python, never inside SQL.
+_SELECT_RUNNING_TASKS_SQL = """
+    SELECT id AS task_id,
+           title,
+           assignee,
+           worker_pid,
+           started_at,
+           last_heartbeat_at
+    FROM tasks
+    WHERE status = 'running'
+    """
+
+
+def _fetch_running_task_rows(db_path: Path) -> List[sqlite3.Row]:
+    """Query the kanban DB for every task in ``running`` status.
+
+    Returns an empty list when the query fails (missing or corrupt DB):
+    the caller treats "unknown" as "no live workers" so the guard stays
+    fail-open.
+    """
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        return conn.execute(_SELECT_RUNNING_TASKS_SQL).fetchall()
+    except Exception as exc:
+        logger.debug("get_live_workers DB query failed: %s", exc)
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _row_is_live(row: sqlite3.Row) -> bool:
+    """Decide whether a ``running`` task row counts as a live worker.
+
+    A row with no ``worker_pid`` counts as live: the dispatcher may not
+    have recorded the PID yet (e.g. goal-mode workers), and a running
+    task with no PID shouldn't be invisible to the concurrency guard.
+    """
+    pid = row["worker_pid"]
+    return pid is None or _pid_alive(pid)
+
+
+def _row_to_worker(row: sqlite3.Row) -> WorkerInfo:
+    """Convert one ``running`` task row into a WorkerInfo record."""
+    return WorkerInfo(
+        task_id=row["task_id"],
+        assignee=row["assignee"] or "unknown",
+        pid=row["worker_pid"],
+        started_at=row["started_at"],
+        last_heartbeat_at=row["last_heartbeat_at"],
+        title=row["title"] or "",
+    )
+
+
 def get_live_workers() -> List[WorkerInfo]:
     """Return all live kanban workers (status='running' + alive PID).
 
@@ -110,54 +167,8 @@ def get_live_workers() -> List[WorkerInfo]:
     if not db_path.exists():
         return []
 
-    conn: Optional[sqlite3.Connection] = None
-    workers: List[WorkerInfo] = []
-    try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT id AS task_id,
-                   title,
-                   assignee,
-                   worker_pid,
-                   started_at,
-                   last_heartbeat_at
-            FROM tasks
-            WHERE status = 'running'
-            """,
-        ).fetchall()
-    except Exception as exc:
-        logger.debug("get_live_workers DB query failed: %s", exc)
-        return []
-    finally:
-        if conn is not None:
-            conn.close()
-
-    for row in rows:
-        pid = row["worker_pid"]
-        # A running task with no PID — count it (see docstring)
-        if pid is None:
-            workers.append(WorkerInfo(
-                task_id=row["task_id"],
-                assignee=row["assignee"] or "unknown",
-                pid=None,
-                started_at=row["started_at"],
-                last_heartbeat_at=row["last_heartbeat_at"],
-                title=row["title"] or "",
-            ))
-            continue
-        if _pid_alive(pid):
-            workers.append(WorkerInfo(
-                task_id=row["task_id"],
-                assignee=row["assignee"] or "unknown",
-                pid=pid,
-                started_at=row["started_at"],
-                last_heartbeat_at=row["last_heartbeat_at"],
-                title=row["title"] or "",
-            ))
-
-    return workers
+    rows = _fetch_running_task_rows(db_path)
+    return [_row_to_worker(row) for row in rows if _row_is_live(row)]
 
 
 def sort_by_age(workers: List[WorkerInfo]) -> List[WorkerInfo]:
@@ -185,6 +196,39 @@ class ConcurrencyDecision:
     reason: str = ""
 
 
+def _resolve_hard_limit(desired_max: int, hard_limit: Optional[int]) -> int:
+    """Resolve the effective hard limit for the concurrency check.
+
+    Precedence: explicit argument > ``QUOTA_GOVERNOR_HARD_LIMIT`` env var >
+    ``desired_max + 2`` (one tick of headroom).  A garbage or empty env
+    value falls back to the default rather than raising.
+    """
+    if hard_limit is not None:
+        return hard_limit
+    env_val = os.environ.get("QUOTA_GOVERNOR_HARD_LIMIT", "").strip()
+    if env_val:
+        try:
+            return int(env_val)
+        except ValueError:
+            pass
+    return desired_max + 2
+
+
+def _build_decision_reason(
+    live_count: int, desired_max: int, hard_limit: int,
+    should_spawn: bool, kill_count: int,
+) -> str:
+    """Build the one-line decision reason consumed by format_decision_for_log."""
+    parts = [f"live={live_count}", f"desired={desired_max}", f"hard={hard_limit}"]
+    if should_spawn:
+        parts.append("spawn=ok")
+    else:
+        parts.append("spawn=skip(soft_cap)")
+    if kill_count:
+        parts.append(f"kill={kill_count}")
+    return " | ".join(parts)
+
+
 def check_concurrency(desired_max: int, hard_limit: Optional[int] = None) -> ConcurrencyDecision:
     """Decide whether the tick should spawn and which workers to kill.
 
@@ -201,16 +245,7 @@ def check_concurrency(desired_max: int, hard_limit: Optional[int] = None) -> Con
     Returns:
         ConcurrencyDecision with the live count, kill list, and reason.
     """
-    # Resolve hard limit
-    if hard_limit is None:
-        env_val = os.environ.get("QUOTA_GOVERNOR_HARD_LIMIT", "").strip()
-        if env_val:
-            try:
-                hard_limit = int(env_val)
-            except ValueError:
-                hard_limit = desired_max + 2
-        else:
-            hard_limit = desired_max + 2
+    hard_limit = _resolve_hard_limit(desired_max, hard_limit)
 
     workers = get_live_workers()
     live_count = len(workers)
@@ -225,13 +260,10 @@ def check_concurrency(desired_max: int, hard_limit: Optional[int] = None) -> Con
         excess = live_count - hard_limit
         to_kill = workers_sorted[:excess]
 
-    parts = [f"live={live_count}", f"desired={desired_max}", f"hard={hard_limit}"]
-    if should_spawn:
-        parts.append("spawn=ok")
-    else:
-        parts.append("spawn=skip(soft_cap)")
-    if to_kill:
-        parts.append(f"kill={len(to_kill)}")
+    reason = _build_decision_reason(
+        live_count, desired_max, hard_limit,
+        should_spawn, kill_count=len(to_kill),
+    )
 
     return ConcurrencyDecision(
         live_count=live_count,
@@ -239,7 +271,7 @@ def check_concurrency(desired_max: int, hard_limit: Optional[int] = None) -> Con
         hard_limit=hard_limit,
         should_spawn=should_spawn,
         workers_to_kill=to_kill,
-        reason=" | ".join(parts),
+        reason=reason,
     )
 
 
