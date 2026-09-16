@@ -556,82 +556,81 @@ def pending_without_successor_count(db_path,
                if f["pending"] and not f["has_successor"])
 
 
-def cascade_step(db_path, ledger, execute: bool = False,
-                 now: float | None = None,
-                 hours: int = DONE_WINDOW_HOURS) -> str | None:
-    """One body-parts step. Returns the stdout message (None = silent).
+# Helper functions for readability and line count control
 
-    Priority order (first actionable finding wins, max 1 action):
-      1. pending + open successor already exists -> detect-log only
-      2. pending + class C + no successor -> create successor
-         (dry-run: report what would be created)
-      3. pending + non-C -> one-time audit comment on the parent
-         (class A/B are user decisions; the comment surfaces the gap
-         without creating work the doctrine forbids)
-    Ledger actions: body-parts-detect / body-parts-successor /
-    body-parts-audit-non-c / body-parts-create-failed.
-    """
+def _handle_detect(ledger: Path, now: float, parent_id: str, label: str) -> None:
+    _log(ledger, {"ts": now, "action": "body-parts-detect",
+                  "parent": parent_id, "pending": label,
+                  "note": "open successor already references parent"})
+
+
+def _handle_non_c(ledger: Path, now: float, f: dict, execute: bool) -> str | None:
+    label = parts_label(f["pending"])
+    if not execute:
+        _log(ledger, {"ts": now, "action": "body-parts-audit-non-c",
+                      "parent": f["parent_id"], "dry": True,
+                      "pending": label})
+        return f"cola viva: auditoria body-parts de {f['parent_id']} (no-C, {label} pendientes)"
+    if f["has_audit"]:
+        return None  # audit already left; never comment-spam
+    ok = comment_task(
+        f["parent_id"],
+        f"{AUDIT_MARKER} Body multi-parte cerrado sin evidenciar: {label}. No se crea sucesor automatico (clase no-C requiere decision del dueno — OBJ-39-REBELION)."
+    )
+    _log(ledger, {"ts": now, "action": "body-parts-audit-non-c",
+                  "parent": f["parent_id"], "pending": label,
+                  "commented": ok})
+    if ok:
+        return f"cola viva: auditoria body-parts de {f['parent_id']} (no-C, {label} pendientes)"
+    return None
+
+
+def _handle_class_c(ledger: Path, now: float, f: dict, execute: bool) -> str | None:
+    title, body = build_successor(f["parent_id"], f["title"],
+                                  f["assignee"], f["body"],
+                                  f["pending"], f["part_lines"])
+    assignee = f["assignee"] or "pr-ollama"
+    if not execute:
+        _log(ledger, {"ts": now, "action": "body-parts-successor",
+                      "parent": f["parent_id"], "dry": True,
+                      "title": title[:60], "assignee": assignee,
+                      "pending": parts_label(f["pending"])})
+        return f"cola viva: sucesor body-parts de {f['parent_id']} ({parts_label(f['pending'])} pendientes) -> {title[:50]}"
+    tid = create_task(title, body, assignee)
+    if not tid:
+        _log(ledger, {"ts": now, "action": "body-parts-create-failed",
+                      "parent": f["parent_id"], "pending": parts_label(f["pending"])})
+        return f"cola seca: fallo al crear sucesor body-parts de {f['parent_id']}"
+    comment_task(f["parent_id"],
+                 f"{AUDIT_MARKER} Body multi-parte. Evidencia en result/runs/comentarios: {parts_label(f['evidenced']) or 'ninguna'}. Partes sin evidencia: {parts_label(f['pending'])}. Sucesor creado: {tid} (OBJ-39: done sellado no se reabre; el sucesor es la reapertura).")
+    _log(ledger, {"ts": now, "action": "body-parts-successor",
+                  "parent": f["parent_id"], "task": tid,
+                  "title": title[:60], "assignee": assignee,
+                  "pending": parts_label(f["pending"])})
+    return f"cola viva: sucesor body-parts de {f['parent_id']} -> {tid} ({parts_label(f['pending'])} pendientes)"
+
+
+# Refactored cascade_step: ≤50 lines
+
+def cascade_step(db_path, ledger, execute: bool = False,
+                now: float | None = None,
+                hours: int = DONE_WINDOW_HOURS) -> str | None:
+    """One body-parts step. Returns stdout message or None."""
     now = time.time() if now is None else float(now)
     for f in scan(db_path, hours, now=now):
         if not f["pending"]:
             continue
-        label = parts_label(f["pending"])
         if f["has_successor"]:
-            _log(ledger, {"ts": now, "action": "body-parts-detect",
-                          "parent": f["parent_id"], "pending": label,
-                          "note": "open successor already references parent"})
-            continue  # silent on stdout: observation only
-        if not f["clase_c"]:
-            if not execute:
-                _log(ledger, {"ts": now, "action": "body-parts-audit-non-c",
-                              "parent": f["parent_id"], "dry": True,
-                              "pending": label})
-                return (f"cola viva: auditoria body-parts de "
-                        f"{f['parent_id']} (no-C, {label} pendientes)")
-            if f["has_audit"]:
-                continue  # audit already left; never comment-spam
-            ok = comment_task(
-                f["parent_id"],
-                f"{AUDIT_MARKER} Body multi-parte cerrado sin evidenciar: "
-                f"{label}. No se crea sucesor automatico (clase no-C "
-                f"requiere decision del dueno — OBJ-39-REBELION).")
-            _log(ledger, {"ts": now, "action": "body-parts-audit-non-c",
-                          "parent": f["parent_id"], "pending": label,
-                          "commented": ok})
-            if ok:
-                return (f"cola viva: auditoria body-parts de "
-                        f"{f['parent_id']} (no-C, {label} pendientes)")
+            _handle_detect(ledger, now, f["parent_id"], parts_label(f["pending"]))
             continue
-        title, body = build_successor(f["parent_id"], f["title"],
-                                      f["assignee"], f["body"],
-                                      f["pending"], f["part_lines"])
-        assignee = f["assignee"] or "pr-ollama"
-        if not execute:
-            _log(ledger, {"ts": now, "action": "body-parts-successor",
-                          "parent": f["parent_id"], "dry": True,
-                          "title": title[:60], "assignee": assignee,
-                          "pending": label})
-            return (f"cola viva: sucesor body-parts de {f['parent_id']} "
-                    f"({label} pendientes) -> {title[:50]}")
-        tid = create_task(title, body, assignee)
-        if not tid:
-            _log(ledger, {"ts": now, "action": "body-parts-create-failed",
-                          "parent": f["parent_id"], "pending": label})
-            return (f"cola seca: fallo al crear sucesor body-parts de "
-                    f"{f['parent_id']}")
-        comment_task(f["parent_id"],
-                     f"{AUDIT_MARKER} Body multi-parte. Evidencia en "
-                     f"result/runs/comentarios: "
-                     f"{parts_label(f['evidenced']) or 'ninguna'}. "
-                     f"Partes sin evidencia: {label}. "
-                     f"Sucesor creado: {tid} (OBJ-39: done sellado no se "
-                     f"reabre; el sucesor es la reapertura).")
-        _log(ledger, {"ts": now, "action": "body-parts-successor",
-                      "parent": f["parent_id"], "task": tid,
-                      "title": title[:60], "assignee": assignee,
-                      "pending": label})
-        return (f"cola viva: sucesor body-parts de {f['parent_id']} -> {tid} "
-                f"({label} pendientes)")
+        if not f["clase_c"]:
+            msg = _handle_non_c(ledger, now, f, execute)
+            if msg:
+                return msg
+            continue
+        msg = _handle_class_c(ledger, now, f, execute)
+        if msg:
+            return msg
     return None
 
 
