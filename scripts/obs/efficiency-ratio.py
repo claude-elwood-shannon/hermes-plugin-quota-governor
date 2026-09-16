@@ -151,7 +151,7 @@ def _objective_res(db_path: Path):
     _OBJECTIVES_RES_CACHE[frozenset(ids)] = pair
     return pair
 
-SUCCESS_TAG_RE = re.compile(r"(?i)^\s*success\s*[:\-]\s*(.+?)\s*$")
+SUCCESS_TAG_RE = re.compile(r"(?i)^\s*\#*\s*success\s*[:\-]\s*(.+?)\s*$")
 SUCCESS_PROSE_RE = re.compile(
     r"(?i)^\s*(?:success criterion|criterio de [ée]xito)\s*[:\-]\s*(.+?)\s*$")
 
@@ -244,6 +244,13 @@ def declared_criterion(body: str):
         m = SUCCESS_PROSE_RE.match(ln)
         if m:
             return "prose", m.group(1)
+    # bare markdown header ("### Success criterion:") with the
+    # criterion text on the next non-empty line
+    for i, ln in enumerate(lines[:12]):
+        if re.match(r"(?i)^\s*\#*\s*success\s*[:]*\s*$", ln):
+            for ln2 in lines[i + 1:]:
+                if ln2.strip():
+                    return "prose", ln2.strip()
     return None, None
 
 
