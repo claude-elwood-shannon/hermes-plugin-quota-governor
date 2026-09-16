@@ -442,3 +442,4 @@ MIT
 ## Additional Features
 - **pr‑vllm** local worker profile now integrated; see `docs/quota-planner.md` for routing rules.
 - **supply_ratio** knob in the planner controls perpetual supply; documented in `docs/obj29-perpetual-supply.md`.
+- **innovation fund (OBJ-30)** — an autonomous innovation fund with its own budget: pilot delivered, mechanisms running, and the funding contract awaits the owner's signature before any window opens; documented in `docs/obj30-innovation-fund.md`.
