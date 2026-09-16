@@ -64,6 +64,7 @@ import subprocess
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -562,36 +563,44 @@ def annotate_wip_files(cwd, changes):
 
 # ── Task Creation ────────────────────────────────────────────────────────────
 
-def build_sync_body(uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_REMOTE, branch=DEFAULT_BRANCH, assignee=None):
-    """Build the body for the sync task."""
-    sections = []
+def _sync_body_listing(items: List[Dict[str, Any]],
+                       formatter: Callable[[Dict[str, Any]], str],
+                       header: str) -> List[str]:
+    """Render one change-list section (cap 30, overflow line); [] when empty."""
+    if not items:
+        return []
+    lines = [header]
+    for c in items[:30]:
+        lines.append(formatter(c))
+    if len(items) > 30:
+        lines.append(f"  ... y {len(items) - 30} mas")
+    lines.append("")
+    return lines
+
+
+def build_sync_body(uncommitted: List[Dict[str, Any]], ahead_commits: List[Dict[str, Any]],
+                    repo: str = REPO_DIR, remote: str = DEFAULT_REMOTE,
+                    branch: str = DEFAULT_BRANCH, assignee: Optional[str] = None) -> str:
+    """Build the body for the sync task (header + listings + instructions)."""
     repo_label = repo
     display_name = repo_basename(repo)
-
-    sections.append(
+    sections = [
         "objective:OBJ-13 | cost:micro | model:worker\n\n"
         "OBJ-13: Sincronizacion automatica del repo\n\n"
         f"El cron de sincronizacion detecto cambios sin publicar en {repo_label} "
         f"(repo: {display_name}, remote: {remote}, branch: {branch}).\n\n"
-    )
+    ]
+    sections += _sync_body_listing(
+        uncommitted, lambda c: f"  {c['status']} {c['path']}", "## Cambios sin commitear\n")
+    sections += _sync_body_listing(
+        ahead_commits, lambda c: f"  {c['hash']} {c['message']}", "## Commits sin pushear\n")
+    sections.append(_sync_body_instructions(repo_label, remote, branch))
+    return "\n".join(sections)
 
-    if uncommitted:
-        sections.append("## Cambios sin commitear\n")
-        for c in uncommitted[:30]:
-            sections.append(f"  {c['status']} {c['path']}")
-        if len(uncommitted) > 30:
-            sections.append(f"  ... y {len(uncommitted) - 30} mas")
-        sections.append("")
 
-    if ahead_commits:
-        sections.append("## Commits sin pushear\n")
-        for c in ahead_commits[:30]:
-            sections.append(f"  {c['hash']} {c['message']}")
-        if len(ahead_commits) > 30:
-            sections.append(f"  ... y {len(ahead_commits) - 30} mas")
-        sections.append("")
-
-    sections.append(
+def _sync_body_instructions(repo_label: str, remote: str, branch: str) -> str:
+    """Numbered worker instructions: commit identity, Tor push, backoff, verify."""
+    return (
         "## Instrucciones\n\n"
         "1. Revisar los cambios con `git status` y `git diff` en "
         f"{repo_label}\n"
@@ -615,8 +624,6 @@ def build_sync_body(uncommitted, ahead_commits, repo=REPO_DIR, remote=DEFAULT_RE
         "   Debe ser 0.\n"
         "6. Dejar evidencia: output de git push y git log en el summary.\n"
     )
-
-    return "\n".join(sections)
 
 def _resolve_assignee(cfg):
     if cfg["assignee"] == "auto":
@@ -692,14 +699,84 @@ def _repo_needs_sync(cfg):
         return [], [], {"fresh_untracked": fresh_untracked}
     return uncommitted, ahead_commits, {"fresh_untracked": fresh_untracked}
 
-def _gather_dirty_repos(configs, db_path):
+def _wip_decision(uncommitted: List[Dict[str, Any]], ahead_commits: Optional[List[Dict[str, Any]]],
+                  desync_time: Optional[float], now_ts: float,
+                  live_workers: List[Dict[str, Any]]) -> Tuple[bool, bool]:
+    """Return (wip_window, wip_suppressed) for the sibling-WIP suppression.
+
+    Uncommitted files (never ahead commits — commits are deliberate,
+    publishable work) while a worker holds a live claim are that task's WIP,
+    not sync debt, and only while the desync itself is young
+    (WIP_MAX_DESYNC_AGE): an uncommitted debt that PRE-DATES the worker's
+    claim — or survives a live worker by hours — is a real orphaned change.
+    Desync timestamp unavailable (all mtimes unreadable) -> fall through to
+    suppression (wip_window True).
+    """
+    wip_window = (desync_time is None) or (now_ts - desync_time <= WIP_MAX_DESYNC_AGE)
+    wip_suppressed = bool(live_workers) and bool(uncommitted) and not ahead_commits and wip_window
+    return wip_window, wip_suppressed
+
+
+def _gather_one_repo(cfg: Dict[str, Any], conn: Optional[sqlite3.Connection],
+                     now_ts: float, live_workers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Gather one dirty repo: pending state, WIP suppression, dedupe, eligibility.
+
+    Return None when the repo is disabled, clean, or not desynced. Sibling-WIP
+    suppression: uncommitted files while a worker holds a live claim are that
+    task's WIP, not sync debt; logged per suppressed repo.
+    """
+    if not cfg["enabled"]:
+        log(f"Repo disabled in config: {cfg['repo']} — skipping", "INFO")
+        return None
+    uncommitted, ahead_commits, wip = _repo_needs_sync(cfg)
+    if uncommitted is None:
+        return None
+    if not uncommitted and not ahead_commits:
+        return None
+    # If the board DB is unavailable we cannot consult it; treat as no
+    # pending task (do not let a missing DB block sync creation).
+    pending_id = None
+    if conn is not None:
+        pending = has_pending_sync_task(conn, repo=cfg["repo"])
+        pending_id = pending[0]["id"] if pending else None
+    desync_time = compute_desync_time(cfg["repo"], uncommitted, ahead_commits, cfg["remote"], cfg["branch"])
+
+    _wip_window, wip_suppressed = _wip_decision(
+        uncommitted, ahead_commits, desync_time, now_ts, live_workers)
+    if wip_suppressed:
+        live_ids = ", ".join(w["task_id"] for w in live_workers)
+        log(f"Repo {cfg['repo']}: uncommitted files match live worker claim(s) "
+            f"[{live_ids}] and desync is fresh — suppressed as sibling WIP", "INFO")
+
+    # Dedupe: a sync card for this repo created inside the dedupe
+    # window (ANY status — resolved counts too) means the signal was
+    # already surfaced; re-creating it is noise (t_f2ff57c5 → t_ad90e6e4).
+    recent_sync = find_recent_sync_task(conn, cfg["repo"], now=now_ts) if conn is not None else None
+
+    eligible = not pending_id and not wip_suppressed and not recent_sync
+    return {
+        "cfg": cfg,
+        "uncommitted": uncommitted,
+        "ahead_commits": ahead_commits,
+        "desync_time": desync_time,
+        "pending": bool(pending_id),
+        "pending_id": pending_id,
+        "live_workers": live_workers,
+        "wip_suppressed": wip_suppressed,
+        "recent_sync": recent_sync,
+        "fresh_untracked": wip["fresh_untracked"] if wip else [],
+        "eligible": eligible,
+    }
+
+
+def _gather_dirty_repos(configs: List[Dict[str, Any]], db_path: str) -> List[Dict[str, Any]]:
     """Return list of dirty-repo dicts with WIP-suppression and dedupe decisions.
 
     Each entry carries: cfg, uncommitted, ahead_commits, desync_time, pending,
     pending_id, live_workers, recent_sync (dedupe hit) and eligible (final
     decision for this tick).
     """
-    dirty = []
+    dirty: List[Dict[str, Any]] = []
     conn = None
     now_ts = time.time()
     try:
@@ -710,56 +787,9 @@ def _gather_dirty_repos(configs, db_path):
         # about which repo its worker edits), so evaluate once, not per repo.
         live_workers = find_live_sibling_workers(conn, now=now_ts)
         for cfg in configs:
-            if not cfg["enabled"]:
-                log(f"Repo disabled in config: {cfg['repo']} — skipping", "INFO")
-                continue
-            uncommitted, ahead_commits, wip = _repo_needs_sync(cfg)
-            if uncommitted is None:
-                continue
-            if not uncommitted and not ahead_commits:
-                continue
-            # If the board DB is unavailable we cannot consult it; treat as no
-            # pending task (do not let a missing DB block sync creation).
-            pending_id = None
-            if conn is not None:
-                pending = has_pending_sync_task(conn, repo=cfg["repo"])
-                pending_id = pending[0]["id"] if pending else None
-            desync_time = compute_desync_time(cfg["repo"], uncommitted, ahead_commits, cfg["remote"], cfg["branch"])
-
-            # Sibling-WIP suppression: uncommitted files (not ahead commits —
-            # commits are deliberate, publishable work) while a worker holds a
-            # live claim are that task's WIP, not sync debt. Only suppress
-            # while the desync itself is young (WIP_MAX_DESYNC_AGE): an
-            # uncommitted debt that PRE-DATES the worker's claim — or survives
-            # a live worker by hours — is a real orphaned change, not WIP.
-            # Desync timestamp unavailable (all mtimes unreadable) → fall
-            # through to suppression only if no dedupe/pending hit applies.
-            wip_window = (desync_time is None) or (now_ts - desync_time <= WIP_MAX_DESYNC_AGE)
-            wip_suppressed = bool(live_workers) and bool(uncommitted) and not ahead_commits and wip_window
-            if wip_suppressed:
-                live_ids = ", ".join(w["task_id"] for w in live_workers)
-                log(f"Repo {cfg['repo']}: uncommitted files match live worker claim(s) "
-                    f"[{live_ids}] and desync is fresh — suppressed as sibling WIP", "INFO")
-
-            # Dedupe: a sync card for this repo created inside the dedupe
-            # window (ANY status — resolved counts too) means the signal was
-            # already surfaced; re-creating it is noise (t_f2ff57c5 → t_ad90e6e4).
-            recent_sync = find_recent_sync_task(conn, cfg["repo"], now=now_ts) if conn is not None else None
-
-            eligible = not pending_id and not wip_suppressed and not recent_sync
-            dirty.append({
-                "cfg": cfg,
-                "uncommitted": uncommitted,
-                "ahead_commits": ahead_commits,
-                "desync_time": desync_time,
-                "pending": bool(pending_id),
-                "pending_id": pending_id,
-                "live_workers": live_workers,
-                "wip_suppressed": wip_suppressed,
-                "recent_sync": recent_sync,
-                "fresh_untracked": wip["fresh_untracked"] if wip else [],
-                "eligible": eligible,
-            })
+            entry = _gather_one_repo(cfg, conn, now_ts, live_workers)
+            if entry is not None:
+                dirty.append(entry)
     finally:
         if conn:
             conn.close()
