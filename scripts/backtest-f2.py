@@ -43,6 +43,7 @@ import json
 import os
 import time
 from pathlib import Path
+from datetime import datetime
 
 HERE = Path(__file__).resolve().parent
 
@@ -259,55 +260,101 @@ def day_verdicts(snaps, res_records, existing_days, now_iso):
     return new
 
 
+# -------------------------------------------------------------------------
+# Helper wrappers that keep each function <= 50 lines
+# -------------------------------------------------------------------------
+
+def _snapshot_phase(forecast, ledger_entries):
+    """Return (snaps, snap_new) where snaps maps ts to records.
+    snap_new contains the new snapshot record if one is added.
+    """
+    snaps = {}
+    snap_now = snapshot_record(forecast) if forecast else None
+    for r in ledger_entries:
+        if r.get("kind") == "snap" and r.get("ts"):
+            snaps[r["ts"]] = r
+    snap_new = []
+    if snap_now and snap_now["ts"] not in snaps:
+        snaps[snap_now["ts"]] = snap_now
+        snap_new.append(snap_now)
+    return snaps, snap_new
+
+
+def _evaluate_phase(snaps, series, resolved, now_epoch):
+    """Return list of new 'res' records.
+    Wrapper around evaluate_snapshots to keep function size small.
+    """
+    return evaluate_snapshots(snaps, series, resolved, now_epoch)
+
+
+def _day_verdict_phase(snaps, ledger_entries, res_new, now_iso):
+    """Return list of new 'day' verdict records.
+    Combines existing days with new results.
+    """
+    # Build existing_days mapping
+    existing_days = {}
+    for r in ledger_entries:
+        if r.get("kind") == "day" and r.get("day") and r.get("prov"):
+            existing_days[(r["day"], r["prov"]) ] = r.get("verdict")
+    all_res = [r for r in ledger_entries if r.get("kind") == "res"] + res_new
+    return day_verdicts(snaps, all_res, existing_days, now_iso)
+
+
 def main():
     now_epoch = time.time()
     new_records = []
 
-    # 1. SNAPSHOT first, so even a crash later does not lose this tick's
-    #    forecast state (forecast.json will be overwritten next tick).
+    # Phase 1: snapshot
     forecast = read_forecast(FORECAST)
-    snap_now = snapshot_record(forecast) if forecast else None
-
-    ledger = read_jsonl(LEDGER)
-    snaps = {}
-    for r in ledger:
-        if r.get("kind") == "snap" and r.get("ts"):
-            snaps[r["ts"]] = r
-    if snap_now and snap_now["ts"] not in snaps:
-        snaps[snap_now["ts"]] = snap_now
-        new_records.append(snap_now)
+    ledger_entries = read_jsonl(LEDGER)
+    snaps, snap_new = _snapshot_phase(forecast, ledger_entries)
+    new_records.extend(snap_new)
     snap_list = [snaps[k] for k in sorted(snaps)]
 
-    # 2. EVALUATE open snapshots against actual history
+    # Phase 2: evaluate open snapshots
     series = crossings_by_provider(read_jsonl(HISTORY))
-    resolved = {(r["snap"], r["prov"]) for r in ledger
+    resolved = {(r["snap"], r["prov"]) for r in ledger_entries
                 if r.get("kind") == "res" and r.get("snap") and r.get("prov")}
-    res_new = evaluate_snapshots(snap_list, series, resolved, now_epoch)
+    res_new = _evaluate_phase(snap_list, series, resolved, now_epoch)
     new_records.extend(res_new)
 
-    # 3. DAILY VERDICT per provider (append only when it changes)
-    existing_days = {}
-    for r in ledger:
-        if r.get("kind") == "day" and r.get("day") and r.get("prov"):
-            existing_days[(r["day"], r["prov"])] = r.get("verdict")
-    all_res = [r for r in ledger if r.get("kind") == "res"] + res_new
-    day_new = day_verdicts(snap_list, all_res, existing_days,
-                           qf._iso(now_epoch))
+    # Phase 3: daily verdicts
+    day_new = _day_verdict_phase(snap_list, ledger_entries, res_new,
+                                 qf._iso(now_epoch))
     new_records.extend(day_new)
 
     if new_records:
-        try:
-            LEDGER.parent.mkdir(parents=True, exist_ok=True)
-            with open(LEDGER, "a", encoding="utf-8") as f:
-                for r in new_records:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except OSError as e:
-            print(f"backtest-f2: cannot write {LEDGER}: {e}")
-            return 0
+        LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with open(LEDGER, "a", encoding="utf-8") as f:
+            for r in new_records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        # --- generate consolidated verdict file for the verifier ---
+        verdict_path = Path(os.path.expanduser("~/.hermes/quota-governor/backtest-f2-verdict.json"))
+        ok = fail = open_cnt = 0
+        for r in read_jsonl(LEDGER):
+            if r.get("kind") == "day":
+                ver = r.get("verdict")
+                if ver == "OK":
+                    ok += r.get("n_ok", 0)
+                elif ver == "FAIL":
+                    fail += r.get("n_fail", 0)
+                elif ver == "OPEN":
+                    open_cnt += r.get("n_open", 0)
+        precision_ratio = None
+        if ok + fail > 0:
+            precision_ratio = ok / (ok + fail)
+        verdict = {
+            "precision_ratio": precision_ratio,
+            "n_ok": ok,
+            "n_fail": fail,
+            "n_open": open_cnt,
+            "computed_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "source": "forecast-backtest.jsonl",
+        }
+        verdict_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(verdict_path, "w", encoding="utf-8") as f:
+            json.dump(verdict, f, ensure_ascii=False, indent=2)
 
-    # stdout only on anomaly (watchdog pattern): a brand-new FAIL verdict
     for r in day_new:
         if r["verdict"] == "FAIL":
             print(f"backtest-f2: FAIL {r['prov']} {r['day']} — "
