@@ -18,8 +18,11 @@ Task side (strict, never inflated):
     - no parts: the body declares a success criterion (`success:` tag in the
       header block, or a `success criterion:` / `criterio de éxito:` line)
       AND the worker output channels (result + run summaries + comments)
-      both mention the criterion tokens and carry a completion word. A done
-      task with no declaration and no evidence NEVER counts (honesty rule).
+      both evidence the criterion and carry a completion word. Evidence is
+      anchor-first (see criterion_evidenced): file paths / test names /
+      command tokens the summary honestly names, falling back to ~1/3 word
+      coverage for anchor-free criteria. A done task with no declaration
+      and no evidence NEVER counts (honesty rule).
 
 Spend side (documented base):
   trace.jsonl lines in the window with costUsd. STRICT spend = lines whose
@@ -172,9 +175,30 @@ _STOPWORDS = {
 }
 
 
+# Typographic fold: NFKD maps U+2011 (non-breaking hyphen) to U+2010, not
+# to ASCII '-', so worker summaries carrying typographic characters
+# (fondo‑queue‑watch, “quoted”, ellipsis…) never substring-match their
+# ASCII criterion anchors. Fold them before tokenizing.
+_FOLD = str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "‒": "-", "–": "-", "—": "-", "―": "-", "‑": "-",
+    "﹣": "-", "－": "-", "\u2010": "-", "\u00a0": " ", "…": "...",
+})
+
+
 def _norm(text: str) -> str:
+    """lowercase + NFKD + combining-mark strip + typographic fold +
+    whitespace collapse.
+
+    OBJ-METRICS t_7aaa897c: NFKD alone leaves combining marks in place, so
+    'número' split into the unmatchable ghost token 'mero' on one side while
+    the other side may spell it 'numero' — dead weight in the coverage
+    denominator. Folding diacritics (and typographic punctuation) makes both
+    sides tokenize alike."""
     t = (text or "").lower()
     t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = t.translate(_FOLD)
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -254,18 +278,79 @@ def declared_criterion(body: str):
     return None, None
 
 
+# Anchors: raw criterion runs that embed _ . / - (paths, filenames,
+# dotted commands, snake_case test names) — the tokens a worker's honest
+# summary quotes nearly verbatim (tested paths, touched files, rc=0 commands),
+# unlike process verbs ("reportar", "resumen") that evidence never repeats.
+ANCHOR_RE = re.compile(r"[a-z0-9][a-z0-9_./-]*")
+
+# Path-like runs must carry a structural char inside the run: an underscore,
+# a slash, or a dot followed by a letter (file extension / dotted command).
+def _is_anchor(run: str) -> bool:
+    return bool(len(run) >= 4 and ("_" in run or "/" in run or
+                                   re.search(r"\.[a-z]", run)))
+
+
 def criterion_evidenced(criterion: str, output_text: str) -> bool:
-    """Honest single-part evidence: output mentions the criterion tokens AND
-    carries a completion word. Half+ token coverage required (>=1)."""
-    toks = [t for t in re.findall(r"[a-z0-9]{4,}", _norm(criterion))
-            if t not in _STOPWORDS]
-    if not toks:
-        return False
+    """Honest single-part evidence: output carries a completion word AND
+    evidences the criterion. Matching is anchor-first (OBJ-METRICS
+    t_7aaa897c recalibration; empirical basis measured live against the
+    real board, 2026-09-16):
+
+    - The previous rule required >= half of the criterion's unique
+      [a-z0-9]{4,} tokens. Real criteria are 17-44-token verification
+      recipes; ~60-80% of their tokens are process instructions
+      ("reportar", "resumen", "pegar", "termina", imperative framing) that
+      an honest 1-3 sentence summary never repeats. Measured distribution
+      over the 40 last-7d done_no_verified budget tasks with a declared
+      criterion: real hits 0-15 vs a required 8-22 — old_pass was 0/40
+      while 13/15 manually audited tasks DID carry the named evidence in
+      their output channels. The ratio read 0.0 CRITICO for ~13h purely
+      as a verifier artifact.
+    - New rule: coverage is computed over evidence-bearing units, not raw
+      tokens:
+        * anchors (paths/filenames/dotted commands, incl. snake_case and
+          test names) — a criterion anchor counts as hit when the output
+          quotes the full run or its basename (>=5 chars);
+        * words — standalone criterion words not inside any anchor.
+      Anchor-bearing criteria need >= ceil(anchors/3) anchor hits: the
+      summary must name the recipe's concrete artifacts, and a purely
+      prose summary (no paths, no commands) fails. Honest summaries prove
+      work through the artifacts they name, not by reusing process
+      vocabulary (measured: real evidence summaries carry 0 standalone
+      criterion words — e.g. t_b2a0bfa7 "Removed out.txt, tests/tmp.db …
+      Commit created" — while never skipping the anchors). Anchor-free
+      criteria need >= ceil(words/3) word hits (never < 1).
+    - Honesty rule unchanged: no declaration or zero token overlap is
+      never enough; no exemption lists, no threshold near zero."""
     out = _norm(output_text)
     if not COMPLETION_RE.search(out):
         return False
-    hits = sum(1 for t in set(toks) if t in out)
-    return hits >= max(1, len(set(toks)) // 2)
+    cn = _norm(criterion)
+    anchors = {a for a in ANCHOR_RE.findall(cn) if _is_anchor(a)}
+    anchor_parts = set()
+    for a in anchors:
+        anchor_parts.update(t for t in re.findall(r"[a-z0-9]{4,}", a)
+                            if t not in _STOPWORDS)
+    words = {t for t in re.findall(r"[a-z0-9]{4,}", cn)
+             if t not in _STOPWORDS and t not in anchor_parts}
+    a_total, w_total = len(anchors), len(words)
+    if a_total == 0 and w_total == 0:
+        return False
+
+    def anchor_hit(a: str) -> bool:
+        if a in out:
+            return True
+        tail = a.rsplit("/", 1)[-1]
+        return tail != a and len(tail) >= 5 and tail in out
+
+    a_hits = sum(1 for a in anchors if anchor_hit(a))
+    w_hits = sum(1 for t in words if t in out)
+    if a_total:
+        need_a = max(1, -(-a_total // 3))   # ceil(anchors/3)
+        return a_hits >= need_a
+    need_w = max(1, -(-w_total // 3))       # ceil(words/3)
+    return w_hits >= need_w
 
 
 def collect_output_text(db_path: Path, task_id: str, result_text: str,

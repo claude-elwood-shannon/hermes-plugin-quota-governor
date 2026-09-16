@@ -6,7 +6,10 @@ live state) so evidence-verification fixes stop being blind edits:
 
   1. verdict ladder: None=SIN GASTO, >=5 EXCELENTE, >=2 OK, >=0.5 BAJO, else CRITICO
   2. declared_criterion: success tag anywhere in body; prose (EN/ES) in first 12 lines
-  3. criterion_evidenced: completion word AND >= half token coverage (honesty)
+  3. criterion_evidenced: completion word AND anchor-first coverage
+     (anchor-bearing criteria need >= ceil(anchors/3) anchor hits —
+     paths/test names/commands, basename match allowed; anchor-free
+     criteria need >= ceil(words/3) word hits) — honesty rule intact
   4. budget_objectives: approved_objectives table extends legacy AUTODEV/AUTOREPAIR
   5. spend side: read_trace (corrupt lines skipped, missing file raises),
      objective_of_row (direct tag / t_xxx join / unattributed), window_spend
@@ -209,7 +212,16 @@ class TestDeclaredCriterion(ErBase):
 
 
 class TestCriterionEvidence(ErBase):
-    def test_evidenced_with_completion_and_half_coverage(self):
+    # A realistic ~24-unit criterion in the house style: concrete artifacts
+    # (test path + repo path) plus a tail of process instructions.
+    LONG_CRITERION = (
+        "cd /data/git/hermes-plugin-quota-governor && python3 -m pytest "
+        "tests/test_repo_sync_drift.py -q termina con rc=0 y el commit de "
+        "la suite aparece en git log; reportar el resumen de pytest con su "
+        "conteo y el hash del commit en el cierre.")
+
+    def test_evidenced_with_completion_and_third_coverage(self):
+        # anchor-free: 6 words, 2 hits >= ceil(6/3)
         self.assertTrue(er.criterion_evidenced(
             "efficiency ratio tests pass rc=0",
             "The efficiency ratio tests are done."))
@@ -219,13 +231,62 @@ class TestCriterionEvidence(ErBase):
             "efficiency ratio tests pass rc=0",
             "the efficiency ratio tests"))
 
-    def test_below_half_token_coverage(self):
-        # 4 tokens -> need >= 2 hits; "alpha done" gives 1
+    def test_below_third_token_coverage(self):
+        # 4 words -> need >= 2 hits; "alpha done" gives 1
         self.assertFalse(er.criterion_evidenced(
             "alpha bravo charlie delta", "alpha done"))
 
     def test_tokenless_criterion_never_counts(self):
         self.assertFalse(er.criterion_evidenced("sí ok", "done done done"))
+
+    # --- t_7aaa897c regression: long anchor-bearing criteria ---------------
+
+    def test_long_criterion_with_anchors_and_honest_summary_verified(self):
+        # Real shape (t_748fcdfd): the summary names the tested path, the
+        # pass count, the commit hash and the touched file. Old matcher
+        # required 14+ raw-token hits -> always CRITICO artifact.
+        summary = ("Suite tests/test_repo_sync_drift.py en verde (12 passed)"
+                   " y entregable comiteado de verdad en 22f4de4. Arreglé el"
+                   " test del escenario drift y la suite completa acabó done.")
+        self.assertTrue(er.criterion_evidenced(self.LONG_CRITERION, summary))
+
+    def test_anchor_match_via_basename(self):
+        # Full path quoted in criterion, basename only in the summary; the
+        # criterion asks to report the test count, so the honest summary
+        # carries it (word channel) plus the named artifact (anchor).
+        crit = ("cd /data/git/hermes-plugin-quota-governor && python3 -m "
+                "pytest tests/test_providers.py -q pasa rc=0 y reportar el "
+                "resumen con el conteo de tests.")
+        summary = ("test_providers.py done: 12 tests passed en la suite, "
+                   "commit creado en el repo.")
+        self.assertTrue(er.criterion_evidenced(crit, summary))
+
+    def test_anchors_present_but_zero_anchor_hits_not_verified(self):
+        # Summary talks about the work in prose only: no path, no filename.
+        summary = ("Refactor del informe terminado y pruebas hechas con el "
+                   "comando, commit creado y todo done.")
+        self.assertFalse(er.criterion_evidenced(self.LONG_CRITERION, summary))
+
+    def test_word_hits_only_still_need_threshold(self):
+        # Anchor-free criterion, exactly 1/3 coverage -> pass boundary.
+        crit = "alpha bravo charlie delta echo foxtrot"   # 6 words
+        self.assertTrue(er.criterion_evidenced(crit, "alpha bravo done"))
+        self.assertFalse(er.criterion_evidenced(crit, "alpha done"))
+
+    def test_zero_token_overlap_never_verified_even_with_completion(self):
+        self.assertFalse(er.criterion_evidenced(
+            self.LONG_CRITERION,
+            "Everything finished, all work done and completed successfully."))
+
+    def test_diacritic_folding_matches_accented_forms(self):
+        # 'número' folds to 'numero' on both sides (t_7aaa897c ghost tokens)
+        self.assertTrue(er.criterion_evidenced(
+            "reportar el número exacto de tests pasados en el resumen",
+            "número de tests: 8, suite done."))
+        self.assertFalse(er.criterion_evidenced(
+            "reportar el número exacto de tests fallidos en el resumen",
+            "tests done: 0 failed, 8 passed."))
+
 
 
 class TestBudgetObjectives(ErBase):
