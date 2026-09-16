@@ -11,4 +11,12 @@ TS=$(date +'%Y-%m-%d %H:%M:%S')
 LOG=/home/iinstances/.hermes/logs/efficiency-ratio.log
 echo "[$TS] efficiency-ratio: tick" >> "$LOG"
 echo "[$TS] efficiency-ratio: tick"
-exec /usr/bin/python3.12 /data/git/hermes-plugin-quota-governor/scripts/obs/efficiency-ratio.py --verbose
+# Ratio: regenera la métrica y deja su línea JSON en el mismo log (crontab
+# redirige el stdout del wrapper). Sin exec: el gauge de abajo corre después.
+/usr/bin/python3.12 /data/git/hermes-plugin-quota-governor/scripts/obs/efficiency-ratio.py --verbose
+# OBJ-METRICS gauge: racha de días consecutivos con veredicto no-CRITICO
+# (criterio de éxito de 3 días). Fail-open: si el gauge falla, el tick y la
+# línea del ratio ya están en el log; solo falta el JSON {"streak_days": ...}
+# de ese tick. Su salida es distinguible (claves streak_days/
+# meets_3_day_criterion, ajenas al registro efficiency_ratio).
+/usr/bin/python3.12 /data/git/hermes-plugin-quota-governor/scripts/obs/efficiency-streak.py --json || true
