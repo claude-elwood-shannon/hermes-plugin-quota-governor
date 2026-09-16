@@ -291,8 +291,10 @@ def _is_anchor(run: str) -> bool:
                                    re.search(r"\.[a-z]", run)))
 
 
-def criterion_evidenced(criterion: str, output_text: str) -> bool:
-    """Honest single-part evidence: output carries a completion word AND
+# The full anchor-first evidence rule and its empirical basis, kept out of
+# the function docstring so criterion_evidenced() stays <= 50 source lines
+# (scripts/quality-check.py counts the docstring in the function span).
+_EVIDENCE_RULE_DOC = """Honest single-part evidence: output carries a completion word AND
     evidences the criterion. Matching is anchor-first (OBJ-METRICS
     t_7aaa897c recalibration; empirical basis measured live against the
     real board, 2026-09-16):
@@ -323,9 +325,14 @@ def criterion_evidenced(criterion: str, output_text: str) -> bool:
       criteria need >= ceil(words/3) word hits (never < 1).
     - Honesty rule unchanged: no declaration or zero token overlap is
       never enough; no exemption lists, no threshold near zero."""
-    out = _norm(output_text)
-    if not COMPLETION_RE.search(out):
-        return False
+
+
+def _criterion_token_sets(criterion: str):
+    """Split a normalized criterion into (anchor_runs, standalone_words).
+
+    Anchors are the path/filename/dotted-command runs (ANCHOR_RE filtered
+    by _is_anchor); words are the remaining >=4-char tokens minus
+    stopwords and minus tokens already inside an anchor."""
     cn = _norm(criterion)
     anchors = {a for a in ANCHOR_RE.findall(cn) if _is_anchor(a)}
     anchor_parts = set()
@@ -334,6 +341,17 @@ def criterion_evidenced(criterion: str, output_text: str) -> bool:
                             if t not in _STOPWORDS)
     words = {t for t in re.findall(r"[a-z0-9]{4,}", cn)
              if t not in _STOPWORDS and t not in anchor_parts}
+    return anchors, words
+
+
+def criterion_evidenced(criterion: str, output_text: str) -> bool:
+    """Honest single-part evidence: output carries a completion word AND
+    evidences the criterion, anchor-first — see _EVIDENCE_RULE_DOC for
+    the full rule and its empirical basis."""
+    out = _norm(output_text)
+    if not COMPLETION_RE.search(out):
+        return False
+    anchors, words = _criterion_token_sets(criterion)
     a_total, w_total = len(anchors), len(words)
     if a_total == 0 and w_total == 0:
         return False
@@ -499,44 +517,47 @@ def verdict_for(ratio):
     return "CRITICO"
 
 
-def compute(now: float | None = None, include_runs: bool = True) -> dict:
-    now = time.time() if now is None else float(now)
-    db = kanban_db_path()
-    trace_file = trace_path()
-    try:
-        rows = read_trace(trace_file)
-        windows = {}
-        for label, w in WINDOWS.items():
-            v_ids, b_ids, verifier = verified_done_tasks(db, w, now,
-                                                         include_runs)
-            strict, total = window_spend(rows, w, now, db)
-            windows[label] = {"verified": len(v_ids), "budget_done": len(b_ids),
-                              "strict_usd": strict, "total_usd": total,
-                              "verifier": verifier, "verified_ids": v_ids}
-    except (OSError, sqlite3.Error) as exc:
-        return {"ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
-                "tareas_verificadas": None, "gasto_usd": None,
-                "gasto_strict_usd": None, "gasto_total_usd": None,
-                "base_mode": None, "ratio": None, "veredicto": "N/A",
-                "error": f"cannot compute: {exc}"}
+def _window_measurements(db, rows, now, include_runs):
+    """Run the task-side verifier and the spend scan over both windows."""
+    windows = {}
+    for label, w in WINDOWS.items():
+        v_ids, b_ids, verifier = verified_done_tasks(db, w, now, include_runs)
+        strict, total = window_spend(rows, w, now, db)
+        windows[label] = {"verified": len(v_ids), "budget_done": len(b_ids),
+                          "strict_usd": strict, "total_usd": total,
+                          "verifier": verifier, "verified_ids": v_ids}
+    return windows
 
-    w24, w7 = windows["24h"], windows["7d"]
 
-    def build(w):
-        strict, total = w["strict_usd"], w["total_usd"]
-        if strict > 0:
-            base, mode = strict, "strict"
-        elif total > 0:
-            base, mode = total, "proxy-total-24h"
-        else:
-            base, mode = 0.0, "none"
-        ratio = round(w["verified"] / base, 2) if base > 0 else None
-        return base, mode, ratio, verdict_for(ratio)
+def _unavailable_entry(now, exc) -> dict:
+    """Degenerate entry for unreadable sources (fail-open cron contract)."""
+    return {"ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
+            "tareas_verificadas": None, "gasto_usd": None,
+            "gasto_strict_usd": None, "gasto_total_usd": None,
+            "base_mode": None, "ratio": None, "veredicto": "N/A",
+            "error": f"cannot compute: {exc}"}
 
-    base24, mode24, ratio24, ver24 = build(w24)
-    base7, mode7, ratio7, ver7 = build(w7)
 
-    out = {
+def _spend_base(window: dict):
+    """(base_usd, base_mode) for one window: strict spend when non-zero,
+    otherwise the total as a documented proxy, otherwise 0."""
+    strict, total = window["strict_usd"], window["total_usd"]
+    if strict > 0:
+        return strict, "strict"
+    if total > 0:
+        return total, "proxy-total-24h"
+    return 0.0, "none"
+
+
+def _ratio_entry(w24: dict, w7: dict, now: float) -> dict:
+    """Assemble the emitted JSONL entry from the 24h and 7d windows."""
+    base24, mode24 = _spend_base(w24)
+    ratio24 = round(w24["verified"] / base24, 2) if base24 > 0 else None
+    ver24 = verdict_for(ratio24)
+    base7, mode7 = _spend_base(w7)
+    ratio7 = round(w7["verified"] / base7, 2) if base7 > 0 else None
+    ver7 = verdict_for(ratio7)
+    return {
         "ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
         "tareas_verificadas": w24["verified"],
         "tareas_budget_done_24h": w24["budget_done"],
@@ -551,7 +572,24 @@ def compute(now: float | None = None, include_runs: bool = True) -> dict:
         "base_mode_7d": mode7,
         "ratio_7d": ratio7, "veredicto_7d": ver7,
     }
-    return out
+
+
+def compute(now: float | None = None, include_runs: bool = True) -> dict:
+    """Efficiency ratio entry: verified budget tasks over window spend.
+
+    Task side via verified_done_tasks (strict, honesty rule), spend side
+    via window_spend; ratio = verified / spend per window (24h emitted,
+    7d as weekly total/total). Unreadable sources degrade to the N/A
+    entry with an error note (fail-open)."""
+    now = time.time() if now is None else float(now)
+    db = kanban_db_path()
+    trace_file = trace_path()
+    try:
+        rows = read_trace(trace_file)
+        windows = _window_measurements(db, rows, now, include_runs)
+    except (OSError, sqlite3.Error) as exc:
+        return _unavailable_entry(now, exc)
+    return _ratio_entry(windows["24h"], windows["7d"], now)
 
 
 def _iso(now: float) -> str:

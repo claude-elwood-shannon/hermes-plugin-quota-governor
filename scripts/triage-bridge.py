@@ -182,8 +182,56 @@ def human_gate_pending(db_path, task_id: str) -> bool:
         return False
 
 
+def _decide_kept(decide, now: str, task_id: str, reason: str) -> None:
+    """Append a kept-in-triage decision for one task."""
+    decide({"ts": now, "task": task_id, "action": "kept-in-triage",
+            "reason": reason})
+
+
+def _promote_task(db_path, task_id: str, title: str, body: str, now: str,
+                  decide, promoted: int, execute: bool) -> int:
+    """Decide and act on one triage row; return 1 when it consumed a
+    promotion slot (would-promote in dry-run, or promoted via the core),
+    0 otherwise. Decision order mirrors the original loop exactly:
+    tags -> human gate -> 1/tick cap -> ledger idempotence -> promote."""
+    promotable, reason = evaluate(title, body)
+    if not promotable:
+        _decide_kept(decide, now, task_id, reason)
+        return 0
+    if human_gate_pending(db_path, task_id):
+        _decide_kept(decide, now, task_id,
+                     f"{title[:40]}: block_loop needs_input sin "
+                     "comentario humano (gate del core)")
+        return 0
+    if promoted >= MAX_PER_TICK:
+        decide({"ts": now, "task": task_id, "action": "cap-reached",
+                "reason": f"{MAX_PER_TICK}/tick — proximo tick"} )
+        return 0
+    if already_promoted(task_id):
+        _decide_kept(decide, now, task_id,
+                     "ya promocionada por este puente (ledger)")
+        return 0
+    if not execute:
+        decide({"ts": now, "task": task_id, "action": "would-promote",
+                "reason": reason, "title": title})
+        return 1
+    if promote_via_core(db_path, task_id):
+        decide({"ts": now, "task": task_id, "action": "promoted",
+                "reason": reason, "title": title})
+        print(f"TRIAGE-BRIDGE: {task_id} -> todo ({title})")
+        return 1
+    decide({"ts": now, "task": task_id, "action": "specify-rejected",
+            "reason": "core rechazo (not in triage o human-gate pendiente)"})
+    return 0
+
+
 def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
-    """Core loop. Returns list of decision entries (for tests and reporting)."""
+    """Core loop: scan triage tasks and promote eligible ones.
+
+    Honours the PROMOTE-STOP kill switch, the core human-gate mirror, the
+    ledger idempotence and the 1-per-tick cap. Every decision is appended
+    to the ledger (DRY-printed when execute=False); returns the decision
+    entries for tests and reporting."""
     now = now or datetime.now(timezone.utc).isoformat()
     decisions: list[dict] = []
 
@@ -201,37 +249,8 @@ def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
 
     promoted = 0
     for task_id, title, body in rows:
-        promotable, reason = evaluate(title, body)
-        if not promotable:
-            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
-                    "reason": reason})
-            continue
-        if human_gate_pending(db_path, task_id):
-            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
-                    "reason": f"{title[:40]}: block_loop needs_input sin "
-                              "comentario humano (gate del core)"})
-            continue
-        if promoted >= MAX_PER_TICK:
-            decide({"ts": now, "task": task_id, "action": "cap-reached",
-                    "reason": f"{MAX_PER_TICK}/tick — proximo tick"} )
-            continue
-        if already_promoted(task_id):
-            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
-                    "reason": "ya promocionada por este puente (ledger)"})
-            continue
-        if not execute:
-            decide({"ts": now, "task": task_id, "action": "would-promote",
-                    "reason": reason, "title": title})
-            promoted += 1
-            continue
-        if promote_via_core(db_path, task_id):
-            decide({"ts": now, "task": task_id, "action": "promoted",
-                    "reason": reason, "title": title})
-            print(f"TRIAGE-BRIDGE: {task_id} -> todo ({title})")
-            promoted += 1
-        else:
-            decide({"ts": now, "task": task_id, "action": "specify-rejected",
-                    "reason": "core rechazo (not in triage o human-gate pendiente)"})
+        promoted += _promote_task(db_path, task_id, title, body, now,
+                                  decide, promoted, execute)
     return decisions
 
 
