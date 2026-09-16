@@ -13,6 +13,8 @@ STOP
 
 # Runtime scratch / SQLite sidecars
 tmp/
+tmp.py
+tmp.txt
 *.db-shm
 *.db-wal
 
