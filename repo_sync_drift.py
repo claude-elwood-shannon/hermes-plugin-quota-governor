@@ -1,5 +1,6 @@
 # Helper utilities for deploy-drift checks
 import os
+import sys
 import hashlib
 import glob
 from pathlib import Path
@@ -99,6 +100,27 @@ def _detect_drift(candidates, md5_by_name, names_by_base, copies):
     return drift
 
 
+# Default deploy dirs. This module is a delegate of repo-sync-check.py
+# (and health_checks): the CALLER's DEPLOY_DIRS must win so tests that
+# patch the caller's attribute (patch("repo_sync_check.DEPLOY_DIRS", ...))
+# actually take effect. Resolved lazily per call via the caller's frame.
+_DEFAULT_DEPLOY_DIRS = (
+    [os.path.expanduser("~/.hermes/scripts")]
+    + sorted(glob.glob(os.path.expanduser("~/.hermes/profiles/*/scripts")))
+)
+
+
+def _caller_deploy_dirs():
+    """First DEPLOY_DIRS attribute defined in the caller's module, if any."""
+    frame = sys._getframe(2)
+    while frame is not None:
+        val = frame.f_globals.get("DEPLOY_DIRS")
+        if isinstance(val, (list, tuple)):
+            return list(val)
+        frame = frame.f_back
+    return None
+
+
 def check_deploy_drift(repo_dir=None, deploy_dirs=None):
     """Compare each repo scripts/ file against its deployed copies.
 
@@ -112,8 +134,7 @@ def check_deploy_drift(repo_dir=None, deploy_dirs=None):
     if repo_dir is None:
         repo_dir = str(Path(__file__).resolve().parent.parent)
     if deploy_dirs is None:
-        deploy_dirs = ([os.path.expanduser("~/.hermes/scripts")]
-                       + sorted(glob.glob(os.path.expanduser("~/.hermes/profiles/*/scripts"))))
+        deploy_dirs = _caller_deploy_dirs() or list(_DEFAULT_DEPLOY_DIRS)
     candidates = _scan_candidates(repo_dir)
     md5_by_name, names_by_base = _build_name_maps(candidates)
     copies = _collect_copies(deploy_dirs, names_by_base)

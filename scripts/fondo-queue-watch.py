@@ -94,11 +94,19 @@ def _get_hermes_root() -> Path:
 
 
 def kanban_db_path(hermes_home=None) -> Path:
+    """Board path: explicit hermes_home arg > HERMES_KANBAN_DB env > root.
+
+    The explicit arg wins so a fixture home (tests pass hermes_home=<tmp>)
+    stays hermetic even when the harness exports HERMES_KANBAN_DB pointing
+    at the real board (any pytest run from inside a Hermes worker env).
+    Production (cron/main) passes nothing: the env > shared-root resolution
+    (ffcc374) applies unchanged.
+    """
+    if hermes_home:
+        return Path(hermes_home) / "kanban.db"
     env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if env_db:
         return Path(env_db).expanduser().resolve()
-    if hermes_home:
-        return Path(hermes_home) / "kanban.db"
     return _get_hermes_root() / "kanban.db"
 
 
@@ -174,11 +182,15 @@ def queue_counts(db_path: Path, exclude_ids: set | None = None) -> dict:
     return {"ready": row[0] or 0, "running": row[1] or 0}
 
 
-def recent_done_tasks(db_path: Path, hours: int = 24) -> list:
-    """Recently closed (done) tasks, newest first — for structural successors."""
+def recent_done_tasks(db_path: Path, hours: int = 24,
+                      now: float | None = None) -> list:
+    """Recently closed (done) tasks, newest first — for structural successors.
+
+    `now` injectable for deterministic tests (fixed-epoch convention,
+    same as tick-cola-viva.recent_clase_c_done)."""
     if not db_path.exists():
         return []
-    cutoff = time.time() - hours * 3600
+    cutoff = (time.time() if now is None else float(now)) - hours * 3600
     try:
         con = _connect(db_path)
         try:
@@ -440,27 +452,32 @@ def step3_assign_triage(triage, execute: bool = False) -> str | None:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def _cascade_steps(window, db, execute, act, state_path, ledger):
-    """Perform cascade steps.``"""
+def _cascade_steps(window, db, execute, act, state_path, ledger, now=None):
+    """Apply the post-grace cascade: at most ONE action per tick.
+
+    All timestamps go through the injected `now` (fixed-epoch convention)
+    so ticks are deterministic; wall clock is only the default."""
+    now = time.time() if now is None else float(now)
     msg = step1_promote_next_phase(window, db, execute=execute)
     if msg:
-        act({"ts": time.time(), "action": "step1", "detail": msg}, msg)
+        act({"ts": now, "action": "step1", "detail": msg}, msg)
         return True
-    msg = step2_structural_successor(recent_done_tasks(db), db, execute=execute)
+    msg = step2_structural_successor(
+        recent_done_tasks(db, now=now), db, execute=execute)
     if msg:
-        act({"ts": time.time(), "action": "step2", "detail": msg}, msg)
+        act({"ts": now, "action": "step2", "detail": msg}, msg)
         return True
     msg = step3_assign_triage(triage_tasks(db), execute=execute)
     if msg:
-        act({"ts": time.time(), "action": "step3", "detail": msg}, msg)
+        act({"ts": now, "action": "step3", "detail": msg}, msg)
         return True
     state = _read_state(state_path)
     empty_since = state.get("empty_since") or 0
-    empty_min = (time.time() - empty_since) / 60.0
+    empty_min = (now - empty_since) / 60.0
     note = (f"cola seca + supply_ratio: cola ready+running vacia {empty_min:.0f} min en ventana de fondo; sin fase planificada, sin sucesor estructural, sin triage clase C ready-able. Parada legitima (regla de oro: no filler).")
     if execute:
         comment_task(window["id"], note)
-    act({"ts": time.time(), "action": "step4-stop", "detail": note}, f"STOP: {note}")
+    act({"ts": now, "action": "step4-stop", "detail": note}, f"STOP: {note}")
     return True
 
 
@@ -498,7 +515,7 @@ def run(hermes_home=None, execute: bool = False, now=None) -> list:
     if empty_min <= EMPTY_GRACE_MIN:
         _log(ledger, {"ts": now, "action": "queue-empty-grace", "empty_min": round(empty_min, 1)})
         return decisions
-    _cascade_steps(window, db, execute, act, state_path, ledger)
+    _cascade_steps(window, db, execute, act, state_path, ledger, now=now)
     return decisions
 
 

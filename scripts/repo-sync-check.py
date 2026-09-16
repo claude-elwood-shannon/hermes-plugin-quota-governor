@@ -320,6 +320,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import repo_sync_drift
 
 def check_deploy_drift(repo_dir=None, deploy_dirs=None):
+    # Delegate module defaults: repo_dir must be THIS module's REPO_DIR
+    # (repo-sync-check's checkout root), not repo_sync_drift's parent.
+    if repo_dir is None:
+        repo_dir = REPO_DIR
     return repo_sync_drift.check_deploy_drift(repo_dir=repo_dir, deploy_dirs=deploy_dirs)
 
 
