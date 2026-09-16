@@ -491,6 +491,138 @@ def check_silent_plugin(
 # ---------------------------------------------------------------------------
 # Run all checks
 # ---------------------------------------------------------------------------
+# Restore (t_3fc3e669): write_alert + run_all_health_checks were dropped
+# from this module by ec609cf while its public callers survived (the
+# plugin `health` subcommand and the tick script import the latter; the
+# check_* bodies still call the former). Both are restored verbatim from
+# ec609cf^ so imports resolve again and the consolidated pytest
+# collection is green.
+# ---------------------------------------------------------------------------
+
+def write_alert(alert_type: str, message: str, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Append a JSON alert to the alert log file, with dedup/backoff.
+
+    Dedup: if the last alert in the log has the same ``type`` AND the same
+    non-timestamp fields (extra dict), this alert is suppressed — no write
+    occurs — and None is returned.  This prevents repeated entries of the
+    same alert type when the underlying state has not changed.
+
+    Returns the alert dict if written, or None if deduplicated.
+    """
+    alert: Dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": alert_type,
+        "message": message,
+    }
+    if extra:
+        alert.update(extra)
+
+    # Dedup: compare (type, non-timestamp fields) against the last entry
+    last = _last_alert_key()
+    if last is not None and last.get("type") == alert_type:
+        # Compare all fields except 'timestamp' and 'hours_silent' (which
+        # always changes as the silence grows)
+        _skip_keys = {"timestamp", "hours_silent", "message"}
+        last_fields = {k: v for k, v in last.items() if k not in _skip_keys}
+        new_fields = {k: v for k, v in alert.items()   if k not in _skip_keys}
+        if last_fields == new_fields:
+            logger.debug(
+                "dedup: suppressing %s alert (unchanged state)",
+                alert_type,
+            )
+            return None
+
+    log_path = get_alert_log_path()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(alert) + "\n")
+    except OSError as exc:
+        logger.debug("failed to write alert to %s: %s", log_path, exc)
+
+    return alert
+
+
+def run_all_health_checks() -> List[Dict[str, Any]]:
+    """Run all three health checks and return the list of new alerts.
+
+    Each alert is also written to the alert log file.
+
+    For silent_plugin, this iterates over ALL profiles that have
+    observations.jsonl files (not just the HERMES_HOME-scoped one).
+    This ensures a genuinely silent plugin in any profile is detected,
+    while idle profiles (no running tasks) are suppressed by
+    ``check_silent_plugin``'s idle-profile logic.
+    """
+    alerts: List[Dict[str, Any]] = []
+
+    # 1. Fast burn
+    fb = check_fast_burn()
+    if fb:
+        alerts.append(fb)
+
+    # 2. Zombie workers (can produce multiple alerts)
+    zw = check_zombie_workers()
+    alerts.extend(zw)
+
+    # 3. Silent plugin — check ALL profiles, not just HERMES_HOME
+    #
+    # The HERMES_HOME-scoped profile (the "tick profile", e.g. pr-ollama)
+    # runs the tick script itself, so it must always be producing
+    # observations.  It is checked WITHOUT idle-suppression.
+    #
+    # Other profiles are checked WITH idle-suppression: if they have no
+    # running tasks, silence is expected and no alert is emitted.
+    default_obs = get_observations_file()
+    checked_paths: set = set()
+
+    # 3a. Tick profile — must always be alive, UNLESS the board is
+    # legitimately idle (no active tasks for this profile).  When the
+    # quota gate outputs max_workers=0 and there are zero ready/running/
+    # blocked/todo tasks, silence is expected and not an alert condition.
+    # Resolve the profile name from HERMES_HOME so we can check it.
+    tick_profile: Optional[str] = None
+    hermes_home = _get_hermes_home()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    try:
+        rel = hermes_home.relative_to(profiles_root)
+        tick_profile = rel.parts[0]
+    except (ValueError, IndexError):
+        pass
+    sp = check_silent_plugin(observations_path=default_obs, profile_name=tick_profile)
+    if sp:
+        alerts.append(sp)
+    checked_paths.add(str(default_obs.resolve()))
+
+    # 3b. Other profiles — with idle suppression.
+    # Skip multi-profile discovery in test mode (when HERMES_HOME is a
+    # temp directory outside ~/.hermes/profiles/, _find_profile_observations
+    # would discover real production profiles and pollute the test).
+    hermes_home = _get_hermes_home()
+    profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+    in_production = False
+    try:
+        hermes_home.relative_to(profiles_root)
+        in_production = True
+    except ValueError:
+        pass
+
+    if in_production:
+        for profile_name, obs_path in _find_profile_observations():
+            if str(obs_path.resolve()) in checked_paths:
+                continue
+            sp = check_silent_plugin(
+                observations_path=obs_path,
+                profile_name=profile_name,
+            )
+            if sp:
+                alerts.append(sp)
+            checked_paths.add(str(obs_path.resolve()))
+
+    return alerts
+
+
+# ---------------------------------------------------------------------------
 
 
 
