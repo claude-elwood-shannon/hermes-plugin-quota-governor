@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent.parent
 _SPEC = importlib.util.spec_from_file_location(
     "efficiency_ratio", _HERE / "scripts" / "obs" / "efficiency-ratio.py")
 er = importlib.util.module_from_spec(_SPEC)

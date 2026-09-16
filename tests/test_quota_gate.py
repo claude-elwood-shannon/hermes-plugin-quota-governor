@@ -40,6 +40,32 @@ qg = importlib.util.module_from_spec(_SPEC)
 # consultarian el endpoint real (26 fallos en tanda completa, t_a8a4418c).
 # Este fichero usa el handle local `qg`, inmune a la colision.
 _SPEC.loader.exec_module(qg)
+sys.modules["quota_gate"] = qg  # single module instance: string patches
+# and from-imports (root-side test bodies) resolve here (t_3fc3e669 merge).
+from quota_gate import (
+    bottleneck_to_max_cost,
+    bottleneck_to_max_workers,
+    _normalise_privacy_value,
+    validate_recommended_profile,
+    get_existing_profiles,
+    load_providers_config,
+    get_parked_profiles,
+    _retry_http,
+    _read_cache,
+    _write_cache,
+    _cache_dir,
+    compute_ollama_status,
+    compute_nanogpt_status,
+    compute_openrouter_status,
+    select_provider,
+    ALLOWED_PROFILES,
+    PROVIDER_PREFERENCE,
+    PRIVACY_CAPABILITIES,
+)
+import quota_gate  # for patch.object / qualified access in OBJ-26 tests
+from unittest.mock import MagicMock
+import json
+import tempfile
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -314,3 +340,1203 @@ class TestWorkerModelMap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+# ══ Merged from the root lane test_quota_gate.py (t_3fc3e669) ══
+
+def _provider(profile="pr-ollama", availability=80.0, bottleneck=20.0,
+              error="", provider="ollama-cloud", model="glm-5.2",
+              bottleneck_window="session"):
+    return {
+        "profile": profile,
+        "provider": provider,
+        "model": model,
+        "availability": availability,
+        "bottleneck_pct": bottleneck,
+        "bottleneck_window": bottleneck_window,
+        "error": error,
+        "raw": {},
+    }
+
+
+# ── Tests: bottleneck_to_max_cost ────────────────────────────────────────────
+
+class TestBottleneckToMaxCostTiers(unittest.TestCase):
+
+    def test_low_bottleneck_any(self):
+        self.assertEqual(bottleneck_to_max_cost(0), "any")
+        self.assertEqual(bottleneck_to_max_cost(29), "any")
+
+    def test_medium_bottleneck(self):
+        self.assertEqual(bottleneck_to_max_cost(30), "medium")
+        self.assertEqual(bottleneck_to_max_cost(59), "medium")
+
+    def test_high_bottleneck(self):
+        self.assertEqual(bottleneck_to_max_cost(60), "small")
+        self.assertEqual(bottleneck_to_max_cost(79), "small")
+
+    def test_very_high_bottleneck(self):
+        self.assertEqual(bottleneck_to_max_cost(80), "tiny")
+        self.assertEqual(bottleneck_to_max_cost(94), "tiny")
+
+    def test_maxed_bottleneck(self):
+        self.assertEqual(bottleneck_to_max_cost(95), "micro")
+        self.assertEqual(bottleneck_to_max_cost(100), "micro")
+        self.assertEqual(bottleneck_to_max_cost(150), "micro")
+
+
+# ── Tests: bottleneck_to_max_workers ─────────────────────────────────────────
+
+class TestBottleneckToMaxWorkersTiers(unittest.TestCase):
+
+    def test_low_bottleneck_2_workers(self):
+        self.assertEqual(bottleneck_to_max_workers(0), 2)
+        self.assertEqual(bottleneck_to_max_workers(49), 2)
+
+    def test_medium_bottleneck_1_worker(self):
+        self.assertEqual(bottleneck_to_max_workers(50), 1)
+        self.assertEqual(bottleneck_to_max_workers(79), 1)
+
+    def test_high_bottleneck_0_workers(self):
+        self.assertEqual(bottleneck_to_max_workers(80), 0)
+        self.assertEqual(bottleneck_to_max_workers(100), 0)
+
+
+# ── Tests: _normalise_privacy_value ──────────────────────────────────────────
+
+class TestNormalisePrivacyValue(unittest.TestCase):
+
+    def test_canonical_levels(self):
+        self.assertEqual(_normalise_privacy_value("public"), "public")
+        self.assertEqual(_normalise_privacy_value("sensitive"), "sensitive")
+        self.assertEqual(_normalise_privacy_value("confidential"), "confidential")
+
+    def test_high_alias(self):
+        self.assertEqual(_normalise_privacy_value("high"), "sensitive")
+
+    def test_medium_alias(self):
+        self.assertEqual(_normalise_privacy_value("medium"), "sensitive")
+
+    def test_low_alias(self):
+        self.assertEqual(_normalise_privacy_value("low"), "public")
+
+    def test_case_insensitive(self):
+        self.assertEqual(_normalise_privacy_value("Public"), "public")
+        self.assertEqual(_normalise_privacy_value("SENSITIVE"), "sensitive")
+        self.assertEqual(_normalise_privacy_value("High"), "sensitive")
+
+    def test_abbreviations(self):
+        self.assertEqual(_normalise_privacy_value("pub"), "public")
+        self.assertEqual(_normalise_privacy_value("publico"), "public")
+        self.assertEqual(_normalise_privacy_value("sens"), "sensitive")
+        self.assertEqual(_normalise_privacy_value("selectivo"), "sensitive")
+        self.assertEqual(_normalise_privacy_value("conf"), "confidential")
+        self.assertEqual(_normalise_privacy_value("intimo"), "confidential")
+
+    def test_unknown_value_returns_none(self):
+        self.assertIsNone(_normalise_privacy_value("unknown"))
+        self.assertIsNone(_normalise_privacy_value("max"))
+        self.assertIsNone(_normalise_privacy_value(""))
+
+    def test_none_input(self):
+        self.assertIsNone(_normalise_privacy_value(None))
+
+    def test_whitespace_stripped(self):
+        self.assertEqual(_normalise_privacy_value("  public  "), "public")
+
+
+# ── Tests: validate_recommended_profile ──────────────────────────────────────
+
+class TestValidateRecommendedProfile(unittest.TestCase):
+
+    def test_valid_profile(self):
+        """Profile in ALLOWED_PROFILES and existing → returned as-is."""
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-ollama", {"pr-ollama", "pr-nanogpt"}, warnings
+        )
+        self.assertEqual(result, "pr-ollama")
+        self.assertEqual(warnings, [])
+
+    def test_profile_not_in_allowed(self):
+        """Profile not in ALLOWED_PROFILES → fallback + warning."""
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-evil", {"pr-ollama"}, warnings
+        )
+        self.assertEqual(result, "pr-ollama")  # alphabetical fallback
+        self.assertTrue(any("not in allowed set" in w for w in warnings))
+
+    def test_profile_not_existing(self):
+        """Profile in ALLOWED_PROFILES but not on host → fallback + warning."""
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-nanogpt", {"pr-ollama"}, warnings
+        )
+        self.assertEqual(result, "pr-ollama")
+        self.assertTrue(any("does not exist" in w for w in warnings))
+
+    def test_no_allowed_profile_exists(self):
+        """No allowed profile on host → None + warning."""
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-ollama", {"pr-unknown"}, warnings
+        )
+        self.assertIsNone(result)
+        self.assertTrue(any("no allowed profile" in w for w in warnings))
+
+    def test_fallback_with_providers_list(self):
+        """When falling back, pick the allowed provider with highest availability."""
+        warnings = []
+        providers = [
+            _provider(profile="pr-ollama", availability=30, error=""),
+            _provider(profile="pr-nanogpt", availability=80, error=""),
+        ]
+        result = validate_recommended_profile(
+            "pr-evil", {"pr-ollama", "pr-nanogpt"}, warnings,
+            providers_list=providers,
+        )
+        # pr-nanogpt has higher availability → should be picked
+        self.assertEqual(result, "pr-nanogpt")
+
+    def test_fallback_skips_errored_providers(self):
+        """Errored providers are not selected as fallback."""
+        warnings = []
+        providers = [
+            _provider(profile="pr-ollama", availability=80, error="timeout"),
+            _provider(profile="pr-nanogpt", availability=50, error=""),
+        ]
+        result = validate_recommended_profile(
+            "pr-evil", {"pr-ollama", "pr-nanogpt"}, warnings,
+            providers_list=providers,
+        )
+        self.assertEqual(result, "pr-nanogpt")
+
+    def test_fallback_skips_zero_availability(self):
+        """Providers with 0 availability are not selected as fallback."""
+        warnings = []
+        providers = [
+            _provider(profile="pr-ollama", availability=0, error=""),
+            _provider(profile="pr-nanogpt", availability=50, error=""),
+        ]
+        result = validate_recommended_profile(
+            "pr-evil", {"pr-ollama", "pr-nanogpt"}, warnings,
+            providers_list=providers,
+        )
+        self.assertEqual(result, "pr-nanogpt")
+
+
+# ── Tests: get_existing_profiles ─────────────────────────────────────────────
+
+class TestGetExistingProfiles(unittest.TestCase):
+
+    @patch("quota_gate.subprocess.run")
+    def test_parses_profile_list(self, mock_run):
+        # Format: header line, then one profile per line.
+        # The active profile has a ◆ marker; inactive ones are plain.
+        mock_run.return_value = MagicMock(
+            stdout="pr-ollama\npr-nanogpt\npr-openrouter\n",
+            returncode=0,
+        )
+        result = get_existing_profiles()
+        self.assertIn("pr-ollama", result)
+        self.assertIn("pr-nanogpt", result)
+        self.assertIn("pr-openrouter", result)
+
+    @patch("quota_gate.subprocess.run")
+    def test_strips_active_marker(self, mock_run):
+        """The ◆ active marker is stripped from profile names."""
+        mock_run.return_value = MagicMock(
+            stdout="◆ pr-ollama\n  pr-nanogpt\n",
+            returncode=0,
+        )
+        result = get_existing_profiles()
+        self.assertIn("pr-ollama", result)
+        self.assertIn("pr-nanogpt", result)
+
+    @patch("quota_gate.subprocess.run")
+    def test_fallback_on_failure(self, mock_run):
+        """If hermes command fails, falls back to ALLOWED_PROFILES."""
+        mock_run.side_effect = OSError("command not found")
+        result = get_existing_profiles()
+        self.assertEqual(result, ALLOWED_PROFILES)
+
+    @patch("quota_gate.subprocess.run")
+    def test_fallback_on_empty_output(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        result = get_existing_profiles()
+        self.assertEqual(result, ALLOWED_PROFILES)
+
+
+# ── Tests: _retry_http ───────────────────────────────────────────────────────
+
+class TestRetryHttp(unittest.TestCase):
+
+    def test_success_first_try(self):
+        """Function succeeds on first call → no retry."""
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            return "ok"
+        result = _retry_http(fn, retries=2, delay=0)
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls[0], 1)
+
+    @patch("quota_gate.time.sleep")
+    def test_retries_on_403(self, mock_sleep):
+        """HTTP 403 is retried."""
+        from urllib.error import HTTPError
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            if calls[0] < 2:
+                raise HTTPError("url", 403, "Forbidden", {}, None)
+            return "ok"
+        result = _retry_http(fn, retries=2, delay=0)
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls[0], 2)
+
+    @patch("quota_gate.time.sleep")
+    def test_retries_on_429(self, mock_sleep):
+        from urllib.error import HTTPError
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            if calls[0] < 3:
+                raise HTTPError("url", 429, "Too Many Requests", {}, None)
+            return "ok"
+        result = _retry_http(fn, retries=3, delay=0)
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls[0], 3)
+
+    @patch("quota_gate.time.sleep")
+    def test_retries_on_503(self, mock_sleep):
+        from urllib.error import HTTPError
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            if calls[0] < 2:
+                raise HTTPError("url", 503, "Service Unavailable", {}, None)
+            return "ok"
+        result = _retry_http(fn, retries=2, delay=0)
+        self.assertEqual(result, "ok")
+
+    @patch("quota_gate.time.sleep")
+    def test_raises_after_max_retries(self, mock_sleep):
+        """After max retries, the exception is raised."""
+        from urllib.error import HTTPError
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            raise HTTPError("url", 503, "Service Unavailable", {}, None)
+        with self.assertRaises(HTTPError):
+            _retry_http(fn, retries=2, delay=0)
+        self.assertEqual(calls[0], 3)  # 1 initial + 2 retries
+
+    @patch("quota_gate.time.sleep")
+    def test_no_retry_on_404(self, mock_sleep):
+        """HTTP 404 is NOT retried (not in transient codes)."""
+        from urllib.error import HTTPError
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            raise HTTPError("url", 404, "Not Found", {}, None)
+        with self.assertRaises(HTTPError):
+            _retry_http(fn, retries=2, delay=0)
+        self.assertEqual(calls[0], 1)
+
+    @patch("quota_gate.time.sleep")
+    def test_retries_on_url_error(self, mock_sleep):
+        """URLError (network) is retried."""
+        from urllib.error import URLError
+        calls = [0]
+        def fn():
+            calls[0] += 1
+            if calls[0] < 2:
+                raise URLError("connection refused")
+            return "ok"
+        result = _retry_http(fn, retries=2, delay=0)
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls[0], 2)
+
+
+# ── Tests: cache read/write ──────────────────────────────────────────────────
+
+class TestCacheReadWrite(unittest.TestCase):
+
+    def test_write_then_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("quota_gate._cache_dir", return_value=tmpdir):
+                data = {"session_pct": 50.0, "weekly_pct": 30.0}
+                _write_cache("testprov", data)
+                result = _read_cache("testprov")
+                self.assertEqual(result, data)
+
+    def test_read_missing_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("quota_gate._cache_dir", return_value=tmpdir):
+                result = _read_cache("nonexistent")
+                self.assertIsNone(result)
+
+    def test_read_corrupt_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("quota_gate._cache_dir", return_value=tmpdir):
+                cache_path = os.path.join(tmpdir, "badprov-last-good.json")
+                with open(cache_path, "w") as f:
+                    f.write("NOT JSON")
+                result = _read_cache("badprov")
+                self.assertIsNone(result)
+
+    def test_cache_dir_respects_env(self):
+        """_cache_dir uses HERMES_HOME if set."""
+        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/fake-hermes"}):
+            result = _cache_dir()
+            self.assertEqual(result, "/tmp/fake-hermes/quota-governor")
+
+    def test_cache_dir_defaults(self):
+        with patch.dict(os.environ, {"HERMES_HOME": ""}, clear=False):
+            # HERMES_HOME empty → default to ~/.hermes
+            result = _cache_dir()
+            self.assertTrue(result.endswith("quota-governor"))
+
+
+# ── Tests: compute_*_status ──────────────────────────────────────────────────
+
+class TestComputeOllamaStatus(unittest.TestCase):
+
+    @patch("quota_gate.query_ollama")
+    def test_normal_status(self, mock_query):
+        mock_query.return_value = {"session_pct": 40.0, "weekly_pct": 20.0, "activity_cost": 0.0}
+        result = compute_ollama_status()
+        self.assertEqual(result["profile"], "pr-ollama")
+        self.assertEqual(result["provider"], "ollama-cloud")
+        self.assertEqual(result["availability"], 60.0)  # 100 - 40 (max)
+        self.assertEqual(result["bottleneck_pct"], 40.0)
+        self.assertEqual(result["bottleneck_window"], "session")  # 40 > 20
+        self.assertEqual(result["error"], "")
+
+    @patch("quota_gate.query_ollama")
+    def test_weekly_bottleneck(self, mock_query):
+        mock_query.return_value = {"session_pct": 10.0, "weekly_pct": 70.0, "activity_cost": 0.0}
+        result = compute_ollama_status()
+        self.assertEqual(result["bottleneck_window"], "weekly")
+        self.assertEqual(result["availability"], 30.0)
+
+    @patch("quota_gate.query_ollama")
+    def test_paying_mode(self, mock_query):
+        """100% session with cost → availability=5 (paying mode)."""
+        mock_query.return_value = {"session_pct": 100.0, "weekly_pct": 50.0, "activity_cost": 1.5}
+        result = compute_ollama_status()
+        self.assertEqual(result["availability"], 5.0)
+        self.assertEqual(result["bottleneck_pct"], 100.0)
+
+    @patch("quota_gate.query_ollama")
+    def test_zero_usage(self, mock_query):
+        mock_query.return_value = {"session_pct": 0.0, "weekly_pct": 0.0, "activity_cost": 0.0}
+        result = compute_ollama_status()
+        self.assertEqual(result["availability"], 100.0)
+        self.assertEqual(result["bottleneck_pct"], 0.0)
+
+
+class TestComputeNanogptStatus(unittest.TestCase):
+
+    def setUp(self):
+        # Test isolation (OBJ-26 review): _covered_models_safe() would hit
+        # the LIVE NanoGPT API (the balance module's _env_key() reads the
+        # real profile .env regardless of HERMES_HOME). Inject the set.
+        p = patch("quota_gate._covered_models_safe",
+                  return_value=({"z-ai/glm-5.3-flash", "z-ai/glm-5.2"}, None))
+        p.start()
+        self.addCleanup(p.stop)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_active_with_usage(self, mock_query):
+        mock_query.return_value = {
+            "state": "active", "daily_pct": 30.0, "weekly_tokens_pct": 50.0
+        }
+        result = compute_nanogpt_status()
+        self.assertEqual(result["profile"], "pr-nanogpt")
+        self.assertEqual(result["availability"], 50.0)
+        self.assertEqual(result["bottleneck_pct"], 50.0)
+        self.assertEqual(result["bottleneck_window"], "weekly_tokens")
+
+    @patch("quota_gate.query_nanogpt")
+    def test_inactive_state(self, mock_query):
+        mock_query.return_value = {"state": "paused", "daily_pct": 50, "weekly_tokens_pct": 50}
+        result = compute_nanogpt_status()
+        self.assertEqual(result["availability"], 0.0)
+        self.assertIn("state is", result["error"])
+
+    @patch("quota_gate.query_nanogpt")
+    def test_no_usage_data(self, mock_query):
+        """Active state with no usage data → 100% availability."""
+        mock_query.return_value = {"state": "active", "daily_pct": None, "weekly_tokens_pct": None}
+        result = compute_nanogpt_status()
+        self.assertEqual(result["availability"], 100.0)
+        self.assertEqual(result["bottleneck_pct"], 0.0)
+
+
+class TestNanogptCoveredFirstObj26(unittest.TestCase):
+    """OBJ-26: covered-first availability + balance budget blend/stop.
+
+    All tests inject the covered-model set (no live API) via
+    quota_gate._covered_models_safe.
+    """
+
+    def setUp(self):
+        p = patch("quota_gate._covered_models_safe",
+                  return_value=({"z-ai/glm-5.3-flash", "z-ai/glm-5.2"}, None))
+        p.start()
+        self.addCleanup(p.stop)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_healthy_covered_first(self, mock_query):
+        """Sub <90% used: availability = weekly remainder; covered-first."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": 30.0, "weekly_tokens_pct": 50.0}
+        budget = {"level": "ok", "usd_balance": 15.49,
+                  "window_spent_usd": 0.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        self.assertEqual(result["availability"], 50.0)
+        self.assertEqual(result["bottleneck_window"], "weekly_tokens")
+        self.assertTrue(result["raw"]["covered_first"])
+        self.assertEqual(result["raw"]["covered_model_count"], 2)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_exhausted_balance_blend(self, mock_query):
+        """Sub >90% used + budget open: balance headroom blends in."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        budget = {"level": "ok", "usd_balance": 15.49,
+                  "window_spent_usd": 0.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        # 5% sub remainder + 100% balance slice → capped at 100.
+        self.assertEqual(result["availability"], 100.0)
+        self.assertEqual(result["bottleneck_window"], "weekly_tokens+balance")
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_exhausted_partial_headroom(self, mock_query):
+        """Headroom is min(balance, budget remainder), scaled to 100."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        budget = {"level": "warn", "usd_balance": 2.0,
+                  "window_spent_usd": 3.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        # headroom = min(2.0, 2.0) = 2.0 → slice 40% → 5 + 40 = 45.
+        self.assertEqual(result["availability"], 45.0)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_subscription_exhausted_budget_stop(self, mock_query):
+        """Budget stop → balance slice contributes nothing (sub only)."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        budget = {"level": "stop", "usd_balance": 15.49,
+                  "window_spent_usd": 5.0, "window_max_spend_usd": 5.0}
+        result = compute_nanogpt_status(budget=budget)
+        self.assertEqual(result["availability"], 5.0)
+
+    @patch("quota_gate.query_nanogpt")
+    def test_budget_none_conservative(self, mock_query):
+        """No budget context → covered-first conservative (sub only)."""
+        mock_query.return_value = {
+            "state": "active", "daily_pct": None, "weekly_tokens_pct": 95.0}
+        result = compute_nanogpt_status(budget=None)
+        self.assertEqual(result["availability"], 5.0)
+        self.assertTrue(result["raw"]["coverage_unknown"] in (True, False))
+
+
+class TestNanogptBudgetStopRoutingObj26(unittest.TestCase):
+    """OBJ-26: budget level 'stop' removes pr-nanogpt from candidates."""
+
+    def test_stop_drops_nanogpt_other_provider_wins(self):
+        providers = [
+            _provider(profile="pr-ollama", availability=10),
+            _provider(profile="pr-nanogpt", availability=100),
+        ]
+        result = select_provider(providers, nanogpt_budget={"level": "stop"})
+        self.assertEqual(result["profile"], "pr-ollama")
+
+    def test_stop_nanogpt_only_returns_none(self):
+        providers = [_provider(profile="pr-nanogpt", availability=100)]
+        result = select_provider(providers, nanogpt_budget={"level": "stop"})
+        self.assertIsNone(result)
+
+    def test_warn_keeps_nanogpt(self):
+        providers = [_provider(profile="pr-nanogpt", availability=50)]
+        result = select_provider(providers, nanogpt_budget={"level": "warn"})
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_nanogpt_budget_context_module_unavailable(self):
+        """Module load failure degrades to (None, []) — never fatal."""
+        with patch("quota_gate._nanogpt_balance_module", return_value=None):
+            ctx, warn = quota_gate.nanogpt_budget_context()
+        self.assertIsNone(ctx)
+        self.assertEqual(warn, [])
+
+
+class TestComputeOpenrouterStatus(unittest.TestCase):
+
+    @patch("quota_gate.query_openrouter")
+    def test_with_spending_limit(self, mock_query):
+        mock_query.return_value = {
+            "limit": 10.0, "usage": 3.0, "usage_weekly_usd": 1.0, "expires_at": None
+        }
+        result = compute_openrouter_status()
+        self.assertEqual(result["profile"], "pr-openrouter")
+        self.assertEqual(result["availability"], 70.0)  # 100 - (3/10*100)
+        self.assertEqual(result["bottleneck_window"], "spending_limit")
+
+    @patch("quota_gate.query_openrouter")
+    def test_no_limit_heuristic(self, mock_query):
+        """No spending limit → $5/week soft ceiling."""
+        mock_query.return_value = {
+            "limit": None, "usage": None, "usage_weekly_usd": 2.5, "expires_at": None
+        }
+        result = compute_openrouter_status()
+        self.assertEqual(result["bottleneck_pct"], 50.0)  # 2.5/5*100
+        self.assertEqual(result["availability"], 50.0)
+        self.assertEqual(result["bottleneck_window"], "weekly_usd")
+
+    @patch("quota_gate.query_openrouter")
+    def test_expired_key(self, mock_query):
+        from datetime import datetime, timezone, timedelta
+        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        mock_query.return_value = {
+            "limit": 10.0, "usage": 0, "usage_weekly_usd": 0, "expires_at": past
+        }
+        result = compute_openrouter_status()
+        self.assertEqual(result["availability"], 0.0)
+        self.assertIn("expired", result["error"])
+
+    @patch("quota_gate.query_openrouter")
+    def test_no_data(self, mock_query):
+        mock_query.return_value = {
+            "limit": None, "usage": None, "usage_weekly_usd": None, "expires_at": None
+        }
+        result = compute_openrouter_status()
+        self.assertEqual(result["availability"], 100.0)
+        self.assertEqual(result["bottleneck_pct"], 0.0)
+
+
+# ── Tests: select_provider (non-privacy) ─────────────────────────────────────
+
+class TestSelectProviderNonPrivacy(unittest.TestCase):
+
+    def test_picks_highest_availability(self):
+        providers = [
+            _provider(profile="pr-ollama", availability=40),
+            _provider(profile="pr-nanogpt", availability=80),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_skips_errored(self):
+        providers = [
+            _provider(profile="pr-ollama", availability=90, error="timeout"),
+            _provider(profile="pr-nanogpt", availability=50, error=""),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_skips_zero_availability(self):
+        providers = [
+            _provider(profile="pr-ollama", availability=0),
+            _provider(profile="pr-nanogpt", availability=50),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_all_exhausted_returns_none(self):
+        providers = [
+            _provider(profile="pr-ollama", availability=0),
+            _provider(profile="pr-nanogpt", availability=0),
+        ]
+        result = select_provider(providers)
+        self.assertIsNone(result)
+
+    def test_empty_list_returns_none(self):
+        result = select_provider([])
+        self.assertIsNone(None)
+
+    def test_tiebreak_by_preference(self):
+        """When availability is equal, lower preference number wins.
+
+        OBJ-26: preference-first for ALL levels; pr-nanogpt is the preferred
+        provider (GENERAL_PROVIDER_PREFERENCE 0) for public/no-privacy.
+        """
+        providers = [
+            _provider(profile="pr-nanogpt", availability=50),
+            _provider(profile="pr-ollama", availability=50),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")  # preference 0 (OBJ-26)
+
+    def test_paying_mode_fallback_to_free(self):
+        """If top provider is in paying mode, but a free one exists, pick free."""
+        providers = [
+            _provider(profile="pr-ollama", availability=5, bottleneck=100),
+            _provider(profile="pr-nanogpt", availability=30, bottleneck=70),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_paying_mode_no_free_stays(self):
+        """If all providers are in paying mode, stay with the top pick.
+
+        OBJ-26: preference-first for ALL levels — top is pr-nanogpt
+        (GENERAL_PROVIDER_PREFERENCE 0) even with lower availability;
+        with no free provider there is nothing to fall back to.
+        """
+        providers = [
+            _provider(profile="pr-ollama", availability=5, bottleneck=100),
+            _provider(profile="pr-nanogpt", availability=3, bottleneck=100),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")  # preference 0 (OBJ-26)
+
+
+# ── OpenCode Go (MULTI-PROV-06) ─────────────────────────────────────────────
+
+from quota_gate import (
+    query_opencode_go,
+    compute_opencode_go_status,
+    PROFILE_MODELS,
+)
+
+# Verified live response shape (Sep 2026, MULTI-PROV-06):
+#   {"usage": {"rolling": {"status": "ok", "percent": 5, "resetsAt": "..."},
+#              "weekly":  {"status": "ok", "percent": 2, "resetsAt": "..."},
+#              "monthly": {"status": "ok", "percent": 1, "resetsAt": "..."}}}
+_OPENCODE_GO_RAW = {
+    "usage": {
+        "rolling": {"status": "ok", "percent": 5, "resetsAt": "2026-09-06T23:44:21Z"},
+        "weekly": {"status": "ok", "percent": 2, "resetsAt": "2026-09-07T00:00:00Z"},
+        "monthly": {"status": "ok", "percent": 1, "resetsAt": "2026-10-06T18:28:47Z"},
+    }
+}
+
+
+class TestOpenCodeGoAllowedProfiles(unittest.TestCase):
+    """MULTI-PROV-06: pr-opencode joins the allowed/recommended sets."""
+
+    def test_pr_opencode_in_allowed_profiles(self):
+        self.assertIn("pr-opencode", ALLOWED_PROFILES)
+
+    def test_pr_opencode_in_profile_models(self):
+        # Sep 7 2026: glm-5.2 burned 82% of the OpenCode Go 5h window alone;
+        # interactive model switched to glm-5.3-flash (3.6% for the same work).
+        self.assertEqual(PROFILE_MODELS.get("pr-opencode"), "glm-5.3-flash")
+
+    def test_pr_opencode_in_provider_preference(self):
+        self.assertIn("pr-opencode", PROVIDER_PREFERENCE)
+
+    def test_opencode_go_public_only(self):
+        """opencode-go qualifies for public, NOT for sensitive/confidential."""
+        self.assertIn("opencode-go", PRIVACY_CAPABILITIES["public"])
+        self.assertNotIn("opencode-go", PRIVACY_CAPABILITIES["sensitive"])
+        self.assertNotIn("opencode-go", PRIVACY_CAPABILITIES["confidential"])
+
+
+class TestQueryOpenCodeGo(unittest.TestCase):
+    """query_opencode_go parses the live response shape correctly."""
+
+    def test_not_configured_returns_none_fields(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENCODE_GO_API_KEY", None)
+            with patch("quota_gate.get_env", return_value=None):
+                # The unconfigured path returns Nones without raising.
+                # (query_opencode_go raises via get_env in the gate — the
+                # providers.py twin returns Nones; here we assert the
+                # RuntimeError branch.)
+                with self.assertRaises(RuntimeError):
+                    query_opencode_go()
+
+    def test_parses_live_shape(self):
+        with patch("quota_gate.get_env", return_value="test-key"), \
+             patch("quota_gate._retry_http", return_value=_OPENCODE_GO_RAW):
+            result = query_opencode_go()
+        self.assertEqual(result["rolling_pct"], 5.0)
+        self.assertEqual(result["weekly_pct"], 2.0)
+        self.assertEqual(result["monthly_pct"], 1.0)
+        self.assertEqual(result["rolling_status"], "ok")
+        self.assertEqual(result["weekly_resets_at"], "2026-09-07T00:00:00Z")
+
+    def test_percent_not_multiplied(self):
+        """percent is already 0-100 — 5 must stay 5.0, not 500."""
+        with patch("quota_gate.get_env", return_value="test-key"), \
+             patch("quota_gate._retry_http", return_value=_OPENCODE_GO_RAW):
+            result = query_opencode_go()
+        self.assertEqual(result["rolling_pct"], 5.0)
+
+
+class TestComputeOpenCodeGoStatus(unittest.TestCase):
+    """compute_opencode_go_status maps windows to availability."""
+
+    def _query_result(self, rolling=5, weekly=2, monthly=1,
+                      r_status="ok", w_status="ok", m_status="ok"):
+        # rolling/weekly/monthly may be int, float, or None (no data).
+        return {
+            "rolling_pct": rolling, "weekly_pct": weekly, "monthly_pct": monthly,
+            "rolling_status": r_status, "weekly_status": w_status,
+            "monthly_status": m_status,
+            "rolling_resets_at": None, "weekly_resets_at": None,
+            "monthly_resets_at": None,
+        }
+
+    def test_normal_status(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=15, weekly=6, monthly=3)):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["profile"], "pr-opencode")
+        self.assertEqual(st["provider"], "opencode-go")
+        self.assertEqual(st["bottleneck_window"], "rolling")
+        self.assertAlmostEqual(st["bottleneck_pct"], 15.0)
+        self.assertAlmostEqual(st["availability"], 85.0)
+
+    def test_monthly_bottleneck(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=10, weekly=20, monthly=80)):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["bottleneck_window"], "monthly")
+        self.assertAlmostEqual(st["availability"], 20.0)
+
+    def test_non_ok_status_treated_as_100(self):
+        """A rate-limited window (status != ok) counts as fully used."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=5, weekly=2, monthly=1,
+                                                   w_status="rate_limited")):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["bottleneck_window"], "weekly")
+        self.assertAlmostEqual(st["bottleneck_pct"], 100.0)
+        self.assertAlmostEqual(st["availability"], 0.0)
+
+    def test_burning_balance_flag(self):
+        """Calibrated Sep 7 2026 (t_47640f18): when a window is exhausted the
+        API keeps serving via prepaid Zen balance — the status dict must say
+        so explicitly instead of looking like a hard block."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=100, weekly=40, monthly=20,
+                                                   r_status="rate-limited")):
+            st = compute_opencode_go_status()
+        self.assertTrue(st["burning_balance"])
+        self.assertEqual(st["bottleneck_window"], "rolling")
+        self.assertAlmostEqual(st["availability"], 0.0)
+        self.assertEqual(st["raw"]["rolling_status"], "rate-limited")
+
+    def test_no_burning_balance_when_all_ok(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=15, weekly=6, monthly=3)):
+            st = compute_opencode_go_status()
+        self.assertFalse(st["burning_balance"])
+        self.assertEqual(st["state"], "ok")
+
+    def test_state_is_burning_balance_not_blocked(self):
+        """t_47640f18: percent >100 in pr-opencode is 'burning-balance'
+        (money burn via prepaid Zen), NOT a hard 'blocked' state."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=100, weekly=40, monthly=20,
+                                                   r_status="rate-limited")):
+            st = compute_opencode_go_status()
+        self.assertTrue(st["burning_balance"])
+        self.assertEqual(st["state"], "burning-balance")
+
+    def test_zen_soft_cap_unset_returns_none(self):
+        """t_47640f18: the monthly Zen soft-cap is a PLACEHOLDER that stays
+        None (no cap) until the user names the exact USD amount."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result()):
+            st = compute_opencode_go_status()
+        self.assertIsNone(st["zen_monthly_soft_cap_usd"])
+
+    def test_raw_carries_resets_at(self):
+        """resetsAt per window flows through to raw for predictive planning."""
+        with patch("quota_gate.query_opencode_go",
+                   return_value={
+                       **self._query_result(rolling=5, weekly=2, monthly=1),
+                       "rolling_resets_at": "2026-09-07T04:44:00Z",
+                   }):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["raw"]["rolling_resets_at"], "2026-09-07T04:44:00Z")
+
+    def test_no_usage_data_fully_available(self):
+        with patch("quota_gate.query_opencode_go",
+                   return_value=self._query_result(rolling=None, weekly=None,
+                                                   monthly=None)):
+            st = compute_opencode_go_status()
+        self.assertEqual(st["availability"], 100.0)
+        self.assertEqual(st["bottleneck_pct"], 0.0)
+        self.assertEqual(st["bottleneck_window"], "unknown")
+
+    def test_select_provider_considers_opencode_go(self):
+        """pr-opencode ranks by preference, not raw availability.
+
+        OBJ-26: preference-first for public/no-privacy too. opencode-go
+        keeps its availability win ONLY when no higher-preference provider
+        is in the candidate set; pr-ollama (preference 1) beats
+        pr-opencode (2) regardless of availability gap.
+        """
+        providers = [
+            _provider(profile="pr-ollama", availability=10, bottleneck=90),
+            _provider(profile="pr-opencode", availability=85, bottleneck=15,
+                      provider="opencode-go"),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-ollama")
+
+    def test_select_provider_excludes_opencode_go_for_sensitive(self):
+        """sensitive excludes opencode-go (public only, unaudited ZDR)."""
+        providers = [
+            _provider(profile="pr-ollama", availability=10, bottleneck=90),
+            _provider(profile="pr-opencode", availability=85, bottleneck=15,
+                      provider="opencode-go"),
+        ]
+        result = select_provider(providers, privacy_level="sensitive")
+        self.assertEqual(result["profile"], "pr-ollama")
+
+    def test_validate_recommended_profile_accepts_pr_opencode(self):
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-opencode",
+            {"pr-ollama", "pr-nanogpt", "pr-opencode"},
+            warnings,
+        )
+        self.assertEqual(result, "pr-opencode")
+        self.assertEqual(warnings, [])
+
+
+# ── Cost-based model selection + peak pricing (MULTI-PROV-07) ──────────────
+
+from quota_gate import (
+    is_peak_hours,
+    peak_pricing_context,
+    worker_model_for,
+    PROFILE_WORKER_MODELS,
+    WORKER_COST_TIERS,
+    PEAK_WINDOWS_UTC,
+)
+import datetime
+
+
+class TestCostModelMap(unittest.TestCase):
+    """MULTI-PROV-07: every allowed profile has a cheap worker model."""
+
+    def test_worker_models_cover_allowed_profiles(self):
+        for profile in ALLOWED_PROFILES:
+            self.assertIn(profile, PROFILE_WORKER_MODELS,
+                          f"{profile} has no cheap worker model")
+
+    def test_worker_model_is_not_the_interactive_model(self):
+        # The whole point: worker model differs from the pricey default.
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-opencode"], "qwen3.8-flash")
+        self.assertNotEqual(PROFILE_MODELS["pr-opencode"],
+                            PROFILE_WORKER_MODELS["pr-opencode"])
+        # pr-ollama worker pin: gpt-oss:20b, re-unified Sep 15 2026 across
+        # all 4 layers (t_aa18eff8): the Sep-12 revocation premise was false
+        # (/api/tags lists gpt-oss:20b-cloud; 8 production tasks closed done,
+        # zero blocked). Canonical record: PROFILE_WORKER_MODELS in
+        # scripts/quota-gate.py. glm-5.2 reserved for interactive only.
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-ollama"], "gpt-oss:20b")
+        # Sep 8 2026: migrated to z-ai/glm-5.3-flash (0.075/0.25 USD/M in/out),
+        # 5.6x/5.3x cheaper than glm-5.2.  Coverage proven by worker t_154b29f2
+        # (run 407, no HTTP 402, real artifacts).  Previous: zai-org/glm-5.2
+        # (worker t_a5f2d953, archived as historical evidence).
+        self.assertEqual(PROFILE_WORKER_MODELS["pr-nanogpt"], "z-ai/glm-5.3-flash")
+
+    def test_nanogpt_interactive_is_glm53_flash(self):
+        """MULTI-PROV-10.5 (Sep 10 2026, matrix §6.2 approved in t_bef3cbf0):
+        pr-nanogpt interactive pinned to z-ai/glm-5.3-flash — stable
+        subscription coverage (costUsd == 0 on every measured call),
+        replacing zai-org/glm-5.2 whose coverage is DYNAMIC (flipped
+        billed/covered within 20 minutes on Sep 7 2026, 10.3 §5.1)."""
+        self.assertEqual(PROFILE_MODELS["pr-nanogpt"], "z-ai/glm-5.3-flash")
+
+    def test_deepseek_never_mapped_to_pr_opencode(self):
+        """Pitfall: deepseek-v4-flash gives RegionError 403 on OpenCode Go
+        (China-hosted, needs explicit opt-in). Must never be pr-opencode's."""
+        self.assertNotIn("deepseek",
+                         PROFILE_WORKER_MODELS["pr-opencode"].lower())
+
+    def test_worker_model_for_known_profile(self):
+        self.assertEqual(worker_model_for("pr-opencode"), "qwen3.8-flash")
+
+    def test_worker_model_for_unknown_profile_falls_back(self):
+        # Unknown profile → falls back to interactive model if present,
+        # else None (never crashes the gate).
+        self.assertEqual(worker_model_for("pr-openrouter"),
+                         PROFILE_MODELS["pr-openrouter"])
+        self.assertIsNone(worker_model_for("pr-nonexistent"))
+
+    def test_worker_cost_tiers(self):
+        self.assertEqual(WORKER_COST_TIERS, {"micro", "tiny", "small"})
+
+
+class TestIsPeakHours(unittest.TestCase):
+    """Peak = Mon–Fri 01:00–04:00 and 06:00–10:00 UTC (half-open ranges)."""
+
+    def _utc(self, y, mo, d, h):
+        return datetime.datetime(y, mo, d, h, tzinfo=datetime.timezone.utc)
+
+    def test_weekday_peak_windows_active(self):
+        # 2026-09-07 is a Monday
+        for hour in (1, 2, 3, 6, 7, 8, 9):
+            self.assertTrue(is_peak_hours(self._utc(2026, 9, 7, hour)),
+                            f"Monday {hour:02d}:00 should be peak")
+
+    def test_boundary_hours(self):
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 0)))
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 4)))  # end excl
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 5)))
+        self.assertTrue(is_peak_hours(self._utc(2026, 9, 7, 6)))
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 10)))  # end excl
+        self.assertFalse(is_peak_hours(self._utc(2026, 9, 7, 23)))
+
+    def test_weekday_outside_windows_inactive(self):
+        # 2026-09-09 is a Wednesday
+        for hour in (0, 4, 5, 10, 12, 18, 23):
+            self.assertFalse(is_peak_hours(self._utc(2026, 9, 9, hour)))
+
+    def test_weekends_never_peak(self):
+        # 2026-09-05 Saturday, 2026-09-06 Sunday
+        for day in (5, 6):
+            for hour in (1, 2, 3, 6, 7, 8, 9):
+                self.assertFalse(is_peak_hours(self._utc(2026, 9, day, hour)),
+                                 f"weekend day {day} {hour:02d}:00 not peak")
+
+    def test_default_now_is_utc(self):
+        # No exception when called without args; returns bool.
+        self.assertIsInstance(is_peak_hours(), bool)
+
+    def test_windows_shape(self):
+        self.assertEqual(PEAK_WINDOWS_UTC, ((1, 4), (6, 10)))
+
+
+class TestPeakPricingContext(unittest.TestCase):
+    def test_active_context(self):
+        # Monday 2026-09-07 at 07:00 UTC → peak
+        ctx = peak_pricing_context(
+            datetime.datetime(2026, 9, 7, 7, tzinfo=datetime.timezone.utc))
+        self.assertTrue(ctx["active"])
+        self.assertEqual(ctx["windows_utc"], ["01:00-04:00", "06:00-10:00"])
+        self.assertEqual(ctx["multiplier"], 2)
+        self.assertIn("opencode-go", ctx["affected_models"])
+        self.assertIn("ollama-cloud", ctx["affected_models"])
+
+    def test_inactive_context_has_no_affected_models(self):
+        # Tuesday 12:00 UTC → off-peak
+        ctx = peak_pricing_context(
+            datetime.datetime(2026, 9, 8, 12, tzinfo=datetime.timezone.utc))
+        self.assertFalse(ctx["active"])
+        self.assertEqual(ctx["affected_models"], {})
+
+
+class TestGateOutputContainsPeakAndWorkerModel(unittest.TestCase):
+    """main()'s wakeAgent:true context must expose peak_pricing and the
+    cheap-model recommendation (the task creator consumes them)."""
+
+    def _fake_provider(self, profile="pr-opencode", provider="opencode-go",
+                       model="glm-5.2", availability=80.0, bottleneck=20.0):
+        return {"profile": profile, "provider": provider, "model": model,
+                "availability": availability, "bottleneck_pct": bottleneck,
+                "bottleneck_window": "monthly", "error": "", "raw": {}}
+
+    def test_main_context_fields(self):
+        import io
+        import contextlib
+        fake = self._fake_provider()
+        with patch.object(qg, "parse_privacy_level", return_value=None), \
+             patch.object(qg, "compute_ollama_status", return_value=fake), \
+             patch.object(qg, "get_env", return_value=None), \
+             patch.object(qg, "nanogpt_budget_context",
+                          return_value=(None, [])), \
+             patch.object(qg, "select_provider", return_value=dict(fake)), \
+             patch.object(qg, "get_existing_profiles",
+                          return_value={"pr-ollama", "pr-nanogpt", "pr-opencode"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                qg.main()
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        ctx = out["context"]
+        self.assertTrue(out["wakeAgent"])
+        self.assertEqual(ctx["recommended_worker_model"], "qwen3.8-flash")
+        self.assertIn("peak_pricing", ctx)
+        self.assertIn("active", ctx["peak_pricing"])
+        self.assertIn("windows_utc", ctx["peak_pricing"])
+        self.assertEqual(ctx["worker_models"]["pr-opencode"], "qwen3.8-flash")
+        self.assertIn("model_selection_rule", ctx)
+
+    def test_main_snapshot_warns_on_burning_balance(self):
+        """t_47640f18: even when pr-opencode is NOT the recommended provider
+        (it has availability 0 while burning), the snapshot warning must say
+        'burning-balance' and spell out that it is spending prepaid Zen, not
+        free quota. Otherwise the money-burn is invisible to the creator."""
+        import io
+        import contextlib
+        burning = self._fake_provider(availability=0.0, bottleneck=100.0)
+        burning["burning_balance"] = True
+        fine = self._fake_provider(profile="pr-ollama", provider="ollama-cloud",
+                                   availability=80.0, bottleneck=20.0)
+
+        def fake_get_env(key):
+            # opencode-go key present (so the burning provider is appended);
+            # NanoGPT key absent (test isolation — no live balance probe).
+            return "k" if key == "OPENCODE_GO_API_KEY" else None
+
+        with patch.object(qg, "parse_privacy_level", return_value=None), \
+             patch.object(qg, "compute_ollama_status", return_value=fine), \
+             patch.object(qg, "get_env", side_effect=fake_get_env), \
+             patch.object(qg, "nanogpt_budget_context",
+                          return_value=(None, [])), \
+             patch.object(qg, "compute_nanogpt_status", side_effect=Exception("no key")), \
+             patch.object(qg, "compute_opencode_go_status", return_value=burning), \
+             patch.object(qg, "select_provider", return_value=dict(fine)), \
+             patch.object(qg, "get_existing_profiles",
+                          return_value={"pr-ollama", "pr-nanogpt", "pr-opencode"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                qg.main()
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        ctx = out["context"]
+        self.assertEqual(ctx["recommended_profile"], "pr-ollama")  # NOT opencode
+        self.assertIn("burning-balance", ctx["warning"])
+        self.assertIn("PREPAID ZEN", ctx["warning"])
+        self.assertIn("not free quota", ctx["warning"])
+
+
+# ── Parked profiles (t_7da69d59) ────────────────────────────────────────────
+
+class TestProvidersConfig(unittest.TestCase):
+    """providers.json loading + parked set extraction."""
+
+    def test_repo_config_parks_pr_openrouter(self):
+        """AC: pr-openrouter is marked parked:true in the shipped config."""
+        cfg = load_providers_config()  # reads scripts/providers.json
+        self.assertIn("pr-openrouter", cfg)
+        self.assertTrue(cfg["pr-openrouter"].get("parked") is True)
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(load_providers_config("/nonexistent/providers.json"), {})
+
+    def test_malformed_json_returns_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{not json")
+            path = f.name
+        try:
+            self.assertEqual(load_providers_config(path), {})
+        finally:
+            os.unlink(path)
+
+    def test_wrong_shape_returns_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(["unexpected", "list"], f)
+            path = f.name
+        try:
+            self.assertEqual(load_providers_config(path), {})
+        finally:
+            os.unlink(path)
+
+    def test_get_parked_profiles_filters_true_only(self):
+        cfg = {
+            "pr-openrouter": {"parked": True},
+            "pr-ollama": {"parked": False},
+            "pr-vllm": {"reason": "no parked key"},
+            42: "not-a-dict",
+        }
+        self.assertEqual(get_parked_profiles(cfg), {"pr-openrouter"})
+
+
+class TestParkedSelection(unittest.TestCase):
+    """select_provider removes parked profiles BEFORE ranking (G1 silent)."""
+
+    def test_parked_profile_never_recommended(self):
+        """pr-openrouter wins on availability but is parked → nanogpt picks."""
+        providers = [
+            _provider(profile="pr-ollama", availability=40),
+            _provider(profile="pr-nanogpt", availability=50),
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+        ]
+        result = select_provider(providers, parked={"pr-openrouter"})
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_parked_none_keeps_legacy_behavior(self):
+        """No parked profiles → the OBJ-26 preference order applies.
+
+        pr-nanogpt is GENERAL_PROVIDER_PREFERENCE 0: it wins over
+        pr-openrouter even with lower availability (the old behavior —
+        availability-first with openrouter winning — is gone).
+        """
+        providers = [
+            _provider(profile="pr-nanogpt", availability=50),
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+        ]
+        result = select_provider(providers)
+        self.assertEqual(result["profile"], "pr-nanogpt")
+
+    def test_all_candidates_parked_returns_none(self):
+        providers = [
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+        ]
+        result = select_provider(providers, parked={"pr-openrouter"})
+        self.assertIsNone(result)
+
+    def test_fallback_skips_parked_profiles(self):
+        """G1 fallback must not resurrect a parked profile."""
+        providers = [
+            _provider(profile="pr-openrouter", availability=100,
+                      provider="openrouter"),
+            _provider(profile="pr-nanogpt", availability=10),
+        ]
+        warnings = []
+        result = validate_recommended_profile(
+            "pr-evil", {"pr-ollama", "pr-nanogpt", "pr-openrouter"}, warnings,
+            providers_list=providers,
+            parked={"pr-nanogpt"},
+        )
+        # pr-nanogpt parked → excluded from fallback despite availability>0;
+        # pr-openrouter not in ALLOWED_PROFILES → nothing qualifies except…
+        # none of the remaining allowed profiles have availability, so
+        # falls through to the "no allowed profile" warning.
+        self.assertIsNone(result)
+        self.assertTrue(any("no allowed profile" in w for w in warnings))
+
+
+class TestGateMainParked(unittest.TestCase):
+    """End-to-end: parked pr-openrouter top-availability → clean recommendation."""
+
+    def _fp(self, profile, provider, availability, model="m"):
+        return {"profile": profile, "provider": provider, "model": model,
+                "availability": availability, "bottleneck_pct": 100 - availability,
+                "bottleneck_window": "weekly", "error": "", "raw": {}}
+
+    def test_main_no_g1_warning_with_parked_openrouter(self):
+        import io
+        import contextlib
+        ollama = self._fp("pr-ollama", "ollama-cloud", 40)
+        orouter = self._fp("pr-openrouter", "openrouter", 100)
+
+        def fake_get_env(key):
+            return "k" if key == "OPENROUTER_API_KEY" else None
+
+        with patch.object(qg, "parse_privacy_level", return_value=None), \
+             patch.object(qg, "compute_ollama_status", return_value=ollama), \
+             patch.object(qg, "compute_openrouter_status", return_value=orouter), \
+             patch.object(qg, "get_env", side_effect=fake_get_env), \
+             patch.object(qg, "load_providers_config",
+                          return_value={"pr-openrouter": {"parked": True}}), \
+             patch.object(qg, "get_existing_profiles",
+                          return_value={"pr-ollama", "pr-nanogpt",
+                                        "pr-openrouter", "pr-opencode"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                qg.main()
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        ctx = out["context"]
+        # Recommendation goes to the best NON-parked profile, silently.
+        self.assertEqual(ctx["recommended_profile"], "pr-ollama")
+        self.assertNotIn("not in allowed set", ctx.get("warning") or "")
+        # Parked profile stays visible for observability, flagged.
+        by_profile = {p["profile"]: p for p in ctx["providers"]}
+        self.assertTrue(by_profile["pr-openrouter"]["parked"])
+        self.assertFalse(by_profile["pr-ollama"]["parked"])
+
+

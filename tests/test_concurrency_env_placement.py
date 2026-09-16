@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parent / "scripts" / "quota-governor-tick.sh"
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "quota-governor-tick.sh"
 
 PASS = 0
 FAIL = 0

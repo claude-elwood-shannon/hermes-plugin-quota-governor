@@ -29,7 +29,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 # Add the scripts directory to the path
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "scripts"))
 
 # Import with filename-based module (repo-sync-check.py → repo_sync_check)

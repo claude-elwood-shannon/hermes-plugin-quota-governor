@@ -38,7 +38,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent
+REPO_DIR = Path(__file__).resolve().parent.parent
 REPO_SERVER = REPO_DIR / "scripts" / "bridge" / "open-webui-bridge.py"
 REPO_WRAPPER = REPO_DIR / "scripts" / "bridge" / "open-webui-bridge-cron.sh"
 

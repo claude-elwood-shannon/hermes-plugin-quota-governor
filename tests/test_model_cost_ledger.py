@@ -21,7 +21,7 @@ import sqlite3
 import tempfile
 import unittest
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
     "model_cost_ledger", os.path.join(SCRIPT_DIR, "scripts", "model-cost-ledger.py")
 )

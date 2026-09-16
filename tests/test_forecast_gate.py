@@ -11,7 +11,7 @@ import os
 import sys
 import unittest
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SPEC = importlib.util.spec_from_file_location(
     "quota_gate", os.path.join(REPO_ROOT, "scripts", "quota-gate.py"))

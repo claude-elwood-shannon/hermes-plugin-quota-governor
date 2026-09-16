@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 # Add the plugin directory to the path
-PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PLUGIN_DIR)
 
 # Isolate HERMES_HOME and kanban DB
@@ -458,9 +458,9 @@ def main():
 # ── Tests: pytest wrapper (canonical batch) ─────────────────────────────────
 def test_full_suite():
     """Run the 6 verify-hook checks; assert 0 failed."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     result = subprocess.run(
-        [sys.executable, os.path.join(repo, "test_verify_hook.py")],
+        [sys.executable, os.path.abspath(__file__)],
         capture_output=True, text=True, timeout=120,
     )
     print(result.stdout[-2000:] if result.stdout else "")

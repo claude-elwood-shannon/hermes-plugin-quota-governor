@@ -16,7 +16,7 @@ import time
 import unittest
 from pathlib import Path
 
-PLUGIN = str(Path(__file__).resolve().parent)
+PLUGIN = str(Path(__file__).resolve().parent.parent)
 SPEC = importlib.util.spec_from_file_location(
     "quota_metrics", f"{PLUGIN}/scripts/quota-metrics.py")
 qm = importlib.util.module_from_spec(SPEC)

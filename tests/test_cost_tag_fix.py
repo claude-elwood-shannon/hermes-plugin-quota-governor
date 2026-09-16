@@ -30,7 +30,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Import hyphenated module the same way the sibling tests do.
 _spec = importlib.util.spec_from_file_location(

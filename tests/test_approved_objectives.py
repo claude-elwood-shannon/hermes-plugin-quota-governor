@@ -14,7 +14,7 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location(
     "approved_objectives", _HERE / "scripts" / "approved_objectives.py")
 ao = importlib.util.module_from_spec(spec)

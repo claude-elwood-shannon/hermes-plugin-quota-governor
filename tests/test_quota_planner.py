@@ -14,7 +14,7 @@ import os
 import sys
 import unittest
 
-GOV_DIR = os.path.dirname(os.path.abspath(__file__))
+GOV_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = "hermes_plugin_quota_governor"
 
 

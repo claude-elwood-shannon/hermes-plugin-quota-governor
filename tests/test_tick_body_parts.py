@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-GOV_DIR = Path(__file__).resolve().parent
+GOV_DIR = Path(__file__).resolve().parent.parent
 SCRIPT = GOV_DIR / "scripts" / "tick_body_parts.py"
 
 _spec = importlib.util.spec_from_file_location("tick_body_parts", SCRIPT)

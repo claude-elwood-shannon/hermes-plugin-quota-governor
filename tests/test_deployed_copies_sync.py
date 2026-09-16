@@ -23,7 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_SCRIPT = Path(__file__).resolve().parent / "scripts" / "quota-governor-tick.sh"
+REPO_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "quota-governor-tick.sh"
 
 CANDIDATE_DEPLOYED = [
     Path.home() / ".hermes" / "scripts" / "quota-governor-tick.sh",

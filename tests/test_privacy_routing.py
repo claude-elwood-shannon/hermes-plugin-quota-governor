@@ -19,7 +19,7 @@ import tempfile
 import unittest
 
 # Ensure the script dir is on the path
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(SCRIPT_DIR, "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
 
@@ -781,9 +781,9 @@ def main():
 # ── Tests: pytest wrapper (canonical batch) ─────────────────────────────────
 def test_full_suite():
     """Run the 15 privacy-routing check groups; assert 0 failed."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     result = subprocess.run(
-        [sys.executable, os.path.join(repo, "test_privacy_routing.py")],
+        [sys.executable, os.path.abspath(__file__)],
         capture_output=True, text=True, timeout=120,
     )
     print(result.stdout[-2000:] if result.stdout else "")

@@ -30,7 +30,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
 
 import importlib.util  # noqa: E402
@@ -395,7 +395,7 @@ class TestDetectorIntegration(Sandbox):
 
     def _load_wp(self):
         import importlib.util
-        repo = os.path.dirname(os.path.abspath(__file__))
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         spec = importlib.util.spec_from_file_location(
             "weekly_progress_wp", os.path.join(repo, "scripts", "weekly-progress.py"))
         mod = importlib.util.module_from_spec(spec)

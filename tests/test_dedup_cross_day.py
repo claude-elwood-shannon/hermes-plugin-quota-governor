@@ -13,7 +13,7 @@ import unittest
 from datetime import datetime, timezone
 
 # Import the module under test (hyphenated filename, need importlib)
-PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(PLUGIN_DIR, "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
 

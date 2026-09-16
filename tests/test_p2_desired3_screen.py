@@ -22,7 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-GOV_DIR = str(Path(__file__).resolve().parent)
+GOV_DIR = str(Path(__file__).resolve().parent.parent)
 SCREEN_SCRIPT = os.path.join(GOV_DIR, "scripts", "obs", "morning-screen.py")
 
 _spec = importlib.util.spec_from_file_location("morning_screen", SCREEN_SCRIPT)

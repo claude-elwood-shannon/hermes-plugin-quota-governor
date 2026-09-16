@@ -22,7 +22,7 @@ import tempfile
 import types
 import unittest
 
-GOV_DIR = os.path.dirname(os.path.abspath(__file__))
+GOV_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(GOV_DIR, "scripts", "nanogpt-balance-ledger.py")
 CAPTURE = os.environ.get(
     "NANO_GPT_PRICING_CAPTURE",

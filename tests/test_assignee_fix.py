@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 # Add the plugin directory to the path
-PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PLUGIN_DIR, "scripts"))
 
 # Isolate kanban DB

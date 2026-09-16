@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 # Add the plugin directory to the path
-PLUGIN_DIR = str(Path(__file__).resolve().parent)
+PLUGIN_DIR = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, PLUGIN_DIR)
 
 # Isolate HERMES_HOME and kanban DB
@@ -444,9 +444,9 @@ def _print_summary():
 # process that collects sibling files in the same interpreter.
 def test_full_suite():
     """Run the whole script-style check set; assert 0 failed."""
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     result = subprocess.run(
-        [sys.executable, os.path.join(repo, __name__ + ".py")],
+        [sys.executable, os.path.abspath(__file__)],
         capture_output=True, text=True, timeout=120,
     )
     print(result.stdout[-2000:] if result.stdout else "")

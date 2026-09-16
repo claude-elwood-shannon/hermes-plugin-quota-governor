@@ -27,7 +27,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TICK = Path(PLUGIN_DIR) / "scripts" / "quota-governor-tick.sh"
 
 PASS = 0

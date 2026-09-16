@@ -37,7 +37,7 @@ CANDIDATE_JOBS = [
     os.path.join(HOME, ".hermes/profiles/pr-ollama/cron/jobs.json"),
     os.path.join(HOME, ".hermes/cron/jobs.json"),
 ]
-REPO = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_GATE = os.path.join(REPO, "scripts", "quota-gate.py")
 DEPLOY_CANDIDATES = [
     os.path.join(HOME, ".hermes/scripts/quota-gate.py"),
