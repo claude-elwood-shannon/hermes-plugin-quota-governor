@@ -481,27 +481,33 @@ def _alerts_section(alerts: list) -> list:
 # Build the actual HTML
 # ---------------------------------------------------------------------------
 
-def build_html(hermes_home=None, now=None) -> str:
-    """The whole page. Pure function of the read‑only sources."""
-    now = time.time() if now is None else float(now)
-    rows = read_trace(hermes_home)
-    agg = agg_trace(rows)
-    series = daily_series(rows, now=now)
-    fc = ms._read_json(ms.forecast_path(hermes_home))
-    board = read_board(hermes_home)
-    budget = read_metrics(hermes_home)
-    budget = budget[-1] if budget and isinstance(budget[-1], dict) else {}
-    verdicts = provider_verdicts(fc)
-    alerts = alert_cards(hermes_home)
-    has_any = bool(rows or board["db"] or fc.get("providers"))
+def _window_suffix(agg: dict) -> str:
+    """Trace window fragment for the header ('' when the trace is empty)."""
+    if agg["first_ts"] is None:
+        return ""
+    return (
+        f" · ventana trace {ms._fmt_ts(agg['first_ts'])} →"
+        f" {ms._fmt_ts(agg['last_ts'])}")
+
+
+def _top_objetivos(agg: dict) -> list:
+    """Top-8 objectives by spend; 'unattributed' is always kept in the cut."""
+    obj_sorted = sorted(agg["by_obj"].items(),
+                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
+    top = obj_sorted[:8]
+    if "unattributed" in agg["by_obj"] and \
+            "unattributed" not in {n for n, _ in top} and top:
+        top = top[:-1] + [("unattributed", agg["by_obj"]["unattributed"])]
+    return top
+
+
+def _page_header(agg: dict, now: float) -> list:
+    """<head> plus page header with the generation stamp and trace window."""
     gen = dt.datetime.fromtimestamp(now, CEST).strftime("%d-%b %H:%M (UTC+2)")
-    win = ""
-    if agg["first_ts"] is not None:
-        win = (
-            f" · ventana trace {ms._fmt_ts(agg['first_ts'])} →"
-            f" {ms._fmt_ts(agg['last_ts'])}")
-    body_lines = [
-        "<!doctype html>", '<html lang="es">', "<head>",
+    win = _window_suffix(agg)
+    return [
+        "<!doctype html>",
+        '<html lang="es">', "<head>",
         '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
         "<title>La casa — observabilidad</title>",
@@ -509,35 +515,63 @@ def build_html(hermes_home=None, now=None) -> str:
         "<header><h1>La casa — observabilidad</h1>",
         '<div class="gen">generado ' + gen + win + ' · OBJ-32 v0 · solo lectura</div></header>',
     ]
-    if not has_any:
-        body_lines.append('<div class="banner">sin fuentes todavía — no se '
-                         'encontraron trace, forecast, ni kanban.db bajo el '
-                         'HERMES_HOME activo; revisa cómo lo fija el cron de '
-                         'morning-screen.</div>')
-    # sections
-    body_lines += _kpi_section(agg, board, budget, now)
-    cls_sorted = sorted(agg["by_class"].items(),
-                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
-    body_lines += _gasto_por_clase_section(cls_sorted, agg, series)
-    obj_sorted = sorted(agg["by_obj"].items(),
-                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
-    top = obj_sorted[:8]
-    if "unattributed" in agg["by_obj"] and \
-            "unattributed" not in {n for n, _ in top} and top:
-        top = top[:-1] + [("unattributed", agg["by_obj"]["unattributed"])]
-    body_lines += _objetivos_section(top, agg)
-    body_lines += _forecast_section(verdicts, fc)
-    body_lines += _board_section(board)
-    if alerts:
-        body_lines += _alerts_section(alerts)
-    body_lines += [
+
+
+def _page_footer() -> list:
+    """Read-only sources footer plus the closing tags."""
+    return [
         ' <footer>fuentes (solo lectura): quota-governor/obs/trace.jsonl · ' +
                  'quota-governor/forecast.json · quota-governor/metrics-history.jsonl · ' +
                  'kanban.db<br>regenerar: <code>python3 scripts/obs/obs-dashboard.py</code>' +
                  ' · servir en vivo: <code>--serve</code> (127.0.0.1 ' +
                  'únicamente) · OBJ-32 v0 — stdlib, cero dependencias</footer>',
         "</div>", "</body>", "</html>"]
-    return "\n".join(body_lines)
+
+
+def _gather_dashboard_data(hermes_home=None, now: float = 0.0) -> dict:
+    """Read every read-only source and compute all render inputs."""
+    rows = read_trace(hermes_home)
+    agg = agg_trace(rows)
+    fc = ms._read_json(ms.forecast_path(hermes_home))
+    board = read_board(hermes_home)
+    budget = read_metrics(hermes_home)
+    budget = budget[-1] if budget and isinstance(budget[-1], dict) else {}
+    return {
+        "rows": rows, "agg": agg,
+        "series": daily_series(rows, now=now),
+        "fc": fc, "board": board, "budget": budget,
+        "verdicts": provider_verdicts(fc),
+        "alerts": alert_cards(hermes_home),
+    }
+
+
+def _render_dashboard(d: dict, now: float) -> str:
+    """Assemble the page from gathered data (pure string work)."""
+    agg, board, fc = d["agg"], d["board"], d["fc"]
+    lines = _page_header(agg, now)
+    if not bool(d["rows"] or board["db"] or fc.get("providers")):
+        lines.append('<div class="banner">sin fuentes todavía — no se '
+                     'encontraron trace, forecast, ni kanban.db bajo el '
+                     'HERMES_HOME activo; revisa cómo lo fija el cron de '
+                     'morning-screen.</div>')
+    lines += _kpi_section(agg, board, d["budget"], now)
+    cls_sorted = sorted(agg["by_class"].items(),
+                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
+    lines += _gasto_por_clase_section(cls_sorted, agg, d["series"])
+    lines += _objetivos_section(_top_objetivos(agg), agg)
+    lines += _forecast_section(d["verdicts"], fc)
+    lines += _board_section(board)
+    if d["alerts"]:
+        lines += _alerts_section(d["alerts"])
+    lines += _page_footer()
+    return "\n".join(lines)
+
+
+def build_html(hermes_home=None, now=None) -> str:
+    """The whole page. Pure function of the read‑only sources."""
+    now = time.time() if now is None else float(now)
+    data = _gather_dashboard_data(hermes_home, now)
+    return _render_dashboard(data, now)
 
 # ---------------------------------------------------------------------------
 # Write file helper

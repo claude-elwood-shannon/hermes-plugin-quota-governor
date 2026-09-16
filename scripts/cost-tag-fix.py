@@ -247,7 +247,8 @@ def log_fix(plan: dict, log_path: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """CLI flags for the cost-tag backstop (dry-run by default)."""
     parser = argparse.ArgumentParser(
         description="Deterministic cost: tag enforcement for USD calibration (OBJ-02)."
     )
@@ -262,40 +263,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="Debug output.")
     parser.add_argument("--db", default=KANBAN_DB, help="kanban.db path override.")
     parser.add_argument("--log", default=FIX_LOG, help="JSONL fix-log path override.")
-    args = parser.parse_args(argv)
+    return parser
 
-    if not os.path.isfile(args.db):
-        if args.verbose:
-            print(f"VERBOSE: kanban.db not found at {args.db}")
-        return 0  # silent, nothing to do
 
+def _open_db(db_path: str, verbose: bool):
+    """Open the kanban DB read-write.  Returns (conn, 0) on success, or
+    (None, rc) when the caller must return rc immediately."""
+    if not os.path.isfile(db_path):
+        if verbose:
+            print(f"VERBOSE: kanban.db not found at {db_path}")
+        return None, 0  # silent, nothing to do
     try:
-        conn = sqlite3.connect(args.db)
+        return sqlite3.connect(db_path), 0
     except sqlite3.Error as exc:
-        print(f"ERROR: cannot open {args.db}: {exc}", file=sys.stderr)
-        return 1
+        print(f"ERROR: cannot open {db_path}: {exc}", file=sys.stderr)
+        return None, 1
 
-    try:
-        plans = find_fixable_tasks(conn)
-    finally:
-        pass  # keep conn for writes
 
-    if not plans:
-        if args.verbose:
-            print("VERBOSE: no tasks need cost-tag fixes")
-        conn.close()
-        return 0
+def _report_plans(plans: list) -> None:
+    """Dry-run: print what would be done for each plan."""
+    for plan in plans:
+        print(
+            f"DRY-RUN: would {plan['action']} cost:{plan['value']} "
+            f"on {plan['id']} ({plan['status']})"
+        )
 
+
+def _apply_plans(conn: sqlite3.Connection, plans: list, log_path: str) -> int:
+    """Execute mode: apply each plan and log it.  Returns the applied count."""
     applied = 0
     for plan in plans:
-        if not args.execute:
-            print(
-                f"DRY-RUN: would {plan['action']} cost:{plan['value']} "
-                f"on {plan['id']} ({plan['status']})"
-            )
-            continue
         if execute_plan(conn, plan):
-            log_fix(plan, args.log)
+            log_fix(plan, log_path)
             print(
                 f"fixed {plan['id']}: {plan['action']} → cost:{plan['value']}"
             )
@@ -306,7 +305,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "(task changed under us)",
                 file=sys.stderr,
             )
+    return applied
 
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Scan the board and inject/normalise cost: tags (dry-run unless
+    --execute).  Returns 0 on success, 1 on catastrophic DB error."""
+    args = _build_arg_parser().parse_args(argv)
+    conn, rc = _open_db(args.db, args.verbose)
+    if conn is None:
+        return rc
+
+    plans = find_fixable_tasks(conn)
+    if not plans:
+        if args.verbose:
+            print("VERBOSE: no tasks need cost-tag fixes")
+        conn.close()
+        return 0
+
+    applied = _report_plans(plans) if not args.execute \
+        else _apply_plans(conn, plans, args.log)
     conn.close()
     if args.verbose:
         print(f"VERBOSE: {len(plans)} plan(s), {applied} applied")

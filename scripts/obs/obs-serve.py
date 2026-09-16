@@ -240,7 +240,8 @@ def make_server(port: int, hermes_home=None, live: bool = False):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """CLI flags for the portal server / supervisor probe."""
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"bind 127.0.0.1:{DEFAULT_PORT} (default)")
@@ -262,46 +263,52 @@ def main(argv=None) -> int:
                          "1 when dead (the tick's respawn trigger)")
     ap.add_argument("--stop", action="store_true",
                     help="stop a running server")
-    args = ap.parse_args(argv)
+    return ap
 
-    if args.check:
-        if port_alive(args.port):
-            return 0
-        pid = read_pid()
-        print(f"obs-serve: DOWN (port {args.port}, pid={pid})",
-              file=sys.stderr)
-        return 1
-    if args.stop:
-        ok = stop_server()
-        print("obs-serve: stopped" if ok else "obs-serve: not running")
-        return 0
-    if args.headless:
-        target = pb.write_portal(out=args.out)
-        print(f"obs-serve: static portal at {target}")
-        return 0
 
-    if port_alive(args.port):  # never double-bind (idempotent respawn)
-        print(f"obs-serve: port {args.port} already serving", file=sys.stderr)
+def _run_check(port: int) -> int:
+    """--check probe: 0 when the URL is alive, 1 + diagnostic when dead."""
+    if port_alive(port):
         return 0
-    try:
-        srv = make_server(args.port, live=args.live)
-    except OSError as exc:
-        print(f"obs-serve: cannot bind {args.port}: {exc}", file=sys.stderr)
-        return 1
+    pid = read_pid()
+    print(f"obs-serve: DOWN (port {port}, pid={pid})", file=sys.stderr)
+    return 1
+
+
+def _write_pid_file() -> None:
+    """Record our PID next to the dashboard (best effort)."""
     try:
         pid_path().parent.mkdir(parents=True, exist_ok=True)
         pid_path().write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
 
+
+def _start_server(port: int, live: bool, refresh_min: float):
+    """Bind the portal server and arm the background regenerator.
+
+    Returns (server, regenerator-or-None); None when the bind was refused
+    (the double-bind guard is checked by the caller).
+    """
+    try:
+        srv = make_server(port, live=live)
+    except OSError as exc:
+        print(f"obs-serve: cannot bind {port}: {exc}", file=sys.stderr)
+        return None
+    _write_pid_file()
     reg = None
-    if not args.live:
-        reg = Regenerator(refresh_min=args.refresh)
+    if not live:
+        reg = Regenerator(refresh_min=refresh_min)
         reg.start()
+    return srv, reg
+
+
+def _serve_forever(srv, reg, refresh_min: float, live: bool) -> None:
+    """Serve until SIGTERM/KeyboardInterrupt, then clean up (PID, thread)."""
     port = srv.server_address[1]
     print(f"hiperespacio: http://localhost:{port}  (Ctrl-C para salir)")
-    _log(f"serving on 127.0.0.1:{port} (refresh={args.refresh}min, "
-         f"live={args.live})")
+    _log(f"serving on 127.0.0.1:{port} (refresh={refresh_min}min, "
+         f"live={live})")
 
     def _term(signum, frame):  # graceful: --stop / systemd-style SIGTERM
         raise SystemExit(0)
@@ -320,6 +327,33 @@ def main(argv=None) -> int:
         except OSError:
             pass
         _log("server closed")
+
+
+def main(argv=None) -> int:
+    """Portal lifecycle entry: --check / --stop / --headless probes, else
+    the resident server (idempotent: exits 0 when the port already serves)."""
+    args = _build_arg_parser().parse_args(argv)
+
+    if args.check:
+        return _run_check(args.port)
+    if args.stop:
+        ok = stop_server()
+        print("obs-serve: stopped" if ok else "obs-serve: not running")
+        return 0
+    if args.headless:
+        target = pb.write_portal(out=args.out)
+        print(f"obs-serve: static portal at {target}")
+        return 0
+
+    if port_alive(args.port):  # never double-bind (idempotent respawn)
+        print(f"obs-serve: port {args.port} already serving", file=sys.stderr)
+        return 0
+    started = _start_server(args.port, live=args.live,
+                            refresh_min=args.refresh)
+    if started is None:
+        return 1  # bind refused
+    srv, reg = started
+    _serve_forever(srv, reg, refresh_min=args.refresh, live=args.live)
     return 0
 
 
