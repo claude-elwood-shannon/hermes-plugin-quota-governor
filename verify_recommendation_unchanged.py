@@ -22,6 +22,7 @@ Exit 0 = recommendation identical (acceptance met).
 Exit 1 = any difference (prints the diff).
 """
 import contextlib
+import difflib
 import importlib.util
 import io
 import json
@@ -228,7 +229,90 @@ def capture_output(mod, kanban_db, scratch):
     return json.loads(buf.getvalue().strip())
 
 
+def _strip_additive(out):
+    """Split one gate output into (stripped copy, additive context keys).
+
+    The ONLY allowed differences between old and new output are the
+    additive keys (OBJ-18 S1 census + OBJ-21 zombie guard).  Both are
+    additive context keys; stripping them must leave the OLD
+    recommendation output byte-identical.  Stripped from BOTH sides: with
+    a pre-S1 baseline the old output carries none of them (nothing
+    removed), but with a post-S1 baseline (e.g. QUOTA_GATE_BASE_REF=6d73746,
+    the Sep-8 worker-model migration used to verify the zombie guard in
+    isolation) the old output already carries privacy_summary — stripping
+    only from new would show a spurious "key removed" hunk.
+    """
+    ctx = dict(out.get("context", {}))
+    stripped = {}
+    for additive_key in ("privacy_summary", "zombie_check"):
+        val = ctx.pop(additive_key, None)
+        if val is not None:
+            stripped[additive_key] = val
+    out2 = dict(out)
+    out2["context"] = ctx
+    return out2, stripped
+
+
+def _print_both_outputs(old_s, new_s):
+    """Print both serialised outputs, delimited."""
+    print("=" * 70)
+    print("OLD output (HEAD, keys sorted):")
+    print(old_s)
+    print("=" * 70)
+    print("NEW output (additive keys stripped):")
+    print(new_s)
+    print("=" * 70)
+
+
+def _print_stripped_fields(stripped):
+    """Print the additive keys removed before comparison."""
+    for key, val in stripped.items():
+        print(f"NEW additive field {key}:", json.dumps(val, sort_keys=True))
+
+
+def report_identical(stripped):
+    """Verdict branch when the stripped outputs are byte-identical.
+
+    Runs the sanity checks over the additive keys (privacy census and
+    zombie guard) and returns 0 or 1 accordingly.
+    """
+    print("\nVERDICT: IDENTICAL — recommendation output unchanged.")
+    # sanity: 4 active untagged tasks → all-none; the done task with
+    # privacy:high must NOT be counted (terminal status).
+    expected = {"high": 0, "medium": 0, "low": 0, "none": 4}
+    summary = stripped.get("privacy_summary")
+    if summary != expected:
+        print(f"WARNING: privacy_summary unexpected: {summary} "
+              f"(expected {expected})")
+        return 1
+    print(f"privacy_summary sanity: {summary} == expected {expected} OK")
+    # OBJ-21 sanity: the untagged board has NO running tasks →
+    # the zombie guard must report zero zombies (fail-open board).
+    zombie = stripped.get("zombie_check")
+    if zombie is None:
+        print("WARNING: zombie_check additive key missing")
+        return 1
+    if zombie.get("has_zombie") or zombie.get("count") != 0:
+        print(f"WARNING: zombie_check unexpected on quiet board: {zombie}")
+        return 1
+    print(f"zombie_check sanity: no zombies on the quiet board OK "
+          f"(threshold {zombie.get('threshold_minutes')} min)")
+    return 0
+
+
+def diff_mismatch(old_s, new_s):
+    """Verdict branch when the stripped outputs differ: print the diff."""
+    print("\nVERDICT: DIFFERENT — recommendation output CHANGED:")
+    for line in difflib.unified_diff(
+        old_s.splitlines(), new_s.splitlines(),
+        "old(HEAD)", "new(S1)", lineterm="",
+    ):
+        print(line)
+    return 1
+
+
 def main():
+    """Entry point: run both gates frozen, compare, report the verdict."""
     old_path = extract_old_gate()
     kanban_db = make_untagged_kanban_db()
 
@@ -240,26 +324,6 @@ def main():
         old_out = capture_output(old_mod, kanban_db, scratch_old)
         new_out = capture_output(new_mod, kanban_db, scratch_new)
 
-    # The ONLY allowed differences: the additive keys (OBJ-18 S1 census +
-    # OBJ-21 zombie guard).  Both are additive context keys; stripping
-    # them must leave the OLD recommendation output byte-identical.
-    # Stripped from BOTH sides: with a pre-S1 baseline the old output
-    # carries none of them (nothing removed), but with a post-S1 baseline
-    # (e.g. QUOTA_GATE_BASE_REF=6d73746, the Sep-8 worker-model migration
-    # used to verify the zombie guard in isolation) the old output already
-    # carries privacy_summary — stripping only from new would show a
-    # spurious "key removed" hunk.
-    def _strip_additive(out):
-        ctx = dict(out.get("context", {}))
-        stripped = {}
-        for additive_key in ("privacy_summary", "zombie_check"):
-            val = ctx.pop(additive_key, None)
-            if val is not None:
-                stripped[additive_key] = val
-        out2 = dict(out)
-        out2["context"] = ctx
-        return out2, stripped
-
     old_stripped, old_extra = _strip_additive(old_out)
     new_stripped, new_extra = _strip_additive(new_out)
     stripped = dict(old_extra)
@@ -268,51 +332,15 @@ def main():
     old_s = json.dumps(old_stripped, sort_keys=True, indent=2)
     new_s = json.dumps(new_stripped, sort_keys=True, indent=2)
 
-    print("=" * 70)
-    print("OLD output (HEAD, keys sorted):")
-    print(old_s)
-    print("=" * 70)
-    print("NEW output (additive keys stripped):")
-    print(new_s)
-    print("=" * 70)
-
-    for key, val in stripped.items():
-        print(f"NEW additive field {key}:", json.dumps(val, sort_keys=True))
+    _print_both_outputs(old_s, new_s)
+    _print_stripped_fields(stripped)
 
     os.unlink(kanban_db)
     os.unlink(old_path)
 
     if old_s == new_s:
-        print("\nVERDICT: IDENTICAL — recommendation output unchanged.")
-        # sanity: 4 active untagged tasks → all-none; the done task with
-        # privacy:high must NOT be counted (terminal status).
-        expected = {"high": 0, "medium": 0, "low": 0, "none": 4}
-        summary = stripped.get("privacy_summary")
-        if summary != expected:
-            print(f"WARNING: privacy_summary unexpected: {summary} "
-                  f"(expected {expected})")
-            return 1
-        print(f"privacy_summary sanity: {summary} == expected {expected} OK")
-        # OBJ-21 sanity: the untagged board has NO running tasks →
-        # the zombie guard must report zero zombies (fail-open board).
-        zombie = stripped.get("zombie_check")
-        if zombie is None:
-            print("WARNING: zombie_check additive key missing")
-            return 1
-        if zombie.get("has_zombie") or zombie.get("count") != 0:
-            print(f"WARNING: zombie_check unexpected on quiet board: {zombie}")
-            return 1
-        print(f"zombie_check sanity: no zombies on the quiet board OK "
-              f"(threshold {zombie.get('threshold_minutes')} min)")
-        return 0
-    print("\nVERDICT: DIFFERENT — recommendation output CHANGED:")
-    import difflib
-    for line in difflib.unified_diff(
-        old_s.splitlines(), new_s.splitlines(),
-        "old(HEAD)", "new(S1)", lineterm="",
-    ):
-        print(line)
-    return 1
+        return report_identical(stripped)
+    return diff_mismatch(old_s, new_s)
 
 
 if __name__ == "__main__":
