@@ -1036,8 +1036,7 @@ def _request_table(reqs: list, limit: int = 40, anchor: bool = True) -> str:
 
 # --- page_consumo helpers (each <50 lines)
 
-def _search_section(query: dict) -> str:
-    note = query.get("note", "")
+def _search_section(note: str = "") -> str:
     return ('<section class="card"><h2>Búsqueda</h2>'
             '<form class="search" method="get" action="consumo.html">'
             '<input type="text" name="q" placeholder="requestId, modelo, objetivo…" value="">'
@@ -1110,7 +1109,7 @@ def page_consumo(data: dict, query: dict = None) -> str:
     q_exact = (query or {}).get("q", "").strip()
 
     out = []
-    out.append(_search_section(query))
+    out.append(_search_section(note))
     out.append(_exact_section(next((r for r in reqs_all if (r.get("requestId") or "").lower() == q_exact.lower()), None), q_exact))
     out.append('<div class="grid">')
     out.extend(_dims_section(dims, total))
@@ -1646,7 +1645,6 @@ def gather(hermes_home=None, now=None) -> dict:
         "alert_cards": od.alert_cards(hermes_home),
         "weekly_ledger": read_weekly_ledger(hermes_home),
         "window_s": window_s,
-        "gpu": gpu,
         "gpu": gpu,
     }
 
