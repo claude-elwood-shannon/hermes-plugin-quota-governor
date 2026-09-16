@@ -1127,9 +1127,8 @@ def page_consumo(data: dict, query: dict = None) -> str:
 
 # --- board ------------------------------------------------------------------
 
-def page_board(data: dict, query: dict = None) -> str:
-    board = data["board"]
-    series = data["series"]
+def _board_kpis(board: dict) -> list:
+    """KPI strip: total tasks, done-24h ids, 30d crash count."""
     out = ['<section class="kpis">']
     chips = "".join(f'<span class="chip">{_esc(k)}={v}</span>'
                     for k, v in sorted(board["counts"].items()))
@@ -1142,19 +1141,22 @@ def page_board(data: dict, query: dict = None) -> str:
     out.append(_kpi("Crashes 30d", str(crashed30),
                     "task_events crashed" if crashed30 else "sin crashes"))
     out.append("</section>")
+    return out
 
-    out.append('<section class="card"><h2>Creadas / cerradas / crashes — '
-               "30 días</h2>" + bars_chart(board["daily"]) + "</section>")
 
-    out.append('<div class="grid">')
+def _board_done24(board: dict) -> list:
+    """Card listing tasks closed in the last 24h."""
     done_li = "".join(
         f'<li><span class="mut">{_esc(_fmt_ts(r.get("completed_at")))}</span> '
         f'<b>{_esc(r["id"])}</b> {_esc((r.get("title") or "")[:56])}</li>'
         for r in board["done24"][:12])
-    out.append('<section class="card"><h2>Cerradas en 24h</h2>'
-               + (f'<ul class="list">{done_li}</ul>' if done_li else
-                  empty_state("nada cerrado en 24h")) + "</section>")
+    return ['<section class="card"><h2>Cerradas en 24h</h2>'
+            + (f'<ul class="list">{done_li}</ul>' if done_li else
+               empty_state("nada cerrado en 24h")) + "</section>"]
 
+
+def _board_active(board: dict) -> list:
+    """Card listing active tasks, each linked to its kanban log block."""
     act_li = []
     for r in board["active"]:
         nid = _esc(r["id"])
@@ -1166,15 +1168,17 @@ def page_board(data: dict, query: dict = None) -> str:
             f'{st} <span class="mut">'
             f'{_esc(r.get("assignee") or "")}</span> '
             f'{title}</li>')
-    out.append('<section class="card"><h2>Tareas activas (link a su '
-               "kanban log)</h2>"
-               + (f'<ul class="list">{"".join(act_li)}</ul>' if act_li else
-                  empty_state("cola vacía — la casa descansa")) + "</section>")
-    out.append("</div>")
+    return ['<section class="card"><h2>Tareas activas (link a su '
+            "kanban log)</h2>"
+            + (f'<ul class="list">{"".join(act_li)}</ul>' if act_li else
+               empty_state("cola vacía — la casa descansa")) + "</section>"]
 
+
+def _board_supply(series: dict) -> list:
+    """Card with the supply_ratio line chart and its summary line."""
+    out = ['<section class="card"><h2>supply_ratio — histórico '
+           "(OBJ-29)</h2>"]
     sup = series["supply"]
-    out.append('<section class="card"><h2>supply_ratio — histórico '
-               "(OBJ-29)</h2>")
     if sup:
         vals = [v for _, v in sup]
         last_v = vals[-1]
@@ -1187,9 +1191,13 @@ def page_board(data: dict, query: dict = None) -> str:
     else:
         out.append(empty_state("sin muestras de supply_ratio todavía"))
     out.append("</section>")
+    return out
 
-    out.append('<section class="card"><h2>Kanban log — eventos recientes '
-               "por tarea activa</h2>")
+
+def _board_events(board: dict) -> list:
+    """Card with recent kanban event logs for up to 14 active tasks."""
+    out = ['<section class="card"><h2>Kanban log — eventos recientes '
+           "por tarea activa</h2>"]
     evs = board.get("events") or {}
     if not board["active"]:
         out.append(empty_state("sin tareas activas"))
@@ -1208,6 +1216,25 @@ def page_board(data: dict, query: dict = None) -> str:
                        f'{_esc((r.get("title") or "")[:60])}</h3>'
                        f'<ul class="list">{log_li}</ul></div>')
     out.append("</section>")
+    return out
+
+
+def page_board(data: dict, query: dict = None) -> str:
+    """Render the kanban board page: KPIs, charts and active-task cards."""
+    board = data["board"]
+    series = data["series"]
+    out = _board_kpis(board)
+
+    out.append('<section class="card"><h2>Creadas / cerradas / crashes — '
+               "30 días</h2>" + bars_chart(board["daily"]) + "</section>")
+
+    out.append('<div class="grid">')
+    out.extend(_board_done24(board))
+    out.extend(_board_active(board))
+    out.append("</div>")
+
+    out.extend(_board_supply(series))
+    out.extend(_board_events(board))
     return "\n".join(out)
 
 
