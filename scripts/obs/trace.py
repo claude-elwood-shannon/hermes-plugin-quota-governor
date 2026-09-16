@@ -396,6 +396,47 @@ def collect_usage_audit(hermes_home=None) -> list:
 # Collector 3: kanban task_events (claimed/completed) — the objective JOIN
 # ---------------------------------------------------------------------------
 
+def _task_event_dbs(hermes_home=None, kanban_db=None) -> list:
+    """Kanban DBs to scan: the explicit one, or one per source home."""
+    if kanban_db:
+        return [Path(kanban_db)]
+    return [home / "kanban.db" for home in _source_homes(hermes_home)]
+
+
+def _task_event_trace_row(tid, kind, created_at, objective) -> dict:
+    """Canonical task-events trace row (board events carry no tokens)."""
+    return {
+        "ts_epoch_utc": _opt_float(created_at),
+        "consumer_class": "worker",
+        "consumer_id": tid,
+        "cause": kind,
+        "model": None,
+        "provider": None,
+        "tokens_in": None,
+        "tokens_out": None,
+        "costUsd": None,
+        "requestId": None,
+        "objective": objective,
+        "source": "task-events",
+        "otel": {},
+    }
+
+
+def _task_event_row(con, ev, bodies: dict, seen: set) -> dict | None:
+    """First trace row for a new (task_id, kind, ts) event; None on dupe."""
+    key = (ev["task_id"], ev["kind"], ev["created_at"])
+    if key in seen:
+        return None
+    seen.add(key)
+    tid = ev["task_id"]
+    if tid not in bodies:
+        row = con.execute(
+            "SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()
+        bodies[tid] = row["body"] if row else None
+    return _task_event_trace_row(tid, ev["kind"], ev["created_at"],
+                                 parse_objective(bodies[tid]))
+
+
 def collect_task_events(hermes_home=None, kanban_db=None) -> list:
     """Emit trace lines from kanban task_events (claimed/completed).
 
@@ -404,12 +445,9 @@ def collect_task_events(hermes_home=None, kanban_db=None) -> list:
     the OBJ-28 rollup consumes. No tokens/costUsd (board events carry none).
     Scans every source home for a kanban.db; dedupes by (task_id, kind, ts).
     """
-    dbs = [Path(kanban_db)] if kanban_db else [
-        home / "kanban.db" for home in _source_homes(hermes_home)
-    ]
     rows = []
     seen = set()
-    for db in dbs:
+    for db in _task_event_dbs(hermes_home, kanban_db):
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             con.row_factory = sqlite3.Row
@@ -419,31 +457,9 @@ def collect_task_events(hermes_home=None, kanban_db=None) -> list:
                     "WHERE kind IN ('claimed','completed')").fetchall()
                 bodies = {}
                 for ev in events:
-                    key = (ev["task_id"], ev["kind"], ev["created_at"])
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    tid = ev["task_id"]
-                    if tid not in bodies:
-                        row = con.execute(
-                            "SELECT body FROM tasks WHERE id=?",
-                            (tid,)).fetchone()
-                        bodies[tid] = row["body"] if row else None
-                    rows.append({
-                        "ts_epoch_utc": _opt_float(ev["created_at"]),
-                        "consumer_class": "worker",
-                        "consumer_id": tid,
-                        "cause": ev["kind"],
-                        "model": None,
-                        "provider": None,
-                        "tokens_in": None,
-                        "tokens_out": None,
-                        "costUsd": None,
-                        "requestId": None,
-                        "objective": parse_objective(bodies[tid]),
-                        "source": "task-events",
-                        "otel": {},
-                    })
+                    row = _task_event_row(con, ev, bodies, seen)
+                    if row is not None:
+                        rows.append(row)
             finally:
                 con.close()
         except (sqlite3.Error, OSError):
@@ -599,6 +615,80 @@ def _gc_archives(adir: Path, keep_n: int, errors: list) -> int:
     return dropped
 
 
+def _retention_bounds(policy: dict, keep_days, max_lines,
+                      keep_archives) -> tuple:
+    """Explicit args win; policy (env over defaults) fills the rest."""
+    kd = policy["keep_days"] if keep_days is None else float(keep_days)
+    ml = policy["max_lines"] if max_lines is None else int(max_lines)
+    ka = (policy["keep_archives"] if keep_archives is None
+          else int(keep_archives))
+    return kd, ml, ka
+
+
+def _archive_evicted(archive_home, evict: list, now: float):
+    """Write-ahead: append evicted rows to a stamped gzip archive.
+
+    Returns the archive path, or None when there is nothing to evict.
+    The archive is written FIRST; the active file is only touched after.
+    """
+    if not evict:
+        return None
+    adir = archive_dir(archive_home)
+    adir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    apath = adir / f"trace-{stamp}.jsonl.gz"
+    with gzip.open(apath, "at", encoding="utf-8") as fh:
+        for r in evict:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return apath
+
+
+def _rewrite_active(path: Path, keep: list, bad_lines: list) -> None:
+    """Atomically replace the active file: kept rows + corrupt lines."""
+    tmp = path.with_name(path.name + ".tmp-rotate")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for r in keep:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for line in bad_lines:
+            fh.write(line + "\n")
+    os.replace(tmp, path)
+
+
+def _settle_rotation(report: dict, rows: list, bad_lines: list,
+                     hermes_home, kd: float, ml: int, ka: int, now: float,
+                     dry_run: bool) -> None:
+    """Plan keep/evict and apply it in place on the report dict.
+
+    No-op when nothing is evicted (still GCs expired archives); a dry run
+    reports the plan without writing; otherwise write-ahead archive, then
+    atomic rewrite of the active file, then archive GC.
+    """
+    keep, evict = _plan_eviction(rows, kd, ml, now)
+    report["cutoff_epoch"] = now - kd * 86400.0
+    report["kept"] = len(keep)
+    report["archived"] = len(evict)
+    if not evict and len(keep) == len(rows):
+        report["reason"] = "none"
+        # still GC expired archive files even when nothing rotated
+        report["dropped_archives"] = _gc_archives(
+            archive_dir(hermes_home), ka, report["errors"])
+        return
+    report["reason"] = "window" if evict and any(
+        (r.get("ts_epoch_utc") is not None
+         and r.get("ts_epoch_utc") < report["cutoff_epoch"])
+        for r in evict) else "lines"
+    if dry_run:
+        return
+    apath = _archive_evicted(hermes_home, evict, now)
+    if apath is not None:
+        report["archive_path"] = str(apath)
+    _rewrite_active(trace_path(hermes_home), keep, bad_lines)
+    report["rotated"] = True
+    # archive GC: keep only the newest ka archive files
+    report["dropped_archives"] = _gc_archives(
+        archive_dir(hermes_home), ka, report["errors"])
+
+
 def enforce_retention(hermes_home=None, keep_days=None, max_lines=None,
                       keep_archives=None, dry_run=False,
                       now=None) -> dict:
@@ -623,10 +713,8 @@ def enforce_retention(hermes_home=None, keep_days=None, max_lines=None,
     }
     try:
         policy = retention_policy(hermes_home)
-        kd = policy["keep_days"] if keep_days is None else float(keep_days)
-        ml = policy["max_lines"] if max_lines is None else int(max_lines)
-        ka = (policy["keep_archives"] if keep_archives is None
-              else int(keep_archives))
+        kd, ml, ka = _retention_bounds(policy, keep_days, max_lines,
+                                       keep_archives)
         report["policy"] = {"keep_days": kd, "max_lines": ml,
                             "keep_archives": ka}
         now = time.time() if now is None else float(now)
@@ -636,69 +724,19 @@ def enforce_retention(hermes_home=None, keep_days=None, max_lines=None,
         rows, bad_lines = _read_trace_lines(path)
         if not rows and not bad_lines:
             return report
-
-        keep, evict = _plan_eviction(rows, kd, ml, now)
-        report["cutoff_epoch"] = now - kd * 86400.0
-        report["kept"] = len(keep)
-        report["archived"] = len(evict)
-        if not evict and len(keep) == len(rows):
-            report["reason"] = "none"
-            # still GC expired archive files even when nothing rotated
-            report["dropped_archives"] = _gc_archives(
-                archive_dir(hermes_home), ka, report["errors"])
-            return report
-        report["reason"] = "window" if evict and any(
-            (r.get("ts_epoch_utc") is not None
-             and r.get("ts_epoch_utc") < report["cutoff_epoch"])
-            for r in evict) else "lines"
-        if dry_run:
-            return report
-
-        if evict:
-            adir = archive_dir(hermes_home)
-            adir.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-            apath = adir / f"trace-{stamp}.jsonl.gz"
-            # write-ahead: archive FIRST, only then touch the active file
-            with gzip.open(apath, "at", encoding="utf-8") as fh:
-                for r in evict:
-                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-            report["archive_path"] = str(apath)
-
-        # atomic replace of the active file: recent rows + preserved
-        # corrupt lines (they are never silently dropped)
-        tmp = path.with_name(path.name + ".tmp-rotate")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            for r in keep:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-            for line in bad_lines:
-                fh.write(line + "\n")
-        os.replace(tmp, path)
-        report["rotated"] = True
-
-        # archive GC: keep only the newest ka archive files
-        report["dropped_archives"] = _gc_archives(
-            archive_dir(hermes_home), ka, report["errors"])
+        _settle_rotation(report, rows, bad_lines, hermes_home, kd, ml,
+                         ka, now, dry_run)
     except Exception as exc:  # fail open, like every public helper here
         report["ok"] = False
         report["errors"].append(repr(exc))
     return report
 
 
-def doctor(hermes_home=None) -> dict:
-    """obs-doctor: writable paths + JSONL parseable + count by class.
-
-    F3 extension: reports the trace's size and age (bytes, oldest/newest
-    epoch, age_days), the effective retention policy, the archive files,
-    and needs_rotation=True when policy bounds are already exceeded.
-    Returns a dict with 'ok' (bool), 'path', 'writable', 'parseable',
-    'lines', 'by_class' (consumer_class -> count) plus the F3 keys.
-    Never raises.
-    """
-    path = trace_path(hermes_home)
-    result = {
+def _doctor_base_result(hermes_home) -> dict:
+    """Doctor report skeleton with every key it can ever carry."""
+    return {
         "ok": True,
-        "path": str(path),
+        "path": str(trace_path(hermes_home)),
         "writable": False,
         "parseable": True,
         "lines": 0,
@@ -712,6 +750,10 @@ def doctor(hermes_home=None) -> dict:
         "archives": {"count": 0, "bytes": 0},
         "needs_rotation": False,
     }
+
+
+def _doctor_writable(path: Path, result: dict) -> bool:
+    """Probe writability (mkdir + append handle). False when OSError."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8"):
@@ -719,14 +761,16 @@ def doctor(hermes_home=None) -> dict:
     except OSError:
         result["ok"] = False
         result["writable"] = False
-        return result
+        return False
+    return True
 
-    if path.exists():
-        try:
-            result["trace_bytes"] = path.stat().st_size
-        except OSError:
-            result["trace_bytes"] = 0
 
+def _doctor_scan_trace(path: Path, result: dict):
+    """Fill lines/by_class/oldest/newest/parseable from the trace file.
+
+    Returns the oldest epoch, or False when the scan aborted (OSError or
+    a corrupt line — both already recorded in the result).
+    """
     by_class = {}
     n = 0
     oldest = newest = None
@@ -741,7 +785,7 @@ def doctor(hermes_home=None) -> dict:
                 except ValueError:
                     result["parseable"] = False
                     result["ok"] = False
-                    break
+                    return False
                 n += 1
                 cls = row.get("consumer_class", "unattributed")
                 by_class[cls] = by_class.get(cls, 0) + 1
@@ -752,14 +796,16 @@ def doctor(hermes_home=None) -> dict:
                     newest = ts if newest is None else max(newest, ts)
     except OSError:
         result["ok"] = False
-        return result
+        return False
     result["lines"] = n
     result["by_class"] = by_class
     result["oldest_epoch"] = oldest
     result["newest_epoch"] = newest
-    if oldest is not None:
-        result["age_days"] = (time.time() - oldest) / 86400.0
+    return oldest
 
+
+def _doctor_archives(result: dict, hermes_home) -> None:
+    """Count and size the archive files (0s when the dir is missing)."""
     try:
         files = sorted(archive_dir(hermes_home).glob("trace-*.jsonl.gz"))
         result["archives"] = {
@@ -769,12 +815,42 @@ def doctor(hermes_home=None) -> dict:
     except OSError:
         pass
 
-    # needs_rotation: policy bounds already exceeded (window or cap).
+
+def _doctor_needs_rotation(result: dict, oldest, n: int) -> None:
+    """Flag when policy bounds are already exceeded (window or cap)."""
     pol = result["retention"]
     if oldest is not None and n > 0:
         cutoff = time.time() - pol["keep_days"] * 86400.0
         if oldest < cutoff or n > pol["max_lines"]:
             result["needs_rotation"] = True
+
+
+def doctor(hermes_home=None) -> dict:
+    """obs-doctor: writable paths + JSONL parseable + count by class.
+
+    F3 extension: reports the trace's size and age (bytes, oldest/newest
+    epoch, age_days), the effective retention policy, the archive files,
+    and needs_rotation=True when policy bounds are already exceeded.
+    Returns a dict with 'ok' (bool), 'path', 'writable', 'parseable',
+    'lines', 'by_class' (consumer_class -> count) plus the F3 keys.
+    Never raises.
+    """
+    path = trace_path(hermes_home)
+    result = _doctor_base_result(hermes_home)
+    if not _doctor_writable(path, result):
+        return result
+    if path.exists():
+        try:
+            result["trace_bytes"] = path.stat().st_size
+        except OSError:
+            result["trace_bytes"] = 0
+    oldest = _doctor_scan_trace(path, result)
+    if oldest is False:
+        return result
+    if oldest is not None:
+        result["age_days"] = (time.time() - oldest) / 86400.0
+    _doctor_archives(result, hermes_home)
+    _doctor_needs_rotation(result, oldest, result["lines"])
     return result
 
 
