@@ -43,7 +43,7 @@ CURSOR (own, byte-offset, idempotent)
 -------------------------------------
 The exporter keeps its OWN cursor (obs/otlp-cursor.json) as a byte offset
 into the append-only trace. On each run it exports only the lines after
-the offset and, on success, advances the offset to the current file size.
+the offset and, on success, advances the cursor to the current file size.
 A byte offset is exact for an append-only file (handles equal timestamps
 correctly). If the F3 rotation shrinks the active file below the stored
 offset, the cursor resets to 0 and the current file is re-exported — safe,
@@ -60,7 +60,7 @@ Some OTLP endpoints are traces-only: they answer `404` for `/v1/metrics`.
 That is NOT a failure — it means "no metrics backend here". The exporter
 skips the metrics leg immediately (a 404 is deterministic; no retries)
 and advances its cursor when `/v1/traces` succeeded, reporting
-`"metrics": "skipped-404"`. Full backends (OpenTelemetry Collector,
+"metrics": "skipped-404". Full backends (OpenTelemetry Collector,
 SigNoz, Grafana) keep the strict both-endpoints semantics.
 
 FAIL-OPEN: every public helper never raises into a caller; a network
@@ -99,9 +99,13 @@ HOUSE_ATTRS = {
 _ENV_ENDPOINT = "OBS_OTLP_ENDPOINT"
 _ENV_AUTH = "OBS_OTLP_AUTH"          # inline "user:pass" (Basic auth)
 _ENV_AUTH_FILE = "OBS_OTLP_AUTH_FILE"  # chmod-600 file: "user:pass" or
-                                       # KEY=VALUE lines (KEY Zo_ROOT_USER_*)
+                                        # KEY=VALUE lines (KEY Zo_ROOT_USER_*)
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_BASE_DELAY = 0.5  # seconds; backoff = base * 2**attempt
+
+# ---------------------------------------------------------------------------
+# Resolve authentication credentials
+# ---------------------------------------------------------------------------
 
 
 def resolve_auth() -> str | None:
@@ -141,26 +145,36 @@ def resolve_auth() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Paths to trace and cursor
+# ---------------------------------------------------------------------------
+
+
 def get_hermes_home() -> Path:
     """Active HERMES_HOME, else ~/.hermes. Never absolute in the repo."""
     val = os.environ.get("HERMES_HOME", "").strip()
     return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
 
-def obs_dir(hermes_home=None) -> Path:
+def obs_dir(hermes_home: Path | None = None) -> Path:
     base = Path(hermes_home) if hermes_home else get_hermes_home()
     return base / "quota-governor" / "obs"
 
 
-def trace_path(hermes_home=None) -> Path:
+def trace_path(hermes_home: Path | None = None) -> Path:
     return obs_dir(hermes_home) / "trace.jsonl"
 
 
-def cursor_path(hermes_home=None) -> Path:
+def cursor_path(hermes_home: Path | None = None) -> Path:
     return obs_dir(hermes_home) / "otlp-cursor.json"
 
 
-def _load_cursor(hermes_home=None) -> dict:
+# ---------------------------------------------------------------------------
+# Cursor helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_cursor(hermes_home: Path | None = None) -> dict:
     try:
         with open(cursor_path(hermes_home), encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -169,7 +183,7 @@ def _load_cursor(hermes_home=None) -> dict:
         return {}
 
 
-def _save_cursor(cursor: dict, hermes_home=None) -> None:
+def _save_cursor(cursor: dict, hermes_home: Path | None = None) -> None:
     try:
         path = cursor_path(hermes_home)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +196,7 @@ def _save_cursor(cursor: dict, hermes_home=None) -> None:
 # ---------------------------------------------------------------------------
 # OTLP payload builders (pure, testable without network)
 # ---------------------------------------------------------------------------
+
 
 def _attr(key: str, value):
     """OTLP AnyValue for span/dataPoint attributes: bool / int / double /
@@ -245,7 +260,7 @@ def _span(row: dict) -> dict:
     cid = str(row.get("consumer_id") or "")
     ts = row.get("ts_epoch_utc")
     name = "{}.{}".format(row.get("consumer_class") or "unknown",
-                          row.get("cause") or "event")
+                            row.get("cause") or "event")
     ts_ns = _ts_ns(row)
     return {
         "traceId": _hex(cid, 16),
@@ -322,10 +337,10 @@ def build_payload(rows: list) -> dict:
         }],
     }
 
-
 # ---------------------------------------------------------------------------
 # Transport (batch + retries with backoff; never raises)
 # ---------------------------------------------------------------------------
+
 
 def _post(url: str, payload: dict, auth: str | None = None) -> int:
     body = json.dumps(payload).encode("utf-8")
@@ -401,21 +416,86 @@ def _post_payload(payload: dict, endpoint: str, auth: str | None = None,
         out["metrics"] = "skipped-404"
     return out
 
+# ---------------------------------------------------------------------------
+# Helper functions for orchestrator (each < 50 lines)
+# ---------------------------------------------------------------------------
+
+def _compute_offset(size: int, cursor_offset: int, export_once: bool) -> int:
+    """Return effective read offset.
+    If export_once, always return 0. If the stored offset is beyond EOF, reset
+    to 0. The function keeps the core arithmetic isolated and trivial.
+    """
+    effective = 0 if export_once else cursor_offset
+    return 0 if effective > size else effective
+
+def _read_trace(path: Path, offset: int) -> tuple[list[dict], int] | None:
+    """Read trace lines from *path* after *offset*.
+    Returns a list of parsed JSON rows and the file size, or None when the
+    file is unreadable (OSError) so the caller can report a hard failure.
+    Handles binary undecodable data with ``replace``; skips lines that
+    cannot parse.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return None  # unreadable trace (distinct from an empty read)
+    rows: list[dict] = []
+    for l in data.decode("utf-8", "replace").splitlines():
+        if not l.strip():
+            continue
+        try:
+            rows.append(json.loads(l))
+        except ValueError:
+            continue
+    return rows, size
+
+def _handle_success(ok: bool, rows: list[dict], size: int,
+                    hermes_home: Path | None) -> None:
+    """Persist the cursor only when the export succeeded (ok=True).
+    ``rows`` allows a quick guard against empty payloads. On failure the
+    cursor stays untouched so the next run re-exports the same lines.
+    """
+    if ok and rows:
+        _save_cursor({"offset": size}, hermes_home)
+
+def _build_response(
+    ok: bool,
+    exported: int,
+    offset: int,
+    endpoint: str,
+    auth_present: bool,
+    export_once: bool,
+    legs: dict,
+    size: int,
+) -> dict:
+    """Construct the public API response dictionary.
+    ``size`` is the trace size at send time; used for the ``offset`` key.
+    """
+    rep = {
+        "ok": ok,
+        "noop": False,
+        "exported": exported,
+        "offset": size if ok else offset,
+        "endpoint": endpoint,
+        "auth": auth_present,
+        "export_once": export_once,
+        "legs": legs,
+    }
+    if legs.get("metrics") == "skipped-404":
+        rep["metrics"] = "skipped-404 (tracing-only backend: /v1/metrics 404)"
+    return rep
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
 def run_export(hermes_home=None, endpoint=None, export_once=False,
-               max_retries=None, base_delay=None) -> dict:
+                max_retries=None, base_delay=None) -> dict:
     """Export new trace lines to the OTLP endpoint. Never raises.
-
-    - endpoint: OBS_OTLP_ENDPOINT env, or the --endpoint override. Unset
-      -> silent no-op (the golden rule: nothing runs by default).
-    - export_once: ignore the cursor and backfill the full current history
-      (idempotent via stable span IDs), then advance the cursor to the end.
-    - The trace is only READ; the exporter writes only its own cursor.
-      A network failure returns ok=False and leaves trace + cursor intact.
+    The heavy lifting is delegated to small helpers.
     """
     endpoint = (endpoint or os.environ.get(_ENV_ENDPOINT, "")).strip()
     if not endpoint:
@@ -426,67 +506,42 @@ def run_export(hermes_home=None, endpoint=None, export_once=False,
     if not path.exists():
         return {"ok": True, "noop": True, "reason": "no trace yet"}
 
+    cursor = _load_cursor(hermes_home)
+    stored = int(cursor.get("offset", 0))
     try:
         size = path.stat().st_size
     except OSError:
         return {"ok": False, "noop": True, "reason": "trace unreadable"}
-
-    cursor = _load_cursor(hermes_home)
-    offset = 0 if export_once else int(cursor.get("offset", 0))
-    if offset > size:
-        # F3 rotation shrank the active file below the stored offset:
-        # reset and re-export the current file (OTLP is output, JSONL is truth).
-        offset = 0
-
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(offset)
-            data = fh.read()
-    except OSError:
+    offset = _compute_offset(size=size, cursor_offset=stored,
+                             export_once=export_once)
+    read = _read_trace(path, offset)
+    if read is None:
         return {"ok": False, "noop": True, "reason": "trace unreadable"}
-
-    lines = [l for l in data.decode("utf-8", "replace").splitlines() if l.strip()]
-    if not lines:
-        return {"ok": True, "noop": True, "reason": "nothing new",
-                "offset": offset}
-
-    rows = []
-    for l in lines:
-        try:
-            rows.append(json.loads(l))
-        except ValueError:
-            continue
+    rows, size = read
     if not rows:
-        return {"ok": True, "noop": True, "reason": "no parseable rows",
+        return {"ok": True, "noop": True, "reason": "nothing new",
                 "offset": offset}
 
     payload = build_payload(rows)
     auth = resolve_auth()
-    legs = _post_payload(payload, endpoint, auth=auth,
-                         max_retries=max_retries if max_retries is not None
-                         else _DEFAULT_MAX_RETRIES,
-                         base_delay=base_delay if base_delay is not None
-                         else _DEFAULT_BASE_DELAY)
-    # ok = traces leg succeeded AND the metrics leg is either delivered or
-    # explicitly absent (tracing-only backend, metrics 404 -> "skipped-404").
+    legs = _post_payload(
+        payload, endpoint, auth=auth,
+        max_retries=max_retries if max_retries is not None else _DEFAULT_MAX_RETRIES,
+        base_delay=base_delay if base_delay is not None else _DEFAULT_BASE_DELAY,
+    )
     metrics_ok = legs.get("metrics") is not False
     ok = bool(legs.get("traces")) and metrics_ok
-    if ok:
-        _save_cursor({"offset": size}, hermes_home)
-    rep = {
-        "ok": ok,
-        "noop": False,
-        "exported": len(rows),
-        "offset": size if ok else offset,
-        "endpoint": endpoint,
-        "auth": bool(auth),
-        "export_once": bool(export_once),
-        "legs": legs,
-    }
-    if legs.get("metrics") == "skipped-404":
-        rep["metrics"] = "skipped-404 (tracing-only backend: /v1/metrics 404)"
-    return rep
-
+    _handle_success(ok, rows, size, hermes_home)
+    return _build_response(
+        ok=ok,
+        exported=len(rows),
+        offset=offset,
+        endpoint=endpoint,
+        auth_present=bool(auth),
+        export_once=export_once,
+        legs=legs,
+        size=size,
+    )
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -508,7 +563,6 @@ def main(argv=None) -> int:
     rep = run_export(endpoint=args.endpoint, export_once=args.export_once)
     print(json.dumps(rep, ensure_ascii=False, indent=1))
     return 0 if rep.get("ok") else 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
