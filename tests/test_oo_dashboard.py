@@ -1,57 +1,59 @@
-import importlib.machinery
 import json
-import sys
 from pathlib import Path
+import importlib.util
 
-# Load generate_dashboard module via importlib spec
-loader = importlib.machinery.SourceFileLoader(
-    "generate_dashboard",
-    str(Path("scripts/obs/oo-dashboard/generate_dashboard.py").resolve()),
-)
-module = loader.load_module()
+# Resolve dashboard module
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "scripts" / "obs" / "oo-dashboard" / "generate_dashboard.py"
 
-build = module.build
+spec = importlib.util.spec_from_file_location("generate_dashboard", MODULE_PATH)
+mod = importlib.util.module_from_spec(spec)
+# Dynamically import the dashboard module in a robust way
+try:
+    spec = importlib.util.spec_from_file_location("generate_dashboard", MODULE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to create spec for generate_dashboard")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    build = mod.build
+except Exception as e:
+    raise RuntimeError(f"Failed to load generate_dashboard module: {e}")
 
 
-def test_roundtrip_serialization():
-    data = build("test-id")
-    dumped = json.dumps(data)
+def test_build_valid_json_serializable():
+    dashboard = build()
+    # Round-trip JSON
+    dumped = json.dumps(dashboard, indent=1)
     loaded = json.loads(dumped)
-    assert loaded == data
+    assert dashboard == loaded, "JSON round-trip mismatch"
 
 
 def test_unique_panel_ids():
-    data = build()
-    panels = data["tabs"][0]["panels"]
-    ids = [p["id"] for p in panels]
-    assert len(ids) == len(set(ids)), "panel ids must be unique"
+    dashboard = build()
+    panel_ids = {panel["id"] for panel in dashboard["tabs"][0]["panels"]}
+    assert len(panel_ids) == len(dashboard["tabs"][0]["panels"]), "Duplicate panel ids found"
 
 
-def test_grid_bounds():
-    data = build()
-    panels = data["tabs"][0]["panels"]
-    for p in panels:
-        layout = p["layout"]
-        x, y, w, h = layout["x"], layout["y"], layout["w"], layout["h"]
-        assert x + w <= 24, f"panel {p['id']} exceeds column width"
-        assert y + h <= 50, f"panel {p['id']} exceeds vertical limit"
-
-
-def test_no_overlapping_panels():
-    data = build()
-    panels = data["tabs"][0]["panels"]
-    def overlaps(a, b):
+def test_grid_limits_and_no_overlap():
+    dashboard = build()
+    panels = dashboard["tabs"][0]["panels"]
+    max_xw = max(p["layout"]["x"] + p["layout"]["w"] for p in panels)
+    max_yh = max(p["layout"]["y"] + p["layout"]["h"] for p in panels)
+    assert max_xw <= 24, f"Grid width exceeds 24 columns: {max_xw}"
+    # simple overlap check: for every pair ensure not overlapping
+    for i, a in enumerate(panels):
         ax, ay, aw, ah = a["layout"]["x"], a["layout"]["y"], a["layout"]["w"], a["layout"]["h"]
-        bx, by, bw, bh = b["layout"]["x"], b["layout"]["y"], b["layout"]["w"], b["layout"]["h"]
-        return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
-    for i, p1 in enumerate(panels):
-        for p2 in panels[i+1:]:
-            assert not overlaps(p1, p2), f"panels {p1['id']} and {p2['id']} overlap"
+        for b in panels[i+1:]:
+            bx, by, bw, bh = b["layout"]["x"], b["layout"]["y"], b["layout"]["w"], b["layout"]["h"]
+            overlap_x = (ax < bx + bw) and (bx < ax + aw)
+            overlap_y = (ay < by + bh) and (by < ay + ah)
+            assert not (overlap_x and overlap_y), f"Panels {a['id']} and {b['id']} overlap"
+    assert max_yh <= 36, f"Grid height exceeds reasonable limit: {max_yh}"
 
 
-def test_query_stream_references():
-    data = build()
-    panels = data["tabs"][0]["panels"]
+def test_build_includes_expected_streams():
+    dashboard = build()
+    panels = dashboard["tabs"][0]["panels"]
     expected_streams = {
         "hermes_tasks_done",
         "hermes_tasks_running",
@@ -70,16 +72,13 @@ def test_query_stream_references():
         "hermes_vllm",
         "hermes_efficiency",
     }
-    for p in panels:
-        sql = p["queries"][0]["query"]
-        assert any(s in sql for s in expected_streams), f"panel {p['id']} query lacks expected streams"
+    for panel in panels:
+        q = panel["queries"][0]["query"]
+        found = any(stream in q for stream in expected_streams)
+        assert found, f"Panel {panel['id']} query missing expected stream"
 
 
-def test_does_propagate_dashboard_id():
-    id_ = "abc123"
-    data = build(id_)
-    assert data["dashboardId"] == id_, "dashboardId not propagated"
-
-if __name__ == "__main__":
-    import pytest
-    pytest.main([__file__])
+def test_id_propagation():
+    id_val = "TESTID123"
+    dashboard = build(dashboard_id=id_val)
+    assert dashboard["dashboardId"] == id_val, "Passed dashboard_id not set"
