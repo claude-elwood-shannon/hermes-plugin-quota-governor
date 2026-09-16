@@ -107,3 +107,36 @@ find ~/.hermes/profiles/pr-ollama/scripts -name '*.sh' -exec bash -n {} \;
 ```
 
 `0 FAIL` lines is the pass condition; failures are recorded, not auto-fixed.
+
+## Run-summary evidence block (EVIDENCE:)
+
+- Every worker run‑summary must end with a literal line `EVIDENCE:` followed by the verbatim stdout of all verification commands listed in the card’s `success:` criterion (e.g. `pytest -q`, AST scan results, `git log -1 --format=%H`, etc.). This literal block shall be indented as a fenced code block for parsing.
+
+- Rationale: `scripts/obs/efficiency-ratio.py` requires ≥50 % token coverage of the criterion text plus a `COMPLETION_RE` keyword. Summaries that merely describe outcomes fall short (audit average 0.21). The evidence block guarantees that the verifier has the concrete data to compute the required coverage.
+
+- Good example (code block):
+
+````
+EVIDENCE:
+````
+*`pytest -q` output:*
+````
+3 passed in 0.12s
+````
+*`git log -1 --format=%H`*:
+````
+ a1b2c3d4e5f6g7h8i9j0
+````
+*`ast-scan --threshold 50` output:*
+````
+funcs>50: []
+````
+
+- Bad example (prose):
+
+````
+All tests passed, refactored into helpers. The AST scan returned no functions over 50 lines.
+````
+
+- Cross‑reference: See the audit for this recommendation: `docs/audit-2026-09-16-verificacion-gaps.md`
+
