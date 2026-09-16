@@ -194,6 +194,56 @@ def _append_ledger(ledger: Path, entry: dict) -> None:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _execute_consumption(consumible: dict, qpath: Path, ledger_path: Path, creator) -> str:
+    """Internal helper that performs a consuming transaction.
+
+    Parameters
+    ----------
+    consumible: dict
+        The seed dict returned from :func:`parsear_semillas`.
+    qpath: Path
+        Path to the queue file being mutated.
+    ledger_path: Path
+        Path to the JSONL ledger.
+    creator:
+        Callable used to create the kanban task.
+    """
+
+    # Read once for validation and to preserve line count.
+    before = qpath.read_text(encoding="utf-8")
+    before_lines = before.splitlines()
+
+    tid = creator(consumible["desc"], consumible["perfil"], consumible["coste"])
+    if not tid:
+        tid = "t_" + uuid.uuid4().hex[:8]
+    tid = str(tid)
+
+    _append_ledger(ledger_path, {
+        "ts": os.environ.get("TS"),
+        "seed_line": consumible["num"],
+        "desc": consumible["desc"],
+        "perfil": consumible["perfil"],
+        "coste": consumible["coste"],
+        "task_id": tid,
+    })
+
+    line_text = consumible["line"] or ""
+    new_line = line_text.replace("- [ ]", "- [x]", 1)
+    new_line = new_line.rstrip() + f" ({tid})"
+    after_raw = before.replace(line_text, new_line)
+    after_lines = after_raw.splitlines()
+    if len(after_lines) != len(before_lines):
+        raise RuntimeError(
+            f"autoqueue: line count changed on consumption ({len(before_lines)} -> {len(after_lines)}); aborting"
+        )
+    qpath.write_text(after_raw, encoding="utf-8")
+
+    return (
+        f"consumed {consumible['num']}: {consumible['desc']!r} -> {tid} "
+        f"(perfil={consumible['perfil']}, coste={consumible['coste']})"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Consumption
 # --------------------------------------------------------------------------- #
@@ -223,39 +273,7 @@ def consumir_semilla(execute: bool = False, ruta: Path | None = None,
                 f"(perfil={consumible['perfil']}, coste={consumible['coste']})")
 
     # --- execute path ---
-    before = qpath.read_text(encoding="utf-8")
-    before_lines = before.splitlines()
-
-    tid = creator(consumible["desc"], consumible["perfil"], consumible["coste"])
-    if not tid:
-        tid = "t_" + uuid.uuid4().hex[:8]
-    tid = str(tid)
-
-    _append_ledger(ledger_path, {
-        "ts": os.environ.get("TS"),
-        "seed_line": consumible["num"],
-        "desc": consumible["desc"],
-        "perfil": consumible["perfil"],
-        "coste": consumible["coste"],
-        "task_id": tid,
-    })
-
-    # Rewrite the consumed line in place: `- [ ] ...` → `- [x] ... (t_<id>)`.
-    # `tid` already includes the `t_` prefix (as returned by the creator), so
-    # the inline marker is ` (t_<id>)` without re-adding `t_`.
-    line_text = consumible["line"] or ""
-    new_line = line_text.replace("- [ ]", "- [x]", 1)
-    new_line = new_line.rstrip() + f" ({tid})"
-    after_raw = before.replace(line_text, new_line)
-    after_lines = after_raw.splitlines()
-    if len(after_lines) != len(before_lines):
-        # Defensive: append-only means the line count must never change.
-        raise RuntimeError("autoqueue: line count changed on consumption "
-                           f"({len(before_lines)} -> {len(after_lines)}); aborting")
-    qpath.write_text(after_raw, encoding="utf-8")
-
-    return (f"consumed {consumible['num']}: {consumible['desc']!r} -> {tid} "
-            f"(perfil={consumible['perfil']}, coste={consumible['coste']})")
+    return _execute_consumption(consumible, qpath, ledger_path, creator)
 
 
 # --------------------------------------------------------------------------- #

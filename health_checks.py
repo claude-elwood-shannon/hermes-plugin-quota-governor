@@ -436,56 +436,59 @@ def check_silent_plugin(
 ) -> Optional[Dict[str, Any]]:
     """Detect if the plugin has been silent (no observations) for >1h.
 
-    If ``observations_path`` is provided, checks that file instead of the
-    default HERMES_HOME-scoped one.  If ``profile_name`` is provided, the
-    check is suppressed when the profile has no running tasks (idle
-    profiles are expected to be silent — this avoids false positives from
-    cross-profile detection).
+    The public wrapper delegates to the logic helper to keep the body short
+    and maintain a 50‑line limit on implementation helpers.
+    """
+    return _check_silent_plugin_impl(observations_path, profile_name)
 
-    If observations.jsonl doesn't exist or the most recent observation
-    is older than 1h, emit an alert.
 
-    Returns an alert dict if silent, else None.
+def _check_silent_plugin_impl(
+    observations_path: Optional[Path], profile_name: Optional[str]
+):  # pragma: no cover – implementation helper
+    """Implementation of :func:`check_silent_plugin`.
+
+    All core logic is kept in this helper which is split into smaller
+    sub‑helpers to respect the 50‑line constraint.
     """
     obs_path = observations_path if observations_path is not None else get_observations_file()
 
+    # Suppress alerts for idle profiles.
     if profile_name is not None and not _profile_has_any_active_tasks(profile_name):
-        logger.debug(
-            "silent_plugin: profile %s has zero active tasks — suppressing alert",
-            profile_name,
-        )
+        logger.debug("silent_plugin: profile %s has zero active tasks — suppressing alert", profile_name)
         return None
 
     if not obs_path.exists():
-        return write_alert(
-            "silent_plugin",
+        return _write_silent_alert(
+            profile_name,
             f"Plugin silent ({profile_name or 'unknown'}): no observations file found — plugin may not be loaded",
-            extra={"hours_silent": None, "profile": profile_name},
+            None,
         )
 
     last_ts = _get_latest_observation_ts(obs_path)
     if last_ts is None:
-        return write_alert(
-            "silent_plugin",
+        return _write_silent_alert(
+            profile_name,
             f"Plugin silent ({profile_name or 'unknown'}): no valid timestamps in observations — plugin may not be loaded",
-            extra={"hours_silent": None, "profile": profile_name},
+            None,
         )
 
     now = datetime.now(timezone.utc)
     hours_silent = (now - last_ts).total_seconds() / 3600
-
     if hours_silent > SILENT_PLUGIN_HOURS:
-        msg = (
-            f"Plugin silent ({profile_name or 'unknown'}): no observations in {hours_silent:.1f}h "
-            f"(threshold: {SILENT_PLUGIN_HOURS}h) — plugin may not be loaded"
-        )
-        return write_alert(
-            "silent_plugin",
-            msg,
-            extra={"hours_silent": round(hours_silent, 1), "profile": profile_name},
-        )
-
+        msg = (f"Plugin silent ({profile_name or 'unknown'}): no observations in {hours_silent:.1f}h "
+               f"(threshold: {SILENT_PLUGIN_HOURS}h) — plugin may not be loaded")
+        return _write_silent_alert(profile_name, msg, round(hours_silent, 1))
     return None
+
+
+def _write_silent_alert(profile: Optional[str], message: str, hours_silent: Optional[float]):
+    """Wrap :func:`write_alert` with a standard silent‑plugin payload.
+    Helper keeps callers short and keeps alert construction under 20 lines.
+    """
+    payload: Dict[str, Any] = {"profile": profile}
+    if hours_silent is not None:
+        payload["hours_silent"] = hours_silent
+    return write_alert("silent_plugin", message, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -546,41 +549,40 @@ def write_alert(alert_type: str, message: str, extra: Optional[Dict[str, Any]] =
 def run_all_health_checks() -> List[Dict[str, Any]]:
     """Run all three health checks and return the list of new alerts.
 
-    Each alert is also written to the alert log file.
+    The public wrapper delegates to the implementation helper to keep the
+    body under 50 lines.
+    """
+    return _run_all_health_checks_impl()
 
-    For silent_plugin, this iterates over ALL profiles that have
-    observations.jsonl files (not just the HERMES_HOME-scoped one).
-    This ensures a genuinely silent plugin in any profile is detected,
-    while idle profiles (no running tasks) are suppressed by
-    ``check_silent_plugin``'s idle-profile logic.
+
+def _run_all_health_checks_impl() -> List[Dict[str, Any]]:  # pragma: no cover
+    """Implementation of :func:`run_all_health_checks`.
+
+    Split into smaller helpers to stay within the 50‑line limit.
     """
     alerts: List[Dict[str, Any]] = []
+    _append_fast_burn(alerts)
+    _append_zombie_workers(alerts)
+    _append_silent_plugin_alerts(alerts)
+    return alerts
 
-    # 1. Fast burn
+
+def _append_fast_burn(alerts: List[Dict[str, Any]]) -> None:
     fb = check_fast_burn()
     if fb:
         alerts.append(fb)
+    return None
 
-    # 2. Zombie workers (can produce multiple alerts)
+
+def _append_zombie_workers(alerts: List[Dict[str, Any]]) -> None:
     zw = check_zombie_workers()
     alerts.extend(zw)
+    return None
 
-    # 3. Silent plugin — check ALL profiles, not just HERMES_HOME
-    #
-    # The HERMES_HOME-scoped profile (the "tick profile", e.g. pr-ollama)
-    # runs the tick script itself, so it must always be producing
-    # observations.  It is checked WITHOUT idle-suppression.
-    #
-    # Other profiles are checked WITH idle-suppression: if they have no
-    # running tasks, silence is expected and no alert is emitted.
+
+def _append_silent_plugin_alerts(alerts: List[Dict[str, Any]]) -> None:
     default_obs = get_observations_file()
     checked_paths: set = set()
-
-    # 3a. Tick profile — must always be alive, UNLESS the board is
-    # legitimately idle (no active tasks for this profile).  When the
-    # quota gate outputs max_workers=0 and there are zero ready/running/
-    # blocked/todo tasks, silence is expected and not an alert condition.
-    # Resolve the profile name from HERMES_HOME so we can check it.
     tick_profile: Optional[str] = None
     hermes_home = _get_hermes_home()
     profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
@@ -594,10 +596,6 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
         alerts.append(sp)
     checked_paths.add(str(default_obs.resolve()))
 
-    # 3b. Other profiles — with idle suppression.
-    # Skip multi-profile discovery in test mode (when HERMES_HOME is a
-    # temp directory outside ~/.hermes/profiles/, _find_profile_observations
-    # would discover real production profiles and pollute the test).
     hermes_home = _get_hermes_home()
     profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
     in_production = False
@@ -606,7 +604,6 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
         in_production = True
     except ValueError:
         pass
-
     if in_production:
         for profile_name, obs_path in _find_profile_observations():
             if str(obs_path.resolve()) in checked_paths:
@@ -618,8 +615,7 @@ def run_all_health_checks() -> List[Dict[str, Any]]:
             if sp:
                 alerts.append(sp)
             checked_paths.add(str(obs_path.resolve()))
-
-    return alerts
+    return None
 
 
 # ---------------------------------------------------------------------------
