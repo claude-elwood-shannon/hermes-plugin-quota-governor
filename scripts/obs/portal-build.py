@@ -444,6 +444,134 @@ _GPU_HOST = "hermesuser@192.168.1.32"
 _GPU_API = "http://192.168.1.32:8000"
 _GPU_CACHE = "gpu-health.json"        # cached under state_dir/obs/
 _GPU_CACHE_TTL = 120                   # seconds — SSH is expensive, cache it
+# ---------------------------------------------------------------------------
+# Helper functions for page_gpu – to keep each <50 lines
+# ---------------------------------------------------------------------------
+
+def _page_gpu_kpis(gpu: dict) -> str:
+    out: list[str] = []
+    out.append('<section class="kpis">')
+    temp = gpu.get("temp_c")
+    if temp is not None:
+        t_cls = "bad" if temp >= 75 else ("warn" if temp >= 65 else "ok")
+        out.append(_kpi(
+            "Temp GPU",
+            f'<span class="{t_cls}">{temp}°C</span>',
+            "RTX 4060 Ti 16GB"))
+    else:
+        out.append(_kpi("Temp GPU", "n/d", "sin lectura"))
+    mem_used = gpu.get("mem_used_mib")
+    mem_total = gpu.get("mem_total_mib")
+    if mem_used is not None and mem_total is not None:
+        out.append(_kpi(
+            "VRAM",
+            f"{mem_used} / {mem_total} MiB",
+            f'{gpu.get("mem_pct", 0):.1f}% uso'))
+    else:
+        out.append(_kpi("VRAM", "n/d", "sin lectura"))
+    util = gpu.get("util_pct")
+    out.append(_kpi(
+        "Utilización",
+        f"{util}%" if util is not None else "n/d",
+        "carga compute actual"))
+    model = gpu.get("model_id", "?")
+    model_short = model.split("/")[-1] if model and model != "?" else "?"
+    out.append(_kpi(
+        "Modelo activo",
+        f'<span class="mono" style="font-size:14px">{_esc(model_short)}</span>',
+        f'ctx {gpu.get("model_ctx_len", "?")} · '
+        f'{"vLLM ✓" if gpu.get("vllm_active") else "vLLM ✗"}'))
+    out.append(_kpi(
+        "Rondas hoy",
+        str(gpu.get("rounds_today", 0)),
+        f'{gpu.get("rounds_today_ok", 0)} ok · '
+        f'{gpu.get("rounds_today_err", 0)} err · '
+        f'{gpu.get("rounds_total", 0)} total'))
+    out.append('</section>')
+    return "\n".join(out)
+
+
+def _page_gpu_services(gpu: dict) -> str:
+    """vLLM service/timer status card with source and cache metadata."""
+    out: list[str] = []
+    out.append('<section class="card"><h2>Estado de servicios</h2>')
+    svc = gpu.get("vllm_service", "unknown")
+    timer = gpu.get("rounds_timer", "unknown")
+    svc_badge = ("ok" if svc == "active" else
+                 ("bad" if svc in ("failed", "inactive") else "mut"))
+    timer_badge = ("ok" if timer == "active" else
+                   ("bad" if timer in ("failed", "inactive") else "mut"))
+    out.append(
+        f'<p>vLLM service: {_badge(svc_badge, _esc(svc))} &nbsp; '
+        f'vllm-rounds.timer: {_badge(timer_badge, _esc(timer))}</p>')
+    src = gpu.get("source", "live")
+    ts = gpu.get("ts")
+    age = ""
+    if ts:
+        age = f' · {_fmt_ts(ts)}'
+    out.append(
+        f'<div class="mut" style="font-size:11px;margin-top:6px">'
+        f'fuente: {_esc(src)}{age} · SSH hermesuser@192.168.1.32 · '
+        f'cache TTL {_GPU_CACHE_TTL}s</div>')
+    out.append("</section>")
+    return "\n".join(out)
+
+
+def _page_gpu_temp_chart(temp_hist: list) -> str:
+    """Thermal history sparkline; '' when history is missing or too short."""
+    out: list[str] = []
+    if temp_hist and len(temp_hist) > 1:
+        out.append('<section class="card"><h2>Temperatura — últimas 20 rondas</h2>')
+        vals = [(ts, v) for ts, v in temp_hist if v is not None]
+        if len(vals) > 1:
+            out.append(line_chart(
+                [v for _, v in vals],
+                w=640, h=100, color="#f85149", fill=False,
+                label_every=max(1, len(vals) // 5)))
+            out.append(
+                f'<div class="mut" style="font-size:11px;margin-top:6px">'
+                f'rango {min(v for _, v in vals)}–{max(v for _, v in vals)}°C · '
+                f'umbral térmico skip 75°C · alerta 85°C</div>')
+        out.append("</section>")
+    return "\n".join(out)
+
+
+def _page_gpu_recent_rounds(recent: list) -> str:
+    """Recent rounds table, or an empty-state card when there are none."""
+    out: list[str] = []
+    if recent:
+        out.append('<section class="card"><h2>Rondas recientes (últimas 10)</h2>')
+        rows_html = []
+        for r in reversed(recent):
+            status = r.get("status", "?")
+            st_badge = "ok" if status == "ok" else "bad"
+            model_s = (r.get("model", "?") or "?").split("/")[-1]
+            task = r.get("task", "?")
+            tok_s = r.get("tok_s")
+            tok_s_s = f"{tok_s:.1f}" if isinstance(tok_s, (int, float)) else "-"
+            temp_r = r.get("temp")
+            temp_s = f"{temp_r}°C" if temp_r is not None else "-"
+            latency = r.get("latency_s")
+            lat_s = f"{latency:.1f}s" if isinstance(latency, (int, float)) else "-"
+            rows_html.append(
+                f'<tr><td class="mono">{_fmt_ts(r.get("ts"))}</td>'
+                f'<td>{_esc(task)}</td>'
+                f'<td class="mono">{_esc(model_s)}</td>'
+                f'<td class="num">{_esc(temp_s)}</td>'
+                f'<td class="num">{_esc(tok_s_s)}</td>'
+                f'<td class="num">{_esc(lat_s)}</td>'
+                f'<td>{_badge(st_badge, _esc(status))}</td></tr>')
+        out.append(
+            '<table><tr><th>cuándo</th><th>ronda</th><th>modelo</th>'
+            '<th class=num>temp</th><th class=num>tok/s</th>'
+            '<th class=num>latencia</th><th>status</th></tr>'
+            + "".join(rows_html) + "</table>")
+        out.append("</section>")
+    else:
+        out.append('<section class="card">')
+        out.append(empty_state("sin rondas registradas (rounds.jsonl vacío o inaccesible)"))
+        out.append("</section>")
+    return "\n".join(out)
 
 
 def _ssh_gpu(cmd: str, timeout: int = 10) -> str:
@@ -1397,122 +1525,18 @@ def page_gpu(data: dict, query: dict = None) -> str:
     out: list[str] = []
 
     # --- KPIs ---
-    out.append('<section class="kpis">')
-
-    temp = gpu.get("temp_c")
-    if temp is not None:
-        t_cls = "bad" if temp >= 75 else ("warn" if temp >= 65 else "ok")
-        out.append(_kpi(
-            "Temp GPU",
-            f'<span class="{t_cls}">{temp}°C</span>',
-            "RTX 4060 Ti 16GB"))
-    else:
-        out.append(_kpi("Temp GPU", "n/d", "sin lectura"))
-
-    mem_used = gpu.get("mem_used_mib")
-    mem_total = gpu.get("mem_total_mib")
-    if mem_used is not None and mem_total is not None:
-        out.append(_kpi(
-            "VRAM",
-            f"{mem_used} / {mem_total} MiB",
-            f'{gpu.get("mem_pct", 0):.1f}% uso'))
-    else:
-        out.append(_kpi("VRAM", "n/d", "sin lectura"))
-
-    util = gpu.get("util_pct")
-    out.append(_kpi(
-        "Utilización",
-        f"{util}%" if util is not None else "n/d",
-        "carga compute actual"))
-
-    model = gpu.get("model_id", "?")
-    model_short = model.split("/")[-1] if model and model != "?" else "?"
-    out.append(_kpi(
-        "Modelo activo",
-        f'<span class="mono" style="font-size:14px">{_esc(model_short)}</span>',
-        f'ctx {gpu.get("model_ctx_len", "?")} · '
-        f'{"vLLM ✓" if gpu.get("vllm_active") else "vLLM ✗"}'))
-
-    out.append(_kpi(
-        "Rondas hoy",
-        str(gpu.get("rounds_today", 0)),
-        f'{gpu.get("rounds_today_ok", 0)} ok · '
-        f'{gpu.get("rounds_today_err", 0)} err · '
-        f'{gpu.get("rounds_total", 0)} total'))
-    out.append("</section>")
+    out.append(_page_gpu_kpis(gpu))
 
     # --- Service status ---
-    out.append('<section class="card"><h2>Estado de servicios</h2>')
-    svc = gpu.get("vllm_service", "unknown")
-    timer = gpu.get("rounds_timer", "unknown")
-    svc_badge = ("ok" if svc == "active" else
-                 ("bad" if svc in ("failed", "inactive") else "mut"))
-    timer_badge = ("ok" if timer == "active" else
-                   ("bad" if timer in ("failed", "inactive") else "mut"))
-    out.append(
-        f'<p>vLLM service: {_badge(svc_badge, _esc(svc))} &nbsp; '
-        f'vllm-rounds.timer: {_badge(timer_badge, _esc(timer))}</p>')
-    src = gpu.get("source", "live")
-    ts = gpu.get("ts")
-    age = ""
-    if ts:
-        age = f' · {_fmt_ts(ts)}'
-    out.append(
-        f'<div class="mut" style="font-size:11px;margin-top:6px">'
-        f'fuente: {_esc(src)}{age} · SSH hermesuser@192.168.1.32 · '
-        f'cache TTL {_GPU_CACHE_TTL}s</div>')
-    out.append("</section>")
+    out.append(_page_gpu_services(gpu))
 
     # --- Thermal history sparkline ---
-    temp_hist = gpu.get("temp_history", [])
-    if temp_hist and len(temp_hist) > 1:
-        out.append('<section class="card"><h2>Temperatura — últimas 20 rondas</h2>')
-        vals = [(ts, v) for ts, v in temp_hist if v is not None]
-        if len(vals) > 1:
-            out.append(line_chart(
-                [v for _, v in vals],
-                w=640, h=100, color="#f85149", fill=False,
-                label_every=max(1, len(vals) // 5)))
-            out.append(
-                f'<div class="mut" style="font-size:11px;margin-top:6px">'
-                f'rango {min(v for _, v in vals)}–{max(v for _, v in vals)}°C · '
-                f'umbral térmico skip 75°C · alerta 85°C</div>')
-        out.append("</section>")
+    chart = _page_gpu_temp_chart(gpu.get("temp_history", []))
+    if chart:
+        out.append(chart)
 
     # --- Recent rounds table ---
-    recent = gpu.get("recent_rounds", [])
-    if recent:
-        out.append('<section class="card"><h2>Rondas recientes (últimas 10)</h2>')
-        rows_html = []
-        for r in reversed(recent):
-            status = r.get("status", "?")
-            st_badge = "ok" if status == "ok" else "bad"
-            model_s = (r.get("model", "?") or "?").split("/")[-1]
-            task = r.get("task", "?")
-            tok_s = r.get("tok_s")
-            tok_s_s = f"{tok_s:.1f}" if isinstance(tok_s, (int, float)) else "-"
-            temp_r = r.get("temp")
-            temp_s = f"{temp_r}°C" if temp_r is not None else "-"
-            latency = r.get("latency_s")
-            lat_s = f"{latency:.1f}s" if isinstance(latency, (int, float)) else "-"
-            rows_html.append(
-                f'<tr><td class="mono">{_fmt_ts(r.get("ts"))}</td>'
-                f'<td>{_esc(task)}</td>'
-                f'<td class="mono">{_esc(model_s)}</td>'
-                f'<td class="num">{_esc(temp_s)}</td>'
-                f'<td class="num">{_esc(tok_s_s)}</td>'
-                f'<td class="num">{_esc(lat_s)}</td>'
-                f'<td>{_badge(st_badge, _esc(status))}</td></tr>')
-        out.append(
-            '<table><tr><th>cuándo</th><th>ronda</th><th>modelo</th>'
-            '<th class=num>temp</th><th class=num>tok/s</th>'
-            '<th class=num>latencia</th><th>status</th></tr>'
-            + "".join(rows_html) + "</table>")
-        out.append("</section>")
-    else:
-        out.append('<section class="card">')
-        out.append(empty_state("sin rondas registradas (rounds.jsonl vacío o inaccesible)"))
-        out.append("</section>")
+    out.append(_page_gpu_recent_rounds(gpu.get("recent_rounds", [])))
 
     # --- Last round details ---
     last = gpu.get("last_round")
