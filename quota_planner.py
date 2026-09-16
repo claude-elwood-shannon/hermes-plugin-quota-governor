@@ -28,7 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from .providers import QuotaSnapshot, _get_env
+import providers
+from providers import QuotaSnapshot, _get_env
 
 
 Action = Literal["run", "paying", "stop"]

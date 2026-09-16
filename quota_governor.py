@@ -17,8 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .providers import QuotaSnapshot, query_all
-from .quota_planner import GovernorDecision, decide
+import providers
+from providers import QuotaSnapshot, query_all
+import quota_planner
+from quota_planner import GovernorDecision, decide
 
 logger = logging.getLogger(__name__)
 

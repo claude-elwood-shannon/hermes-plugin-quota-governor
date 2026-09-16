@@ -54,9 +54,9 @@ import os
 import subprocess
 from typing import Any, Dict, Optional
 
-from . import quota_governor as gov
-from . import quota_planner as planner
-from . import health_checks
+import quota_governor as gov
+import quota_planner as planner
+import health_checks
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,33 @@ _ASSIGNEE_FIX_SCRIPT = os.path.join(
     "scripts",
     "assignee-fix.py",
 )
+
+# Helper for spawning scripts
+
+def _spawn_helper(script, log_msg, *, python_executable="python3", args=None):
+    """Invoke script if exists, detached, logging log_msg."""
+    if os.path.exists(script):
+        cmd = [python_executable, script]
+        if args is not None:
+            cmd += args
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.debug(log_msg)
+        except Exception as exc:
+            logger.debug("failed to spawn %s: %s", script, exc)
+    else:
+        logger.debug("%s not found at %s — skipping", os.path.basename(script), script)
+
+# wrappers for specific scripts
+_def_privacy_router = lambda: _spawn_helper(_PRIVACY_ROUTER_SCRIPT, "privacy-router-fix.py spawned after dispatch tick")
+_def_assignee_fix = lambda: _spawn_helper(_ASSIGNEE_FIX_SCRIPT, "assignee-fix.py spawned after dispatch tick")
+_def_approval_ready = lambda: _spawn_helper(_APPROVAL_FIX_SCRIPT, "approval-ready-fix.py spawned after dispatch tick", python_executable="/usr/bin/python3.12", args=["--execute"])
 
 # --- approval-ready-fix.py path (P5, 2026-09-13) ------------------------------
 
@@ -230,92 +257,14 @@ def _handle_dispatch_tick(
 ):
     """Perform privacy, assignee, and approval fixes.
 
-    Spawns each missing script in the background; any failure is logged.
-    All subprocesses are detached to keep the dispatcher responsive.
+    All spawns are delegated to helper wrappers and run detached.
     """
-    # privacy-router
-    if os.path.exists(_PRIVACY_ROUTER_SCRIPT):
-        try:
-            subprocess.Popen(
-                ["python3", _PRIVACY_ROUTER_SCRIPT],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            logger.debug("privacy-router-fix.py spawned after dispatch tick")
-        except Exception as exc:
-            logger.debug("failed to spawn privacy-router-fix.py: %s", exc)
-
-    # assignee‑fix
-    if os.path.exists(_ASSIGNEE_FIX_SCRIPT):
-        try:
-            subprocess.Popen(
-                ["python3", _ASSIGNEE_FIX_SCRIPT],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            logger.debug("assignee-fix.py spawned after dispatch tick")
-        except Exception as exc:
-            logger.debug("failed to spawn assignee-fix.py: %s", exc)
-
-    # approval‑ready
-    if os.path.exists(_APPROVAL_FIX_SCRIPT):
-        try:
-            subprocess.Popen(
-                ["/usr/bin/python3.12", _APPROVAL_FIX_SCRIPT, "--execute"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            logger.debug("approval-ready-fix.py spawned after dispatch tick")
-        except Exception as exc:
-            logger.debug("failed to spawn approval-ready-fix.py: %s", exc)
-
-    # OBJ-08: deterministically reassign tasks whose assignee is not a valid
-    # profile (e.g. the LLM agent invented 'alice').  Same pattern as the
-    # privacy router above — enforce G1 in code, not via prompt compliance.
-    # Runs AFTER the privacy router so privacy-routed tasks keep their
-    # (valid) profile; this only catches the remaining invalid assignees.
+    _def_privacy_router()
+    _def_assignee_fix()
+    _def_approval_ready()
     if not os.path.exists(_ASSIGNEE_FIX_SCRIPT):
         logger.debug("assignee-fix.py not found at %s — skipping", _ASSIGNEE_FIX_SCRIPT)
         return
-
-    try:
-        subprocess.Popen(
-            ["python3", _ASSIGNEE_FIX_SCRIPT],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        logger.debug("assignee-fix.py spawned after dispatch tick")
-    except Exception as exc:
-        logger.debug("failed to spawn assignee-fix.py: %s", exc)
-
-    # P5 (2026-09-13): approval-ready backstop — completes Flujo B packages
-    # and archives duplicate proposals (dedup by signature). Same pattern:
-    # enforce in code what the creator prompt cannot guarantee. Dry-run
-    # default inside the script; here we pass --execute because the hook
-    # is the deterministic enforcement point.
-    if not os.path.exists(_APPROVAL_FIX_SCRIPT):
-        logger.debug("approval-ready-fix.py not found at %s — skipping",
-                     _APPROVAL_FIX_SCRIPT)
-    else:
-        try:
-            subprocess.Popen(
-                ["/usr/bin/python3.12", _APPROVAL_FIX_SCRIPT, "--execute"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            logger.debug("approval-ready-fix.py spawned after dispatch tick")
-        except Exception as exc:
-            logger.debug("failed to spawn approval-ready-fix.py: %s", exc)
 
 
 def _on_kanban_task_completed(
