@@ -363,3 +363,59 @@ def test_missing_db_fails_clean(tmp_path):
                 log=tmp_path / "objective-lifecycle.jsonl",
                 alarms=tmp_path / "cron-alarms.jsonl")
     assert r["errors"] and "not found" in r["errors"][0]
+
+
+# ---------------------------------------------------------------------------
+# burn-watchdog -> protected (t_f5838b27 §6 escenario especial)
+# ---------------------------------------------------------------------------
+
+def test_burn_warning_near_stop_forces_protected(tmp_path, monkeypatch):
+    # A warning at >= 80% of the provider's stop threshold forces
+    # preset protected for every evaluated objective (no adjustments).
+    qg = tmp_path / "quota-governor"
+    qg.mkdir()
+    (qg / "burn-warnings.json").write_text(json.dumps({
+        "opencode-go": {"ts": 1, "cum_cost_usd": 0.9,
+                        "rate_usd_per_min": 0.05, "window": "weekly"}}),
+        encoding="utf-8")
+    (qg / "burn-watchdog.json").write_text(json.dumps({
+        "opencode-go": {"enabled": True, "burn_total_stop_usd": 1.0}}),
+        encoding="utf-8")
+    monkeypatch.setattr(ol, "_HERMES_ROOT", tmp_path)
+    note = ol.burn_force_protected(time.time(), hermes_root=tmp_path)
+    assert note and "opencode-go" in note and "protected" in note
+
+    _db(tmp_path, [_obj(gov="responsive")], presets=["normal"])
+    _trace(tmp_path, _low_events())
+    log = tmp_path / "objective-lifecycle.jsonl"
+    now = time.time()
+    with open(log, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "ts": ol.ts_utc(now - 600), "kind": "objective_lifecycle",
+            "objective": "OBJ-TEST", "state": "low", "streak_low": 2,
+            "streak_high": 0, "last_adjusted": None,
+            "ts_epoch": now - 600}) + "\n")
+    r = _run(tmp_path)
+    entry = r["entries"][0]
+    assert entry["preset_id"] == "burn:protected"
+    assert entry["actions"] == []            # protected: step 0, no moves
+    assert "burn-watchdog" in entry["preset_note"]
+
+
+def test_burn_warning_below_threshold_no_override(tmp_path, monkeypatch):
+    qg = tmp_path / "quota-governor"
+    qg.mkdir()
+    (qg / "burn-warnings.json").write_text(json.dumps({
+        "opencode-go": {"ts": 1, "cum_cost_usd": 0.1,
+                        "rate_usd_per_min": 0.01, "window": "weekly"}}),
+        encoding="utf-8")
+    (qg / "burn-watchdog.json").write_text(json.dumps({
+        "opencode-go": {"enabled": True, "burn_total_stop_usd": 1.0}}),
+        encoding="utf-8")
+    monkeypatch.setattr(ol, "_HERMES_ROOT", tmp_path)
+    assert ol.burn_force_protected(time.time(), hermes_root=tmp_path) is None
+
+
+def test_burn_files_missing_fail_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(ol, "_HERMES_ROOT", tmp_path)
+    assert ol.burn_force_protected(time.time(), hermes_root=tmp_path) is None

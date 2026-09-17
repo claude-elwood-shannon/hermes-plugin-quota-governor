@@ -306,6 +306,51 @@ def resolve_preset(preset_id: str | None, presets: dict[str, dict],
 
 
 # ---------------------------------------------------------------------------
+# burn-watchdog -> protected (t_f5838b27 §6 escenario especial). Any open
+# burn warning at or beyond burn_force_protected_pct of its provider's stop
+# threshold forces the 'protected' preset for EVERY objective this tick
+# (step_size 0 -> the ratchet cannot move while money is burning). The
+# warning file carries no stop threshold, so it is read from the watchdog
+# config; missing files / parse errors -> no override (fail-open).
+# ---------------------------------------------------------------------------
+
+def burn_force_protected(now: float,
+                         hermes_root: Path | None = None,
+                         threshold_pct: float = 80.0) -> str | None:
+    """Override note when a burn warning nears its stop threshold, else None."""
+    root = hermes_root or _HERMES_ROOT
+    qg = root / "quota-governor"
+    try:
+        warnings = json.loads(
+            (qg / "burn-warnings.json").read_text(encoding="utf-8"))
+        config = json.loads(
+            (qg / "burn-watchdog.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(warnings, dict) or not warnings:
+        return None
+    for prov, w in warnings.items():
+        if not isinstance(w, dict):
+            continue
+        try:
+            cum = float(w.get("cum_cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        cfg = config.get(prov) if isinstance(config, dict) else None
+        stop_total = 1.0
+        if isinstance(cfg, dict):
+            try:
+                stop_total = float(cfg.get("burn_total_stop_usd", 1.0))
+            except (TypeError, ValueError):
+                stop_total = 1.0
+        if stop_total > 0 and (cum / stop_total) * 100.0 >= threshold_pct:
+            return (f"burn-watchdog: {prov} cumulative ${cum:.2f} "
+                    f">= {threshold_pct:.0f}% of stop ${stop_total:.2f} "
+                    "-> preset protected (no adjustments)")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle log: the ratchet's persistent state (last entry per objective)
 # ---------------------------------------------------------------------------
 
@@ -490,6 +535,9 @@ def evaluate_objective(conn: sqlite3.Connection, row: sqlite3.Row,
         return entry, updates
 
     pid, preset, note = resolve_preset(row["preset_id"], presets, eff)
+    burn_note = burn_force_protected(now)
+    if burn_note:
+        pid, preset, note = "burn:protected", presets["protected"], burn_note
     entry["preset_id"] = pid
     if note:
         entry["preset_note"] = note
