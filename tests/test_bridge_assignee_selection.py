@@ -166,12 +166,12 @@ class CreateTaskWiringTests(unittest.TestCase):
         # the hardcoded literal must be gone from the command construction
         self.assertNotIn('"--assignee", "pr-ollama"', src)
 
-    def test_openapi_declares_assignee_property_and_v19(self):
+    def test_openapi_declares_assignee_property_and_version(self):
         entry = bridge.OPENAPI_SPEC["paths"]["/create-task"]
         props = (entry["post"]["requestBody"]["content"]["application/json"]
                  ["schema"]["properties"])
         self.assertIn("assignee", props)
-        self.assertEqual(bridge.OPENAPI_SPEC["info"]["version"], "1.9.0")
+        self.assertEqual(bridge.OPENAPI_SPEC["info"]["version"], "1.10.0")
 
     def test_spec_still_valid_json_shape(self):
         # smoke: the giant literal still parses and carries the new text

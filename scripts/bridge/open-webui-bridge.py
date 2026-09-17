@@ -112,6 +112,195 @@ HERMES_HOME = os.path.expanduser("~/.hermes")
 _AO_DB = os.environ.get("AO_KANBAN_DB") or os.path.join(HERMES_HOME, "kanban.db")
 _AO_VALID_STATUSES = {"active", "achieved", "paused", "discarded"}
 
+# rutas de log-tail plegadas en dict (t_d8df248b: do_GET <50 lineas)
+_LOG_TAILS = {
+    "/watchdog": ("logs/kanban-watchdog.log", 15),
+    "/tick": ("logs/quota-governor-tick.log", 10),
+    "/health": ("logs/cron-health-check.log", 5),
+    "/efficiency": ("logs/efficiency-ratio.log", 3),
+}
+
+# --- adjustment_presets + P1 columns (t_d8df248b, v1.8.0) ---------------------
+# Schema P1 (t_67876b3f) en kanban.db compartida. Lecturas read-only (uri ro);
+# escrituras serializadas por los locks de SQLite (bridge + tick). El DDL
+# espeja VERBATIM el CREATE TABLE de P1: el primer create apunta a kanban.db.
+
+_PRESET_DDL = (
+    "CREATE TABLE IF NOT EXISTS adjustment_presets ("
+    "id TEXT PRIMARY KEY, name TEXT, description TEXT, "
+    "nice_step REAL, nice_cap_high REAL, nice_cap_low REAL, "
+    "budget_step_pct REAL, budget_cap_high_pct REAL, "
+    "budget_cap_low_pct REAL, eval_frequency_min INTEGER, "
+    "cooldown_min INTEGER, trigger_eff_high REAL, trigger_eff_low REAL, "
+    "consecutive_high INTEGER, consecutive_low INTEGER, is_system INTEGER, "
+    "is_active INTEGER, created_at REAL, updated_at REAL, updated_by TEXT)")
+
+# (columna, tipo, default) de approved_objectives añadidos por P1; ALTER
+# idempotente para bases creadas antes de P1.
+_AO_P1_COLUMNS = (
+    ("nice", "INTEGER DEFAULT 0"),
+    ("focus_until", "REAL DEFAULT NULL"),
+    ("budget_baseline", "REAL DEFAULT 0"),
+    ("budget_adjustment_pct", "REAL DEFAULT 0"),
+    ("governance", "TEXT DEFAULT 'static'"),
+    ("preset_id", "TEXT DEFAULT 'normal'"))
+
+# governance modal válido del esquema P1
+_AO_GOVERNANCE_MODES = {"static", "responsive", "dynamic"}
+
+
+def _preset_id_exists(pid):
+    """True si preset_id existe en adjustment_presets.
+
+    Fail-open: db/tabla ausente => True (la FK es gobernanza, no integridad;
+    el upsert del objetivo no debe morir por inventario de presets vacío).
+    """
+    import sqlite3
+    if not os.path.exists(_AO_DB):
+        return True
+    con = sqlite3.connect(f"file:{_AO_DB}?mode=ro", uri=True)
+    try:
+        return con.execute(
+            "SELECT 1 FROM adjustment_presets WHERE id=?",
+            (pid,)).fetchone() is not None
+    except sqlite3.Error:
+        return True
+    finally:
+        con.close()
+
+
+def _ao_ensure_columns(db_path=None):
+    """ALTER TABLE approved_objectives ADD COLUMN (P1) idempotentemente.
+
+    Bridge-side safeguard: bases creadas antes de P1 no tienen las 6 columnas
+    y el upsert fallaría con 'no such column'. Espeja el DDL de P1 (t_67876b3f)
+    columna a columna via PRAGMA; NULL y errores => silencio (fail-open).
+    """
+    import sqlite3
+    path = db_path or _AO_DB
+    try:
+        con = sqlite3.connect(path)
+        try:
+            cols = {r[1] for r in con.execute(
+                "PRAGMA table_info(approved_objectives)")}
+            if not cols:
+                return  # tabla inexistente: el upsert la crea ya con P1
+            for col, decl in _AO_P1_COLUMNS:
+                if col not in cols:
+                    con.execute(
+                        f"ALTER TABLE approved_objectives ADD COLUMN "
+                        f"{col} {decl}")
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass  # fail-open: el handler degradará al error 503/500 de siempre
+
+
+def _preset_list():
+    """GET /presets: adjustment_presets completa (dicts) | None (503)."""
+    import sqlite3
+    if not os.path.exists(_AO_DB):
+        return None
+    con = sqlite3.connect(f"file:{_AO_DB}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT * FROM adjustment_presets ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+_PRESET_REAL_FIELDS = (
+    "nice_step", "nice_cap_high", "nice_cap_low",
+    "budget_step_pct", "budget_cap_high_pct", "budget_cap_low_pct",
+    "trigger_eff_high", "trigger_eff_low")
+_PRESET_INT_FIELDS = (
+    "eval_frequency_min", "cooldown_min", "consecutive_high",
+    "consecutive_low", "is_system", "is_active")
+
+
+def _bw_preset_validate(data):
+    """Valida el payload de /update-preset.
+
+    Devuelve (pid, err); err es None cuando el payload es válido o el dict
+    de error 400 (id requerido, name default=id, campos numéricos no bool,
+    is_system/is_active enteros no bool). No toca disco.
+    """
+    pid = (data.get("id") or "").strip()
+    if not pid:
+        return None, {"error": "id is required"}
+    for f in _PRESET_REAL_FIELDS:
+        v = data.get(f)
+        if v is not None and (not isinstance(v, (int, float))
+                              or isinstance(v, bool)):
+            return None, {"error": f"{f} must be a number"}
+    for f in ("eval_frequency_min", "cooldown_min", "consecutive_high",
+              "consecutive_low", "is_system", "is_active"):
+        v = data.get(f)
+        if v is not None and (not isinstance(v, int)
+                              or isinstance(v, bool)):
+            return None, {"error": f"{f} must be an integer"}
+    return pid, None
+
+
+def _preset_upsert(data):
+    """POST /update-preset: INSERT o UPDATE de los campos provistos only."""
+    import sqlite3
+    import time as _t
+    pid, err = _bw_preset_validate(data)
+    if err:
+        return 400, err
+    if not os.path.exists(_AO_DB):
+        return 500, {"error": "kanban.db not found"}
+    now = _t.time()
+    con = None
+    try:
+        con = sqlite3.connect(_AO_DB)
+        con.execute(_PRESET_DDL)
+        row = con.execute("SELECT id FROM adjustment_presets WHERE id=?",
+                          (pid,)).fetchone()
+        if row:
+            sets, vals = ["updated_at=?", "updated_by=?"], [now, "mediator"]
+            for f in ("name", "description") + _PRESET_REAL_FIELDS + (
+                    "eval_frequency_min", "cooldown_min",
+                    "consecutive_high", "consecutive_low",
+                    "is_system", "is_active"):
+                if f in data and data[f] is not None:
+                    sets.append(f"{f}=?")
+                    vals.append(data[f])
+            vals.append(pid)
+            con.execute(f"UPDATE adjustment_presets SET {', '.join(sets)} "
+                        "WHERE id=?", vals)
+            action = "updated"
+        else:
+            name = (data.get("name") or pid).strip()
+            con.execute(
+                "INSERT INTO adjustment_presets (id, name, created_at, "
+                "updated_at, updated_by) VALUES (?,?,?,?,?)",
+                (pid, name, now, now, "mediator"))
+            action = "created"
+        con.commit()
+        con.row_factory = sqlite3.Row
+        out = con.execute("SELECT * FROM adjustment_presets WHERE id=?",
+                          (pid,)).fetchone()
+        con.close()
+        return 200, {"ok": True, "action": action,
+                     "preset": dict(out) if out else None}
+    except sqlite3.Error as exc:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return 500, {"error": str(exc)}
+
+# --- fin presets (t_d8df248b) -------------------------------------------------
+
+
 
 def _ao_list(status=None):
     import sqlite3
@@ -137,26 +326,55 @@ def _ao_list(status=None):
 def _bw_ao_validate(data):
     """Valida el payload de /update-objective.
 
-    Devuelve (oid, name, budget_daily, status, err); err es None cuando el
-    payload es válido, o el dict de error 400 (id/name requeridos, budget
-    numérico no bool, status dentro de _AO_VALID_STATUSES). No toca disco.
+    Devuelve (oid, name, budget_daily, status, governance, preset_id,
+    focus_until, err); err es None cuando el payload es válido, o el dict
+    de error 400 (id/name requeridos, budget numérico no bool, status
+    dentro de _AO_VALID_STATUSES, nice entero no bool,
+    budget_baseline/budget_adjustment_pct/focus_until numéricos no bool,
+    governance dentro de _AO_GOVERNANCE_MODES, preset_id existente en
+    adjustment_presets). No toca disco.
     """
     oid = (data.get("id") or "").strip()
     name = (data.get("name") or "").strip()
     budget = data.get("budget_daily")
     if not oid or not name or not isinstance(budget, (int, float)) \
             or isinstance(budget, bool):
-        return None, None, None, None, {
+        return None, None, None, None, None, None, None, {
             "error": "id, name and numeric budget_daily are required"}
     status = (data.get("status") or "active").strip()
     if status not in _AO_VALID_STATUSES:
-        return None, None, None, None, {
+        return None, None, None, None, None, None, None, {
             "error": f"invalid status {status!r} "
                      f"(valid: {sorted(_AO_VALID_STATUSES)})"}
-    return oid, name, budget, status, None
+    nice = data.get("nice")
+    if nice is not None and (not isinstance(nice, int)
+                             or isinstance(nice, bool)):
+        return None, None, None, None, None, None, None, {
+            "error": "nice must be an integer (P1)"}
+    for f in ("budget_baseline", "budget_adjustment_pct", "focus_until"):
+        v = data.get(f)
+        if v is not None and (not isinstance(v, (int, float))
+                              or isinstance(v, bool)):
+            return None, None, None, None, None, None, None, {
+                "error": f"{f} must be a number (P1)"}
+    governance = data.get("governance")
+    if governance is not None and governance not in _AO_GOVERNANCE_MODES:
+        return None, None, None, None, None, None, None, {
+            "error": f"invalid governance {governance!r} (valid: "
+                     f"{sorted(_AO_GOVERNANCE_MODES)})"}
+    preset_id = data.get("preset_id")
+    if preset_id is not None and not _preset_id_exists(preset_id):
+        return None, None, None, None, None, None, None, {
+            "error": f"unknown preset_id {preset_id!r} (must exist in "
+                     "adjustment_presets)"}
+    return oid, name, budget, status, governance, preset_id, \
+        data.get("focus_until"), None
 
 
-def _bw_ao_apply(con, oid, name, budget, status, data, now):
+def _bw_ao_apply(con, oid, name, budget, status, data, now,
+                 governance=None, preset_id=None, nice=None,
+                 budget_baseline=None, budget_adjustment_pct=None,
+                 focus_until=None):
     """INSERT o UPDATE (campos provistos) dentro de la transacción abierta.
 
     Housekeeping (spent_*, exhausted_days) nunca se toca aquí: es tick-owned.
@@ -175,7 +393,9 @@ def _bw_ao_apply(con, oid, name, budget, status, data, now):
     if row:
         sets, vals = ["updated_at=?", "updated_by=?"], [now, "mediator"]
         for f in ("name", "budget_daily", "description",
-                  "success_criterion", "status"):
+                  "success_criterion", "status", "governance",
+                  "preset_id", "nice", "budget_baseline",
+                  "budget_adjustment_pct", "focus_until"):
             if f in data and data[f] is not None:
                 sets.append(f"{f}=?")
                 vals.append(data[f])
@@ -183,12 +403,35 @@ def _bw_ao_apply(con, oid, name, budget, status, data, now):
         con.execute(f"UPDATE approved_objectives SET {', '.join(sets)} "
                     "WHERE id=?", vals)
         return "updated"
-    con.execute(
-        "INSERT INTO approved_objectives (id, name, budget_daily, "
-        "description, status, success_criterion, created_at, "
-        "updated_at, updated_by) VALUES (?,?,?,?,?,?,?,?,?)",
-        (oid, name, float(budget), data.get("description"), status,
-         data.get("success_criterion"), now, now, "mediator"))
+    return _bw_ao_insert(con, oid, name, budget, status, data, now)
+
+
+def _bw_ao_insert(con, oid, name, budget, status, data, now):
+    """INSERT de objetivo nuevo con los campos P1 provistos.
+
+    Los ausentes caen a los DEFAULT del schema P1; budget_baseline
+    sin valor explicito se inicializa a budget_daily (P1, migracion).
+    """
+    p1 = {"governance": data.get("governance"),
+          "preset_id": data.get("preset_id"),
+          "nice": data.get("nice"),
+          "budget_baseline": (data.get("budget_baseline")
+                              if data.get("budget_baseline") is not None
+                              else float(budget)),
+          "budget_adjustment_pct": data.get("budget_adjustment_pct"),
+          "focus_until": data.get("focus_until")}
+    p1_vals = [(f, v) for f, v in p1.items() if v is not None]
+    cols = ("id, name, budget_daily, description, status, "
+            "success_criterion, created_at, updated_at, updated_by")
+    marks = "?,?,?,?,?,?,?,?,?"
+    vals = [oid, name, float(budget), data.get("description"), status,
+            data.get("success_criterion"), now, now, "mediator"]
+    if p1_vals:
+        cols += ", " + ", ".join(f for f, _ in p1_vals)
+        marks += ", " + ", ".join("?" * len(p1_vals))
+        vals.extend(v for _, v in p1_vals)
+    con.execute(f"INSERT INTO approved_objectives ({cols}) "
+                f"VALUES ({marks})", vals)
     return "created"
 
 
@@ -199,16 +442,26 @@ def _ao_upsert(data):
     tick-owned and never wiped."""
     import sqlite3
     import time as _t
-    oid, name, budget, status, err = _bw_ao_validate(data)
+    oid, name, budget, status, governance, preset_id, focus_until, \
+        err = _bw_ao_validate(data)
     if err:
         return 400, err
+    _ao_ensure_columns()  # P1: bases pre-P1 reciben las 6 columnas
     if not os.path.exists(_AO_DB):
         return 500, {"error": "kanban.db not found"}
+    nice = data.get("nice")  # validado en _bw_ao_validate, no retornado
+    budget_baseline = data.get("budget_baseline")
+    budget_adjustment_pct = data.get("budget_adjustment_pct")
     now = _t.time()
     con = None
     try:
         con = sqlite3.connect(_AO_DB)
-        action = _bw_ao_apply(con, oid, name, budget, status, data, now)
+        action = _bw_ao_apply(con, oid, name, budget, status, data, now,
+                              governance=governance,
+                              preset_id=preset_id, nice=nice,
+                              budget_baseline=budget_baseline,
+                              budget_adjustment_pct=budget_adjustment_pct,
+                              focus_until=focus_until)
         con.commit()
         con.row_factory = sqlite3.Row
         out = con.execute("SELECT * FROM approved_objectives WHERE id=?",
@@ -512,7 +765,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.9.0",
+    "info": {"title": "Hermes Bridge", "version": "1.10.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -544,6 +797,16 @@ OPENAPI_SPEC = {
         "/backup/health": {"get": {"summary": "Check backup system health", "description": "Verifies last snapshot age, log errors, cron presence, and repo size.", "operationId": "get_backup_health", "responses": {"200": {"description": "Health status", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_27e6f8f8 2b: GPU ml-host health (SSH probe, cacheless) ----
         "/gpu/health": {"get": {"summary": "GPU ml-host health snapshot", "description": "Probes ml-host (192.168.1.32) over SSH + vLLM HTTP API and returns temperature, VRAM, utilization, active model, service state and today's rounds. Zero dependencies (stdlib only); SSH is best-effort, every failure degrades to null/false.", "operationId": "get_gpu_health", "responses": {"200": {"description": "GPU health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_d8df248b v1.8: presets + P1 objective columns ----
+        "/presets": {"get": {"summary": "List adjustment presets",
+                    "description": "Returns the full adjustment_presets inventory (P1 schema in kanban.db): the 5 system presets (normal, aggressive, conservative, startup, protected) plus any custom ones.",
+                    "operationId": "list_presets",
+                    "responses": {"200": {"description": "Presets list", "content": {"application/json": {"schema": {"type": "object"}}}}, "503": {"description": "kanban.db missing or table absent"}}}},
+        "/update-preset": {"post": {"summary": "Create or update an adjustment preset",
+                    "description": "Inserts a new preset or updates PROVIDED fields only (name, description, nice_step, nice_cap_high/low, budget_step_pct, budget_cap_high/low_pct, eval_frequency_min, cooldown_min, trigger_eff_high/low, consecutive_high/low, is_system, is_active).",
+                    "operationId": "update_preset",
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "description": {"type": "string"}, "nice_step": {"type": "number"}, "nice_cap_high": {"type": "number"}, "nice_cap_low": {"type": "number"}, "budget_step_pct": {"type": "number"}, "budget_cap_high_pct": {"type": "number"}, "budget_cap_low_pct": {"type": "number"}, "eval_frequency_min": {"type": "integer"}, "cooldown_min": {"type": "integer"}, "trigger_eff_high": {"type": "number"}, "trigger_eff_low": {"type": "number"}, "consecutive_high": {"type": "integer"}, "consecutive_low": {"type": "integer"}, "is_system": {"type": "integer"}, "is_active": {"type": "integer"}}, "required": ["id"]}}}},
+                    "responses": {"200": {"description": "Preset created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"description": "Invalid payload"}, "500": {"description": "kanban.db not found"}}}},
         # ---- t_0c6a7847 v1.7: idea parking lot (~/.hermes/data/ideas/) ----
         "/save-idea": {"post": {"summary": "Save a brainstorm idea to the parking lot",
                     "description": "Persists an idea as a JSON file under ~/.hermes/data/ideas/. Ideas are NOT kanban tasks: they are a parking lot consulted by the mediator when needed. Creates the directory on first save.",
@@ -1489,7 +1752,7 @@ def _ideas_sorted():
 
 
 class HermesBridge(BaseHTTPRequestHandler):
-    server_version = "HermesBridge/1.9"
+    server_version = "HermesBridge/1.10"
 
     def _send_json(self, data, code=200):
         self.send_response(code)
@@ -1570,14 +1833,8 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_board()
         elif path == "/snapshot":
             self._handle_snapshot()
-        elif path == "/watchdog":
-            self._send_json({"log": self._read_log("logs/kanban-watchdog.log", 15)})
-        elif path == "/tick":
-            self._send_json({"log": self._read_log("logs/quota-governor-tick.log", 10)})
-        elif path == "/health":
-            self._send_json({"log": self._read_log("logs/cron-health-check.log", 5)})
-        elif path == "/efficiency":
-            self._send_json({"log": self._read_log("logs/efficiency-ratio.log", 3)})
+        elif path in _LOG_TAILS:
+            self._send_json({"log": self._read_log(*_LOG_TAILS[path])})
         elif path == "/backup/snapshots":
             self._handle_backup_snapshots()
         elif path == "/backup/stats":
@@ -1600,6 +1857,8 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_metrics(qs)
         elif path == "/metrics-prometheus":
             self._handle_prometheus()
+        elif path == "/presets":
+            self._handle_presets()
         elif path == "/objectives":
             self._handle_objectives(qs)
         elif path == "/bootstrap":
@@ -1688,7 +1947,7 @@ class HermesBridge(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_objectives(self, qs: dict) -> None:
-        """GET /objectives — approved objectives inventory (optional ?status=)."""
+        """GET /objectives — inventory including the P1 columns (?status=)."""
         status = (qs.get("status") or [None])[0]
         rows = _ao_list(status)
         if rows is None:
@@ -1762,6 +2021,16 @@ class HermesBridge(BaseHTTPRequestHandler):
                                        _BOOTSTRAP_LOG_LINES),
                 "health": self._read_log("logs/cron-health-check.log",
                                          _BOOTSTRAP_LOG_LINES)}})
+
+    def _handle_presets(self) -> None:
+        """GET /presets — adjustment_presets inventory (P1 schema)."""
+        rows = _preset_list()
+        if rows is None:
+            self._send_json({"error": "adjustment_presets unavailable "
+                                      "(kanban.db missing or table "
+                                      "absent)"}, 503)
+        else:
+            self._send_json({"presets": rows, "count": len(rows)})
 
     def _handle_get_task(self, qs):
         task_id = (qs.get("task_id") or [""])[0].strip()
@@ -1939,6 +2208,11 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_approve_task(self._read_body())
         elif path == "/verify-task":
             self._handle_verify_task(self._read_body())
+        elif path == "/update-preset":
+            code, resp = _preset_upsert(self._read_body())
+            self._send_json(resp, code)
+        # t_d8df248b: _ao_upsert acepta ademas nice/governance/preset_id/
+        # budget_baseline/budget_adjustment_pct/focus_until (schema P1)
         elif path == "/update-objective":
             code, resp = _ao_upsert(self._read_body())
             self._send_json(resp, code)
@@ -2104,7 +2378,7 @@ class HermesBridge(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Hermes Bridge API v1.9 on http://0.0.0.0:{PORT}")
+    print(f"Hermes Bridge API v1.10 on http://0.0.0.0:{PORT}")
     HTTPServer(("0.0.0.0", PORT), HermesBridge).serve_forever()
 
 
