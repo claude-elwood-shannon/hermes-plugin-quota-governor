@@ -103,6 +103,21 @@ POST (write side, JSON body):
 | `/create-task` | `{"title", "body", "tags"?, "triage"?}` → creates kanban task (default assignee `pr-ollama`, `--created-by mediator`; `triage:true` lands it in triage) |
 | `/move-task` | `{"task_id", "status"}` → move task (ready/triage/blocked/archived/done) |
 | `/comment-task` | `{"task_id", "comment"}` → append comment to the task body |
+| `/save-idea` | `{"title", "body", "tags"?}` → park a brainstorm idea as JSON under `~/.hermes/data/ideas/` (dir created on first save) — v1.7 |
+
+GET `/ideas` (v1.7) returns the parked ideas, newest first:
+
+```json
+{"count": 2, "ideas_dir": "/home/iinstances/.hermes/data/ideas",
+ "ideas": [{"idea_id": "idea_20260917_121530_123", "title": "...",
+            "body": "...", "saved_at": "2026-09-17T12:15:30", "tags": ["..."]}]}
+```
+
+Ideas are NOT kanban tasks and are NOT part of the bootstrap: they are a
+parking lot the mediator consults when it needs them. Every idea file
+carries a unique `idea_id` (`idea_<yyyymmdd>_<hhmmss>_<mmm>` — milliseconds,
+so lexicographic order = creation order); the reader skips corrupt files
+best-effort.
 
 CORS is open (`*`) so browser frontends can call it directly. The server
 binds `0.0.0.0:9120` (Open WebUI reaches it from the LAN as

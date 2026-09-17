@@ -3,7 +3,8 @@
 del bridge (v1.5, t_2c9322f1).
 
 Cubre el success criterion de la tarea:
-  1. capabilities/sysadmin-lan/ existe con manifest.yaml, skill.md, hosts.yaml
+  1. capabilities/sysadmin-lan/ existe con manifest.yaml, skill.md, guard.py
+     y su hosts.yaml vive en ~/.hermes/data/capabilities/sysadmin-lan/
   2. el trigger [capability: sysadmin-lan] (y title/objective) se detecta
   3. operación SSH con permiso → allowed
   4. operación SSH con deny (edit_credentials, ...) → denied
@@ -87,7 +88,18 @@ class TestCapabilityStructure(unittest.TestCase):
     """SC1/SC9: estructura de directorios de las capacidades."""
 
     def test_sysadmin_lan_files(self):
-        for f in ("manifest.yaml", "skill.md", "hosts.yaml", "guard.py"):
+        # hosts.yaml es DATO (IPs/permisos de esta casa): vive en
+        # ~/.hermes/data/, no en el repo (t_7d102e2b).
+        data_hosts = os.path.join(
+            os.path.expanduser("~"), ".hermes", "data", "capabilities",
+            "sysadmin-lan", "hosts.yaml")
+        self.assertTrue(
+            os.path.isfile(data_hosts),
+            "falta ~/.hermes/data/capabilities/sysadmin-lan/hosts.yaml")
+        self.assertFalse(
+            os.path.exists(os.path.join(CAPS, "sysadmin-lan", "hosts.yaml")),
+            "hosts.yaml ya no debe estar en capabilities/sysadmin-lan/")
+        for f in ("manifest.yaml", "skill.md", "guard.py"):
             self.assertTrue(
                 os.path.isfile(os.path.join(CAPS, "sysadmin-lan", f)),
                 f"falta capabilities/sysadmin-lan/{f}")
@@ -316,7 +328,6 @@ class TestMiniyamlConformance(unittest.TestCase):
         sys.path.insert(0, CAPS)
         import _miniyaml
         for rel in ("sysadmin-lan/manifest.yaml",
-                    "sysadmin-lan/hosts.yaml",
                     "self-governance/manifest.yaml"):
             p = os.path.join(CAPS, rel)
             self.assertEqual(_miniyaml.load(p), yaml.safe_load(open(p)),
@@ -344,10 +355,12 @@ class TestApprovedObjective(unittest.TestCase):
 class TestBridgeCapabilitiesEndpoints(unittest.TestCase):
     """SC7/SC8 + negative paths. /status valida estructura (best-effort)."""
 
-    def test_openapi_v16_lists_capabilities(self):
+    def test_openapi_lists_capabilities(self):
+        # la versión del spec evoluciona con cada feature (v1.6 -> v1.7...);
+        # el pin de drift del daemon vivo vive en test_bridge_deploy_sync.py.
         code, body = req("/openapi.json")
         self.assertEqual(code, 200)
-        self.assertEqual(body["info"]["version"], "1.6.0")
+        self.assertRegex(body["info"]["version"], r"^\d+\.\d+\.\d+$")
         self.assertIn("/capabilities", body["paths"])
         self.assertIn("/capabilities/{name}/hosts", body["paths"])
         self.assertIn("/capabilities/{name}/status", body["paths"])

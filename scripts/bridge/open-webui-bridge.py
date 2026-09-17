@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Hermes Bridge API — expone operaciones de Hermes para Open WebUI.
 
+v1.8.0 — t_d8df248b (MEDIATOR 2026-09-17): gobernanza P3 — endpoints de
+      presets y objectives extendidos (schema P1 en kanban.db, t_67876b3f).
+      GET  /presets          — inventario adjustment_presets (5 del sistema)
+      POST /update-preset    — crea/actualiza un preset (solo campos provistos)
+      POST /update-objective — acepta además nice, budget_baseline,
+                               budget_adjustment_pct, governance y preset_id
+                               (validados/tipados); las columnas P1 se añaden
+                               idempotentemente (ALTER) a bases antiguas
+      GET  /objectives       — devuelve también las columnas P1 (SELECT *)
+
 v1.3.0 — fusión de dos tareas mediador sobre la misma base v1.2.0:
   * t_e81f0811: GET /file (lectura restringida de ficheros, preservada intacta)
   * t_3cafd196 (esta): 6 endpoints de gobernanza
@@ -13,6 +23,16 @@ v1.3.0 — fusión de dos tareas mediador sobre la misma base v1.2.0:
     Fix: /move-task llamaba `hermes kanban move` (subcomando inexistente en el
     CLI actual) — ahora triage->todo vía `specify`, todo/blocked->ready vía
     `promote`; otros pares se rechazan.
+
+
+v1.7.0 — t_0c6a7847 (MEDIATOR 2026-09-17): idea parking lot. Las ideas de
+      brainstorming se perdían al terminar la conversación; no son tareas
+      kanban todavía, así que se aparcan como JSON en ~/.hermes/data/ideas/:
+      POST /save-idea — persiste una idea (title+body requeridos), devuelve
+                        idea_id; el directorio se crea al primer POST.
+      GET  /ideas      — lista las ideas guardadas, la más reciente primero.
+      No forman parte del bootstrap: se consultan cuando el mediador las
+      necesita. Sin dependencias nuevas (stdlib).
 
 v1.6.0 — t_74f5f315 (MEDIATOR 2026-09-14): métricas Prometheus.
       GET /metrics-prometheus — texto Prometheus 0.0.4 (pull-only): tasks
@@ -373,6 +393,15 @@ PLUGIN_REPO = os.environ.get("BRIDGE_PLUGIN_REPO") or os.path.dirname(
 PORT = 9120
 MAX_FILE_BYTES = 100 * 1024  # 100 KB por fichero
 KANBAN_DB = os.path.join(HERMES_HOME, "kanban.db")
+# t_0c6a7847 v1.7: idea parking lot — los archivos de ideas viven fuera del
+# bootstrap (no son tareas kanban); el directorio se crea al primer POST.
+IDEAS_DIR = os.path.join(HERMES_HOME, "data", "ideas")
+# idea_<yyyymmdd>_<hhmmss>_<mmm>: el sufijo son MILISEGUNDOS del reloj local,
+# así el orden lexicográfico de los nombres es el orden de creación (la lista
+# "más reciente primero" sale de un sort inverso) y no hay colisión entre
+# saves consecutivos en el mismo segundo; el último tramo se incrementa si el
+# fichero ya existe.
+IDEA_ID_RE = re.compile(r"^idea_[0-9]{8}_[0-9]{6}_[0-9]{3}$")
 METRICS_JSONL = os.path.join(
     HERMES_HOME, "profiles", "pr-ollama", "quota-governor", "metrics-history.jsonl")
 DEFAULT_GIT_REPO = PLUGIN_REPO
@@ -413,7 +442,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.6.0",
+    "info": {"title": "Hermes Bridge", "version": "1.7.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -445,6 +474,21 @@ OPENAPI_SPEC = {
         "/backup/health": {"get": {"summary": "Check backup system health", "description": "Verifies last snapshot age, log errors, cron presence, and repo size.", "operationId": "get_backup_health", "responses": {"200": {"description": "Health status", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_27e6f8f8 2b: GPU ml-host health (SSH probe, cacheless) ----
         "/gpu/health": {"get": {"summary": "GPU ml-host health snapshot", "description": "Probes ml-host (192.168.1.32) over SSH + vLLM HTTP API and returns temperature, VRAM, utilization, active model, service state and today's rounds. Zero dependencies (stdlib only); SSH is best-effort, every failure degrades to null/false.", "operationId": "get_gpu_health", "responses": {"200": {"description": "GPU health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_0c6a7847 v1.7: idea parking lot (~/.hermes/data/ideas/) ----
+        "/save-idea": {"post": {"summary": "Save a brainstorm idea to the parking lot",
+                    "description": "Persists an idea as a JSON file under ~/.hermes/data/ideas/. Ideas are NOT kanban tasks: they are a parking lot consulted by the mediator when needed. Creates the directory on first save.",
+                    "operationId": "save_idea",
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object",
+                        "properties": {"title": {"type": "string"}, "body": {"type": "string"},
+                                       "tags": {"type": "array", "items": {"type": "string"},
+                                                "description": "Optional list of tags"}},
+                        "required": ["title", "body"]}}}},
+                    "responses": {"200": {"description": "Idea saved", "content": {"application/json": {"schema": {"type": "object"}}}},
+                                  "400": {"description": "Missing title or body"}}}},
+        "/ideas": {"get": {"summary": "List saved ideas, newest first",
+                    "description": "Returns the ideas parked under ~/.hermes/data/ideas/, newest first. Not part of the bootstrap: read on demand.",
+                    "operationId": "list_ideas",
+                    "responses": {"200": {"description": "Ideas list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_74f5f315 v1.6: métricas Prometheus (texto 0.0.4) ----
         "/metrics-prometheus": {"get": {"summary": "Prometheus metrics", "description": "Returns bridge/board metrics as Prometheus text format 0.0.4 (pull-only): tasks by status, objective spend/budget, quotas, supply ratio, cron health, GPU ml-host. All sources best-effort; zero dependencies.", "operationId": "get_metrics_prometheus", "responses": {"200": {"description": "Prometheus exposition", "content": {"text/plain": {"schema": {"type": "string"}}}}}}},
         # ---- t_2c9322f1 v1.5: capacidades modulares (SOLO LECTURA) ----
@@ -909,15 +953,23 @@ def _cap_find(name):
 
 def _cap_hosts(cap):
     """Lista de hosts del inventario de la capacidad (o None si no declara
-    hosts_file). Best-effort: error de parseo → (None, error)."""
+    hosts_file). Best-effort: error de parseo → (None, error).
+
+    Rutas relativas se resuelven bajo capabilities/ (sin escapes, path
+    traversal bloqueado). Rutas absolutas (p. ej. ~/.hermes/data/capabilities/
+    <cap>/hosts.yaml — principio plugin=código, ~/.hermes/=datos) se usan
+    tal cual tras expandir ~. Otras formas → fail-closed."""
     m = cap["manifest"]
     hosts_file = m.get("hosts_file")
     if not hosts_file:
         return None, None
-    hpath = os.path.join(cap["dir"], hosts_file)
-    full = _safe_join(_capabilities_root(), hpath)
-    if not full:
-        return None, "hosts_file fuera de capabilities/"
+    if os.path.isabs(hosts_file) or hosts_file.startswith("~/"):
+        full = os.path.expanduser(hosts_file)
+    else:
+        full = _safe_join(_capabilities_root(),
+                          os.path.join(cap["dir"], hosts_file))
+        if not full:
+            return None, "hosts_file fuera de capabilities/"
     try:
         _miniyaml = _cap_miniyaml()
         inv = _miniyaml.load(full)
@@ -1287,6 +1339,44 @@ def _bw_approve_promote_move(task_id, run):
 
 # ------------------------------------------------------------------- server
 
+# ------------------------------------------- idea parking lot (t_0c6a7847)
+
+def _load_idea_file(path):
+    """Lee un fichero de idea y devuelve (idea_id, dict) o (None, None).
+
+    Los ficheros corruptos o ilegibles se saltan silenciosamente (best-effort,
+    misma filosofía que las fuentes de /metrics-prometheus): una idea rota no
+    debe tumbar el inventario entero.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            idea = json.load(f)
+    except Exception:
+        return None, None
+    if not isinstance(idea, dict):
+        return None, None
+    idea_id = idea.get("idea_id")
+    if not isinstance(idea_id, str) or not IDEA_ID_RE.match(idea_id):
+        return None, None
+    return idea_id, idea
+
+
+def _ideas_sorted():
+    """Inventario de ideas: la más reciente primero (best-effort)."""
+    ideas = []
+    try:
+        names = os.listdir(IDEAS_DIR)
+    except OSError:
+        return ideas  # el directorio aún no existe: parking lot vacío
+    for name in sorted(names, reverse=True):
+        if not name.startswith("idea_") or not name.endswith(".json"):
+            continue
+        idea_id, idea = _load_idea_file(os.path.join(IDEAS_DIR, name))
+        if idea_id:
+            ideas.append(idea)
+    return ideas
+
+
 class HermesBridge(BaseHTTPRequestHandler):
     server_version = "HermesBridge/1.6"
 
@@ -1401,6 +1491,8 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_prometheus()
         elif path == "/objectives":
             self._handle_objectives(qs)
+        elif path == "/ideas":
+            self._handle_ideas()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1668,6 +1760,8 @@ class HermesBridge(BaseHTTPRequestHandler):
         elif path == "/update-objective":
             code, resp = _ao_upsert(self._read_body())
             self._send_json(resp, code)
+        elif path == "/save-idea":
+            self._handle_save_idea(self._read_body())
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1764,6 +1858,58 @@ class HermesBridge(BaseHTTPRequestHandler):
                                     "error": "task not found"}, 404)
         self._send_json(_verify_logic(t))
 
+    # ---- v1.7: idea parking lot (t_0c6a7847) ----
+
+    def _handle_save_idea(self, data: dict) -> None:
+        """POST /save-idea — aparca una idea como JSON en ~/.hermes/data/ideas/.
+
+        Las ideas NO son tareas kanban: es un parking lot que el mediador
+        consulta cuando las necesita (nunca en el bootstrap). El directorio se
+        crea en el primer POST.
+        """
+        title = (data.get("title") or "").strip() if isinstance(data, dict) else ""
+        body = (data.get("body") or "").strip() if isinstance(data, dict) else ""
+        if not title or not body:
+            return self._send_json({
+                "saved": False,
+                "error": "title and body are required",
+                "hint": 'POST {"title": "...", "body": "..."}'}, 400)
+        now = time.localtime()
+        tags = data.get("tags")
+        idea = {"title": title,
+                "body": body,
+                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", now)}
+        if isinstance(tags, list) and tags:
+            idea["tags"] = [str(t) for t in tags if str(t).strip()]
+        try:
+            os.makedirs(IDEAS_DIR, exist_ok=True)
+            t = time.time()
+            base = time.strftime("idea_%Y%m%d_%H%M%S", time.localtime(t))
+            ms = int(t * 1000) % 1000
+            idea_id = path = ""
+            for bump in range(1000):
+                candidate = f"{base}_{(ms + bump) % 1000:03d}"
+                candidate_path = os.path.join(IDEAS_DIR, f"{candidate}.json")
+                if not os.path.exists(candidate_path):
+                    idea_id, path = candidate, candidate_path
+                    break
+            else:  # 1000 ideas en el mismo milisegundo: ceder
+                return self._send_json({"saved": False,
+                                        "error": "idea id space exhausted"}, 500)
+            idea = {"idea_id": idea_id, **idea}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(idea, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return self._send_json({"saved": False, "error": f"write failed: {e}"}, 500)
+        self._send_json({"saved": True, "idea_id": idea_id,
+                         "path": os.path.join("data", "ideas", f"{idea_id}.json")})
+
+    def _handle_ideas(self) -> None:
+        """GET /ideas — inventario del parking lot, la más reciente primero."""
+        ideas = _ideas_sorted()
+        self._send_json({"count": len(ideas), "ideas_dir": IDEAS_DIR,
+                         "ideas": ideas})
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1776,7 +1922,7 @@ class HermesBridge(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Hermes Bridge API v1.6 on http://0.0.0.0:{PORT}")
+    print(f"Hermes Bridge API v1.7 on http://0.0.0.0:{PORT}")
     HTTPServer(("0.0.0.0", PORT), HermesBridge).serve_forever()
 
 
