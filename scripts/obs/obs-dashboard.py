@@ -481,6 +481,48 @@ def _alerts_section(alerts: list) -> list:
 # Build the actual HTML
 # ---------------------------------------------------------------------------
 
+def _html_header(agg: dict, has_any: bool, gen: str, win: str) -> list:
+    """Doc, head, page header and the no-sources banner (if any)."""
+    body_lines = [
+        "<!doctype html>",
+        '<html lang="es">', "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>La casa — observabilidad</title>",
+        f"<style>{_CSS}</style>", "</head>", "<body>", '<div class="wrap">',
+        "<header><h1>La casa — observabilidad</h1>",
+        '<div class="gen">generado ' + gen + win + ' · OBJ-32 v0 · solo lectura</div></header>',
+    ]
+    if not has_any:
+        body_lines.append('<div class="banner">sin fuentes todavía — no se '
+                         'encontraron trace, forecast, ni kanban.db bajo el '
+                         'HERMES_HOME activo; revisa cómo lo fija el cron de '
+                         'morning-screen.</div>')
+    return body_lines
+
+
+def _html_top_objs(agg: dict) -> list:
+    """Top-8 spend table by objective; unattributed always shown (swap-in)."""
+    obj_sorted = sorted(agg["by_obj"].items(),
+                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
+    top = obj_sorted[:8]
+    if "unattributed" in agg["by_obj"] and \
+            "unattributed" not in {n for n, _ in top} and top:
+        top = top[:-1] + [("unattributed", agg["by_obj"]["unattributed"])]
+    return _objetivos_section(top, agg)
+
+
+def _html_footer() -> list:
+    """Trailing sources note and closing tags."""
+    return [
+        ' <footer>fuentes (solo lectura): quota-governor/obs/trace.jsonl · ' +
+        'quota-governor/forecast.json · quota-governor/metrics-history.jsonl · ' +
+        'kanban.db<br>regenerar: <code>python3 scripts/obs/obs-dashboard.py</code>' +
+        ' · servir en vivo: <code>--serve</code> (127.0.0.1 ' +
+        'únicamente) · OBJ-32 v0 — stdlib, cero dependencias</footer>',
+        "</div>", "</body>", "</html>"]
+
+
 def build_html(hermes_home=None, now=None) -> str:
     """The whole page. Pure function of the read‑only sources."""
     now = time.time() if now is None else float(now)
@@ -500,43 +542,18 @@ def build_html(hermes_home=None, now=None) -> str:
         win = (
             f" · ventana trace {ms._fmt_ts(agg['first_ts'])} →"
             f" {ms._fmt_ts(agg['last_ts'])}")
-    body_lines = [
-        "<!doctype html>", '<html lang="es">', "<head>",
-        '<meta charset="utf-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        "<title>La casa — observabilidad</title>",
-        f"<style>{_CSS}</style>", "</head>", "<body>", '<div class="wrap">',
-        "<header><h1>La casa — observabilidad</h1>",
-        '<div class="gen">generado ' + gen + win + ' · OBJ-32 v0 · solo lectura</div></header>',
-    ]
-    if not has_any:
-        body_lines.append('<div class="banner">sin fuentes todavía — no se '
-                         'encontraron trace, forecast, ni kanban.db bajo el '
-                         'HERMES_HOME activo; revisa cómo lo fija el cron de '
-                         'morning-screen.</div>')
+    body_lines = _html_header(agg, has_any, gen, win)
     # sections
     body_lines += _kpi_section(agg, board, budget, now)
     cls_sorted = sorted(agg["by_class"].items(),
                         key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
     body_lines += _gasto_por_clase_section(cls_sorted, agg, series)
-    obj_sorted = sorted(agg["by_obj"].items(),
-                        key=lambda kv: (-kv[1]["usd"], -kv[1]["n"]))
-    top = obj_sorted[:8]
-    if "unattributed" in agg["by_obj"] and \
-            "unattributed" not in {n for n, _ in top} and top:
-        top = top[:-1] + [("unattributed", agg["by_obj"]["unattributed"])]
-    body_lines += _objetivos_section(top, agg)
+    body_lines += _html_top_objs(agg)
     body_lines += _forecast_section(verdicts, fc)
     body_lines += _board_section(board)
     if alerts:
         body_lines += _alerts_section(alerts)
-    body_lines += [
-        ' <footer>fuentes (solo lectura): quota-governor/obs/trace.jsonl · ' +
-                 'quota-governor/forecast.json · quota-governor/metrics-history.jsonl · ' +
-                 'kanban.db<br>regenerar: <code>python3 scripts/obs/obs-dashboard.py</code>' +
-                 ' · servir en vivo: <code>--serve</code> (127.0.0.1 ' +
-                 'únicamente) · OBJ-32 v0 — stdlib, cero dependencias</footer>',
-        "</div>", "</body>", "</html>"]
+    body_lines += _html_footer()
     return "\n".join(body_lines)
 
 # ---------------------------------------------------------------------------
