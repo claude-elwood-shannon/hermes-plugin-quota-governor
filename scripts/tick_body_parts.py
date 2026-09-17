@@ -144,6 +144,7 @@ AUDIT_MARKER = "[done-verify]"
 
 
 def get_hermes_home() -> Path:
+    """HERMES_HOME env override or ~/.hermes, resolved (profile homes included; see _get_hermes_root for the shared-root nuance)."""
     val = os.environ.get("HERMES_HOME", "").strip()
     return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
@@ -166,6 +167,7 @@ def _get_hermes_root() -> Path:
 
 
 def kanban_db_path(hermes_home=None) -> Path:
+    """Shared board DB path: HERMES_KANBAN_DB override, then explicit home, then the shared root (never a profile home; t_99e3b849)."""
     env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if env_db:
         return Path(env_db).expanduser().resolve()
@@ -175,6 +177,7 @@ def kanban_db_path(hermes_home=None) -> Path:
 
 
 def ledger_path(hermes_home=None) -> Path:
+    """Cola-viva ledger (quota-governor/cola-viva.jsonl) under the given (or default) Hermes home."""
     base = Path(hermes_home) if hermes_home else get_hermes_home()
     return base / "quota-governor" / "cola-viva.jsonl"
 
@@ -322,6 +325,7 @@ def parts_label(nums: list) -> str:
 
 
 def first_tag(body: str, tag: str) -> str:
+    """First whitespace token of a header tag's value ("cost:tiny (...)" -> 'tiny'), empty string when absent."""
     m = TAG_RE[tag].search(body or "")
     if not m:
         return ""
@@ -330,6 +334,7 @@ def first_tag(body: str, tag: str) -> str:
 
 
 def is_clase_c(body: str) -> bool:
+    """True when the body carries the clase:C marker (auto-successor mandate, same convention as tick-cola-viva.py)."""
     return bool(CLASE_C_RE.search(body or ""))
 
 
@@ -517,6 +522,7 @@ def _cli(*args, timeout=60):
 
 
 def create_task(title: str, body: str, assignee: str) -> str | None:
+    """Create a task via the hermes kanban CLI and return its id, or None on failure (rc!=0 or unparseable output)."""
     r = _cli("create", title, "--assignee", assignee, "--workspace", "scratch",
              "--body", body, "--json")
     if r.returncode != 0:
@@ -529,6 +535,7 @@ def create_task(title: str, body: str, assignee: str) -> str | None:
 
 
 def comment_task(task_id: str, text: str) -> bool:
+    """Post a comment authored as 'tick-body-parts'; True on rc=0."""
     return _cli("comment", task_id, text,
                 "--author", "tick-body-parts").returncode == 0
 
@@ -635,6 +642,7 @@ def cascade_step(db_path, ledger, execute: bool = False,
 
 
 def main(argv=None) -> int:
+    """CLI: --scan prints the findings table; otherwise run one cascade step (dry-run unless --execute). Always exits 0."""
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     p.add_argument("--execute", action="store_true",
                    help="actually create/comment (default: dry-run)")

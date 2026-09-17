@@ -56,24 +56,29 @@ GPU_CACHE_MAX_AGE_S = 2 * 3600  # cache older than this = no live view
 
 
 def get_hermes_home() -> Path:
+    """HERMES_HOME env override or ~/.hermes, resolved. Every path in this module derives from it (no absolute host paths)."""
     val = os.environ.get("HERMES_HOME", "").strip()
     return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
 
 def state_dir(hermes_home=None) -> Path:
+    """quota-governor state directory under the given (or default) Hermes home."""
     base = Path(hermes_home) if hermes_home else get_hermes_home()
     return base / "quota-governor"
 
 
 def trace_path(hermes_home=None) -> Path:
+    """OBJ-27 F0 consumption trace (trace.jsonl) under the state dir."""
     return state_dir(hermes_home) / "obs" / "trace.jsonl"
 
 
 def forecast_path(hermes_home=None) -> Path:
+    """OBJ-24 F2 EMA burn-rate forecast (forecast.json) under the state dir."""
     return state_dir(hermes_home) / "forecast.json"
 
 
 def metrics_path(hermes_home=None) -> Path:
+    """Metrics history ledger (metrics-history.jsonl) under the state dir."""
     return state_dir(hermes_home) / "metrics-history.jsonl"
 
 
@@ -104,6 +109,7 @@ def _candidate_homes(hermes_home=None) -> list:
 
 
 def kanban_db_path(hermes_home=None) -> Path:
+    """Shared board DB: first EXISTING candidate home's kanban.db (root then profile homes), else the base home path. Candidate homes are overridable via QUOTA_GOVERNOR_PROFILE_HOMES for tests."""
     for home in _candidate_homes(hermes_home):
         p = home / "kanban.db"
         if p.exists():
@@ -340,6 +346,7 @@ _supply_ratio_cache: dict | None = None
 
 
 def cola_viva_log_path(hermes_home=None) -> Path:
+    """Cola-viva decision ledger (cola-viva.jsonl) under the state dir."""
     return state_dir(hermes_home) / "cola-viva.jsonl"
 
 
@@ -946,6 +953,7 @@ def build_screen(hermes_home=None) -> str:
 
 
 def main(argv=None) -> int:
+    """Build and print the consumption screen. Always exits 0."""
     screen = build_screen()
     if screen:
         print(screen)

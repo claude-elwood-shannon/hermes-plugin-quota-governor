@@ -23,6 +23,7 @@ REASSIGNABLE_STATUSES = {"ready", "todo", "triage"}
 # ── Profile discovery (G1) ────────────────────────────────────────────────────
 
 def get_existing_profiles() -> Set[str]:
+    """Profile names reported by 'hermes profile list'; falls back to ALLOWED_PROFILES when discovery fails or returns nothing."""
     try:
         proc = subprocess.run(
             ["hermes", "profile", "list"], capture_output=True, text=True, timeout=20
@@ -44,6 +45,7 @@ def get_existing_profiles() -> Set[str]:
 
 
 def compute_valid_profiles() -> Tuple[List[str], Set[str]]:
+    """Intersect discovered profiles with ALLOWED_PROFILES, preference-ordered. Returns (ordered_list, valid_set)."""
     existing = get_existing_profiles()
     valid_set = existing & ALLOWED_PROFILES
     ordered = [p for p in PROFILE_PREFERENCE if p in valid_set]
@@ -53,6 +55,7 @@ def compute_valid_profiles() -> Tuple[List[str], Set[str]]:
 # ── Database helper ─────────────────────────────────────────────────────────────
 
 def find_invalid_assignee_tasks(conn: sqlite3.Connection, valid_set: Set[str]) -> List[Tuple[str, str, str, str]]:
+    """Assignable tasks (ready/todo/triage) whose assignee is outside valid_set. Returns (task_id, title, assignee, status) tuples."""
     rows = conn.execute(
         "SELECT id, title, assignee, status FROM tasks WHERE status IN ('ready','todo','triage')"
     ).fetchall()
@@ -68,6 +71,7 @@ def find_invalid_assignee_tasks(conn: sqlite3.Connection, valid_set: Set[str]) -
 # ── Reassignment ─────────────────────────────────────────────────────────────
 
 def reassign_task(task_id: str, correct_profile: str) -> bool:
+    """Reassign one task via the hermes kanban CLI. True on rc=0; False plus an stderr line on failure."""
     try:
         result = subprocess.run(
             ["hermes", "kanban", "assign", task_id, correct_profile],
@@ -83,6 +87,7 @@ def reassign_task(task_id: str, correct_profile: str) -> bool:
 # ── Argument parsing ──────────────────────────────────────────────────
 
 def parse_arguments() -> argparse.Namespace:
+    """Parse the --dry-run and --verbose flags."""
     parser = argparse.ArgumentParser(
         description="Deterministic G1 profile‑validation enforcement (OBJ‑08)."
     )
@@ -93,6 +98,7 @@ def parse_arguments() -> argparse.Namespace:
 # ── Core processing (to keep main small) ─────────────────────────────────────
 
 def process_tasks(args: argparse.Namespace, ordered_valid: List[str], valid_set: Set[str]) -> int:
+    """Reassign (or dry-run print) every invalid-assignee task to the first valid profile. Returns 0 always; non-empty stdout signals changes to the cron layer."""
     if not os.path.isfile(KANBAN_DB):
         if args.verbose:
             print(f"VERBOSE: kanban.db not found at {KANBAN_DB}")
@@ -125,6 +131,7 @@ def process_tasks(args: argparse.Namespace, ordered_valid: List[str], valid_set:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
+    """Entry point: compute valid profiles and fix invalid assignees. Returns 0, silently no-op when no valid profiles exist."""
     args = parse_arguments()
     ordered_valid, valid_set = compute_valid_profiles()
     if args.verbose:

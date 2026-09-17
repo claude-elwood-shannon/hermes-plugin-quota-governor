@@ -99,6 +99,7 @@ def header_bounds(lines: List[str]) -> int:
 
 
 def objective_of(body: str) -> Optional[str]:
+    """Upper-case objective tag of the task, searched over the WHOLE body (OBJ-20: footer-only tags count too), or None."""
     # Search the WHOLE body, not just the tag header: some tasks carry the
     # objective: tag only in the footer (below the first blank line), and a
     # header-only match would silently drop them from their objective group
@@ -108,6 +109,7 @@ def objective_of(body: str) -> Optional[str]:
 
 
 def has_abandoned_stamp(body: str) -> bool:
+    """True when the tag header already carries an 'abandoned:' line (header-only convention; prose mentions never count)."""
     return any(ABANDONED_TAG_RE.match(ln) for ln in header_of(body or "").splitlines())
 
 
@@ -128,6 +130,7 @@ def norm_title(title: str) -> str:
 
 
 def load_board(db_path: str) -> List[Dict[str, Any]]:
+    """Read the whole tasks table read-only as dicts (id, title, status, body, created_at, completed_at)."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -180,6 +183,7 @@ def supersession_evidence(lost: Dict[str, Any],
 
 
 def build_stamp_line(reason: str, superseder_ids: List[str]) -> str:
+    """Build the 'abandoned: superseded-by <ids> -- <reason>' tag-header line (ids capped at 8 for header readability)."""
     ids = ",".join(superseder_ids[:8])  # cap for header readability
     return f"abandoned: superseded-by {ids} — {reason}"
 
@@ -253,6 +257,7 @@ def execute_plan(conn: sqlite3.Connection, plan: Dict[str, Any]) -> bool:
 
 
 def log_stamp(plan: Dict[str, Any], log_path: str) -> None:
+    """Append one applied stamp to the JSONL audit log, creating the target directory if needed."""
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     record = {
         "ts": int(time.time()),
@@ -266,6 +271,7 @@ def log_stamp(plan: Dict[str, Any], log_path: str) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """CLI: dry-run by default prints the stamp plan; --execute applies stamps under the status-guarded CAS and logs them. Exit 0 on success (incl. no-op), 1 on catastrophic error."""
     ap = argparse.ArgumentParser(
         description="Stamp abandoned: on archived lost tasks whose work was "
                     "superseded (OBJ-08 detector convention). Dry-run by default.")

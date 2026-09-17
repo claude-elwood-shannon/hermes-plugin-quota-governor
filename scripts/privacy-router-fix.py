@@ -60,6 +60,7 @@ CONFIDENTIAL_TAGS = {"confidential", "conf", "intimo"}
 # ── Privacy tag parsing ──────────────────────────────────────────────────────
 
 def parse_privacy_tag(body: str) -> Optional[str]:
+    """Value of the task's 'privacy:' tag line (lowercased, quotes stripped), or None when the body carries none."""
     if not body:
         return None
     for line in body.splitlines():
@@ -70,14 +71,17 @@ def parse_privacy_tag(body: str) -> Optional[str]:
     return None
 
 def is_sensitive(privacy_value: Optional[str]) -> bool:
+    """True when the privacy tag routes under the sensitive policy (high/sensitive/medium)."""
     return bool(privacy_value and privacy_value.lower() in SENSITIVE_TAGS)
 
 def is_confidential(privacy_value: Optional[str]) -> bool:
+    """True when the privacy tag routes under the confidential policy (confidential/conf/intimo): strictest tier, never a cloud profile."""
     return bool(privacy_value and privacy_value.lower() in CONFIDENTIAL_TAGS)
 
 # ── Privacy gate query ──────────────────────────────────────────────────────
 
 def query_privacy_gate() -> Optional[str]:
+    """Run privacy-gate.sh high and return its JSON 'context.recommended_profile', or None when the gate is missing, fails or yields no recommendation."""
     if not os.path.isfile(PRIVACY_GATE):
         print(f"ERROR: privacy-gate.sh not found at {PRIVACY_GATE}", file=sys.stderr)
         return None
@@ -111,6 +115,7 @@ def query_privacy_gate() -> Optional[str]:
 # ── Kanban DB query ──────────────────────────────────────────────────────────
 
 def find_misrouted_sensitive_tasks(conn: sqlite3.Connection, correct_profile: str) -> list:
+    """Live tasks tagged privacy-sensitive whose assignee is NOT a sensitive-capable profile. Returns (task_id, title, assignee, privacy, status) tuples."""
     misrouted=[]
     rows=conn.execute("SELECT id,title,body,assignee,status FROM tasks WHERE status NOT IN ('done','archived','blocked','running')").fetchall()
     for row in rows:
@@ -121,6 +126,7 @@ def find_misrouted_sensitive_tasks(conn: sqlite3.Connection, correct_profile: st
     return misrouted
 
 def find_misrouted_confidential_tasks(conn: sqlite3.Connection) -> list:
+    """Live tasks tagged privacy-confidential assigned to ANY profile (no local provider exists, so every assignment is a violation to flag). Returns (task_id, title, assignee, privacy, status) tuples."""
     misrouted=[]
     rows=conn.execute("SELECT id,title,body,assignee,status FROM tasks WHERE status NOT IN ('done','archived','blocked','running')").fetchall()
     for row in rows:
@@ -133,6 +139,7 @@ def find_misrouted_confidential_tasks(conn: sqlite3.Connection) -> list:
 # ── Reassignment ─────────────────────────────────────────────────────────────
 
 def reassign_task(task_id: str, correct_profile: str) -> bool:
+    """Reassign one task via the hermes kanban CLI. True on rc=0; False plus an stderr line on failure."""
     try:
         result=subprocess.run(['hermes','kanban','assign',task_id,correct_profile],capture_output=True,text=True,timeout=10)
         return result.returncode==0
@@ -180,6 +187,7 @@ def _handle_misrouted(conn,correct_profile,dry_run,verbose):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    """Query the gate, reassign misrouted sensitive tasks and warn on confidential ones. Returns 0 even on no-op; a missing DB or gate recommendation is a silent exit."""
     args=_parse_args()
     conn=_prepare_connection()
     if not conn:
