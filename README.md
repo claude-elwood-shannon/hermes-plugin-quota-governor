@@ -1,61 +1,20 @@
-# hermes-plugin-quota-governor
-
-## Objectives status
-- 1: Initial plugin setup and documentation
-- 2: Add basic quota governor mechanism
-- 3: Implement observation hooks for task lifecycle
-- 4: Add per-model cost ledger
-- 5: Add quota time-series sampling
-- 6: Implement privacy routing matrix
-- 7: Add disaster recovery procedures
-- 8: Implement weekly objective progress reporting
-- 9: Add zombie guard for stale tasks
-- 10: Implement predictive quota forecasting
-- 11: Add per-request billing visibility for NanoGPT
-- 12: Add dynamic task generation for autonomous plugins
-- 13: Add autonomous objectives tracking
-- 14: Add observer dashboards
-- 15: Add task cost estimation
-- 16: Add model matrix documentation
-- 17: Add privacy by provider design
-- 18: Add opencode go reset semantics
-- 19: Add dynamic task generation
-- 20: Add autonomous-objectives.md
-- 21: Add privacy-routing-matrix.md
-- 22: Add rust-projects-to-contribute.md
-- 23: Add skills-discovery.md
-- 24: Add obj-07-audit.md
-- 25: Add disaster-recovery.md
-- 26: Objective 26: Description placeholder
-- 27: Objective 27: Description placeholder
-- 28: Objective 28: Description placeholder
-- 29: Objective 29: Description placeholder
-- 30: Objective 30: Description placeholder
-- 31: Objective 31: Description placeholder
-- 32: Objective 32: Description placeholder
-- 33: Objective 33: Description placeholder
-- 34: Objective 34: Description placeholder
-- 35: Objective 35: Description placeholder
-- 36: Objective 36: Description placeholder
-- 37: Objective 37: Description placeholder
-- 38: Objective 38: Description placeholder
-- 39: Objective 39: Description placeholder
-- 40: Objective 40: Description placeholder
-- 41: Objective 41: Description placeholder
-- 42: Objective 42: Description placeholder
-- 43: Objective 43: Description placeholder
-- 44: Objective 44: Description placeholder
+# self-govern
 
 [![tests](https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor/actions/workflows/tests.yml/badge.svg)](https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org)
 
-> Hermes Agent plugin: self-governance by quota
+> **Hermes puede hacer cualquier cosa, y self-govern le ayuda a hacerlo de forma autónoma, con presupuesto, con calidad, y con observabilidad.**
 
-A Hermes Agent plugin that observes the kanban lifecycle, queries provider
-quota in real time, and coordinates the kanban daemon accordingly — so the
-agent can self-organise work based on available quota without human
-intervention.
+A Hermes Agent plugin that turns an agent runtime into a self-governing
+workspace: a kanban board where workers claim and close tasks on their own,
+a quota governor that decides how much work the house can afford right now,
+a mediator bridge so a human steers without babysitting, and an
+observability stack so every decision leaves evidence.
+
+It is installed as the Hermes plugin `self-govern` (repo:
+`hermes-plugin-quota-governor`; older checkouts name the plugin
+`quota-governor` in `plugin.yaml`).
 
 ## Why this exists
 
@@ -69,34 +28,99 @@ The governor closes that loop: observe (kanban lifecycle + provider quota)
 → decide (a deterministic heuristic, no LLM in the loop) → act
 (start/stop/scale the worker daemon). It has governed a multi-agent
 workspace continuously since then, and grew the pieces nobody publishes
-and we needed most:
+and we needed most.
 
-- a **per-model cost ledger** calibrated against real provider billing —
-  Hermes does not persist the API cost field, so the ledger estimates from
-  token counts × published prices as a conservative upper bound;
-- a **quota time-series** sampled with zero extra API calls, driving
-  threshold forecasts;
-- **per-task cost prediction** (median/p90 by objective) trained on its own
-  observation data.
+## The usage model: human + mediator, an iterative cycle
 
-`docs/` carries the calibration notes, the per-model matrix and the design
-records — the measurements are the point, not an afterthought.
+One human, a bounded budget, and agents that keep working between looks.
+The loop that makes that work:
+
+```
+        ┌────────────────────────────────────────────────────────┐
+        │                                                        │
+        ▼                                                        │
+  HUMAN (direction, taste, budget)                               │
+    │  ratifies objectives, approves budgets, arbitrates         │
+    ▼                                                            │
+  MEDIATOR (Open WebUI or any frontend)                          │
+    │  writes tasks into triage via the bridge HTTP API          │
+    ▼                                                            │
+  BOARD (kanban) ──► DISPATCHER assigns by quota & cost class    │
+    │                    │                                       │
+    ▼                    ▼                                       │
+  WORKERS claim → heartbeat → work → close with evidence         │
+    │                    │                                       │
+    ▼                    ▼                                       │
+  GOVERNOR observes quota & lifecycle ──► scales/starts/stops    │
+    │                                                            │
+    ▼                                                            │
+  OBSERVABILITY (portal, morning report, ledgers, forecasts) ────┘
+       every cycle returns evidence for the next human decision
+```
+
+- **The human** owns direction: objectives (OBJ), budgets, and anything
+  tagged as needing approval. Governance guardrails (GR1–GR11,
+  `docs/guardrails-autonomous-objectives.md`) bound what the system may
+  propose by itself — nothing outside the plugin repo or `~/.hermes/`,
+  no new credentials without approval.
+- **The mediator** is the human's hands between visits: it creates tasks,
+  moves and comments on them through the bridge
+  (`docs/bridge-open-webui.md`). A single `GET /bootstrap` call hands any
+  newcomer the whole context: plugin info, board stats, objectives,
+  capabilities, health.
+- **The cycle is iterative**: every closure leaves evidence (tests, docs,
+  metrics); every morning the board reports its night unasked; the next
+  wave of tasks grows from that evidence, not from filler.
+
+The flight constitution, ratified three times by the owner:
+free quota available → fly; no free quota but approved budget → fly with a
+cap; neither → stop, and only after verifying reality — a "we're out of
+quota" claim must be earned by a check, never recited.
 
 ## What it does
 
-The governor has five behaviours, wired as plugin hooks:
+Capabilities, each with its own doc where one exists:
 
-| Hook | Fires in | What it does |
-|------|----------|-------------|
-| `kanban_task_claimed` | Dispatcher | Queries quota before a worker spawns; writes stop-signal if critical |
-| `kanban_task_completed` | Worker | Records task cost; re-evaluates quota after completion |
-| `kanban_task_blocked` | Worker | Records blocked tasks for audit |
-| `post_tool_call` | Any session | Lightweight quota sampling every 50 tool calls |
-| `on_session_end` | Any session | Final quota snapshot when session closes |
-
-All hooks are **observer-only** — they record and signal, never veto. The
-cron layer (a `no_agent=True` script) reads the signals and controls the
-daemon.
+- **Quota governance** — multi-provider quota polling (Ollama Cloud,
+  NanoGPT, OpenRouter, OpenCode Go), a three-state decision model
+  (`run` / `paying` / `stop`), and a cron tick (zero tokens) that starts,
+  scales or stops the worker daemon. Observer-only plugin hooks record the
+  lifecycle; the cron layer acts.
+- **Autonomous objectives** — the system proposes, budgets and closes its
+  own improvement objectives (`OBJ-*`) inside guardrails; per-objective
+  budgets aggregate real spend (`docs/objectives.md`,
+  `docs/obj28-budget-by-objective-design.md`).
+- **Per-model cost ledger** — append-only per-session×model×task cost rows
+  (Hermes does not persist API cost; the ledger estimates from tokens ×
+  published prices, a conservative upper bound), auto-synced on every gate
+  run. `python3 scripts/model-cost-ledger.py report [--json] [--last 24h]`.
+- **Predictive quota** — time-series collector, EMA burn-rate forecaster
+  with ETA to the 90% milestone, per-task budget checks, and a backtest
+  harness that measures whether the forecast actually hits
+  (`docs/quota-planner.md`). All `no_agent` cron — the predictive layer
+  never spends tokens.
+- **Deterministic zombie guard** — a running task without a live heartbeat
+  past the threshold silences the task creator, enforced in the gate
+  snapshot, not in a prompt.
+- **Mediator bridge** — zero-dependency HTTP server (port 9120) exposing
+  board read/write operations to Open WebUI or any frontend, with an
+  OpenAPI description at `/openapi.json` (`docs/bridge-open-webui.md`).
+- **Modular capabilities** — optional capability packs under
+  `capabilities/` (e.g. `sysadmin-lan` for LAN sysadmin work) with
+  fail-closed manifest guards: operations outside the manifest are blocked
+  and logged (`capabilities/README.md`).
+- **Observability** — local trace JSONL with OpenTelemetry semantic
+  conventions, optional OTLP export, local portal on :8917, morning report
+  at 08:00, efficiency-ratio and burn watchdogs
+  (`docs/obs-portal.md`, `docs/obs-otlp.md`).
+- **Weekly objective progress** — regenerates per-objective progress and
+  renders the ISO-week report from `objective:OBJ-NN` tags alone.
+- **GPU health** — the portal's GPU page shows temperature, VRAM,
+  utilization and the active vLLM model, with thermal guardrails
+  (`docs/gpu-health-config.md`).
+- **Per-request billing visibility** — NanoGPT per-request rows expose
+  subscription-covered vs balance-draining spend, always as separate
+  accumulators, never merged with probe-derived meters.
 
 ## Providers
 
@@ -106,202 +130,6 @@ daemon.
 | NanoGPT | `GET /api/subscription/v1/usage` | Daily % + Weekly tokens % | Informational |
 | OpenRouter | `GET /api/v1/key` | USD (weekly/monthly) | Informational |
 | OpenCode Go | `GET /zen/go/v1/usage` | Rolling 5h + Weekly + Monthly % | Yes (pr-opencode) |
-
-Only Ollama Cloud's session/weekly windows map cleanly to the "should I
-keep spawning workers?" decision. NanoGPT and OpenRouter are reported as
-context.
-
-## Per-model cost ledger (MULTI-PROV-09)
-
-One model can silently burn most of an OpenCode Go 5h window (the Sep 7
-2026 incident: glm-5.2 alone took 82% of the $12 window). The
-`model-cost-ledger.py` script makes that visible without opening the
-console:
-
-- **Ledger**: `~/.hermes/quota-governor/model-cost-ledger.jsonl`
-  (append-only, one JSON row per session×model×task usage *delta*):
-  `{ts, window, profile, model, cost, request_count, tokens{in,out,cache_read}, session_id, task}`.
-  `window` is the ISO UTC start of the rolling 5h window, anchored to the
-  live `rolling.resetsAt` (windows roll; they are NOT fixed clock hours).
-- **Source of truth**: Hermes does not persist the API `cost` field
-  (`session_model_usage.estimated_cost_usd` is always 0 — verified Sep 7),
-  so the ledger estimates `cost = tokens × published prices`
-  (input, output+reasoning, cache_read; cache_write excluded). Calibrated
-  live Sep 7 2026 against the console's per-model table, the estimate is a
-  CONSERVATIVE UPPER BOUND (+16%..+125%: Hermes records the full prompt as
-  input on every call while the provider meters cached context at the
-  cheaper cache-read rate) — warnings fire early, never late; request and
-  token counts per model are exact. Recalibrate the price triples after
-  ~1 week of data via `~/.hermes/quota-governor/model-cost.json`
-  (`{"prices": {model: [in, out, cache]}, "window_usd": 12.0,
-  "warn_fraction": 0.5}`) — no code change needed.
-- **Automatic sync**: quota-gate.py opportunistically syncs the ledger on
-  every cron run (throttled to ≤1 sync/20 min; the gate cron cadence is
-  30 min) — zero extra API calls, zero tokens. The FIRST sync after
-  deployment is a historical catch-up batch (whole pre-existing sessions
-  land in the window of their last activity); from then on 30-min deltas
-  track the right window closely.
-- **Gate integration**: the snapshot's `context.model_cost` carries the
-  current-window per-model shares, and any model over `warn_fraction`
-  (default 50%) of the window budget injects a
-  `WARNING: <model> consumed NN% of the OpenCode Go 5h window…` line into
-  `context.warning` for the task creator. All ledger failures degrade to
-  silence — observability never breaks the gate.
-- **Queries**: `python3 scripts/model-cost-ledger.py report [--json] [--last 24h]`
-  reproduces the console's per-model consumption table; `sync` forces an
-  immediate accumulation pass.
-- **Re-baselining**: delete BOTH `model-cost-ledger.jsonl` and
-  `model-cost-ledger.cursor.json` together (deleting only the ledger
-  would re-count from the cursor and lose history; deleting only the
-  cursor would double-count).
-
-## Weekly objective progress (OBJ-08)
-
-`scripts/weekly-progress.py` regenerates
-`~/.hermes/quota-governor/objective-progress.json` in the multi-objective
-structure of `autonomous-objectives.md` §4 (one entry per `OBJ-NN`: status,
-`last_task_created`, `tasks_completed`) purely from the `objective:OBJ-NN`
-header tags in kanban.db, and renders the ISO-week report §7 calls for into
-`~/.hermes/profiles/pr-ollama/docs/weekly-reports/YYYY-WW-weekly-summary.md`
-(objectives completed vs in progress, tasks completed in the window, quota
-consumed per provider from the model-cost + burn ledgers).
-
-- Dry-run by default; `--execute` writes (atomic tmp+rename, fully
-  regenerated -> idempotent).
-- `awaiting_human_verification` for OBJ-01 (§4: human check required);
-  `needs_attention` when tagged tasks were lost (archived without
-  `completed_at`).
-- Cron (register once):
-  `hermes cron create weekly-progress --name weekly-progress --script weekly-progress-cron.sh --no-agent --deliver local "0 23 * * 0"`
-
-## GPU health section (OBJ-27)
-
-The observability portal's **GPU ml-host** page
-(`scripts/obs/portal-build.py` → `read_gpu_health` / `page_gpu`) shows
-temperature, VRAM, utilization, the active vLLM model, daily rounds, service
-state and a thermal sparkline. Its configuration surface is documented in
-[`docs/gpu-health-config.md`](docs/gpu-health-config.md) — note there is
-currently **no dynamic config surface**: every option is a hardcoded module
-constant (`_GPU_HOST`, `_GPU_API`, `_GPU_CACHE`, `_GPU_CACHE_TTL`), the
-section is always rendered, and unreachable-host cases degrade to empty
-states (`n/d`, `unknown`) rather than fake zeros.
-
-## Deterministic zombie guard (OBJ-21)
-
-Guardrail G3 of the autonomous-task-creator prompt ("any running task older
-than 45 minutes → `[SILENT]`") used to live only in the prompt, so its
-enforcement was stochastic — a tick could mis-read the board and feed work
-anyway. The gate snapshot now carries `context.zombie_check`:
-
-```json
-{"has_zombie": false, "count": 0, "threshold_minutes": 45.0, "tasks": []}
-```
-
-- **Age base**: `last_heartbeat_at` (worker liveness), falling back to
-  `started_at`; only `status='running'` rows are examined — measuring the
-  age of a COMPLETED task is meaningless (that exact mistake produced the
-  false "87 min zombie" report behind OBJ-21).
-- **Decisional, not informational**: when `has_zombie` is true the gate
-  forces `wakeAgent:false` and appends a `zombie_guard:` line to
-  `context.warning` (creator silenced regardless of what the LLM sees).
-  The recommendation fields stay visible in the context for auditability.
-- **Prompt kept as second line of defence**: G3 remains in the creator
-  prompt (reworded as "defense in depth") — the gate is the enforcement.
-- Tests: `test_zombie_check.py` (19 cases incl. the done-task regression),
-  `test_cron_prompt_zombie.py` (active-prompt + deploy-drift regression),
-  `e2e_zombie_live.py` (live gate vs the real board + injected-zombie copy).
-
-## Predictive quota system (OBJ-24)
-
-Three no_agent pieces that observe and forecast WITHOUT burning tokens
-(the LLM workers keep burning where they already burn; the predictive
-layer never spends tokens):
-
-**F1 — time-series collector** (`quota-metrics.py`, cron every 15m): samples
-board counts + all providers' last-good pct and appends to
-`~/.hermes/profiles/pr-ollama/quota-governor/metrics-history.jsonl`. Zero
-extra API calls (the tick's last-good IS the sample). Since the OBJ-26a
-follow-up it also carries `nanogpt_request_balance_usd` /
-`nanogpt_request_covered_usd` (see below). Tests: `test_quota_metrics.py`.
-
-## Per-request billing visibility (OBJ-26a follow-up, t_92d7f0d6)
-
-The in-process capture (hermes-agent `nanogpt_pricing_capture`) appends one
-row per NanoGPT request to `nanogpt-requests.jsonl` under the CAPTURING
-process's HERMES_HOME. Three read paths expose the window accumulators —
-always as SEPARATE fields, never merged with probe-derived spend meters
-(`window_spent_usd`, `activity_cost`, burn-watchdog `spent_usd`):
-
-- `nanogpt-balance-ledger.request_window_totals_all_homes()`: merges the
-  per-request rows across every HERMES root (`~/.hermes` + all profiles;
-  `QUOTA_GOVERNOR_PROFILE_HOMES` os.pathsep override). `homes_read == 0`
-  means "no capture data anywhere" — consumers report None, not 0.0.
-- `quota-governor-tick.sh` → `tick-observation.py`: the tick now PERSISTS a
-  `quota_tick` row in `observations.jsonl` (it decided but never wrote one;
-  in-process hooks don't fire in no_agent cron) with
-  `quota.request_balance_usd` / `quota.request_covered_usd`.
-- Core `record_observation()`: every hook row (`task_claimed`,
-  `session_end`, `periodic_sample`, …) carries the same two fields.
-
-Privacy:low — only USD aggregates at NanoGPT scale (1e-06); no per-request
-rows, prompts, or model names reach observations.jsonl.
-
-**F2 — EMA predictor** (`quota-forecast.py`, cron every 15m after metrics):
-for each provider, exponential moving average of the weekly burn rate
-(%/min) over a 6h window (alpha 0.3), with pairs closer than 120s discarded
-(unsynchronised last-good refreshes produce absurd rates). Projects the
-90% milestone (governor stop) and 100% (exhaustion) for the WEEKLY window
-(all three providers reset Monday ~02:00 CEST). Output `forecast.json`:
-`{providers: {provider: {pct_now, burn_rate_pct_per_min, eta_90_iso,
-eta_100_iso, eta_90_hours, confidence, samples, pairs_used}}}` plus
-`next_weekly_reset_iso` / `hours_to_reset`. The per-provider data is
-NESTED under `providers` — that is the shape the gate (`--suggest`) and
-`budget_check.py` consume (OBJ-24 contract; top-level provider keys were
-a writer bug and are gone). Tests: `test_quota_forecast.py`.
-
-Gate integration (`--suggest` mode, wrapper `forecast-gate.sh`): injects
-`context.forecast_warning` with the fired decision rules —
-- `eta_90 < 1h` → board off (wakeAgent stays as-is in suggest mode),
-- `eta_90 < hours_to_reset - 2h` (COLCHÓN) → max_workers=1 + cost cap.
-The plain gate (no flags) produces byte-identical output as before —
-zero regression. Real veto only with `--enforce` after 7 days of
-backtest (flag already parsed; wired in `forecast_context`). Tests:
-`test_forecast_gate.py`.
-
-**F3 — per-task budget** (`budget_check.py`, cron every 15m + observer
-spawn from `kanban_task_claimed`): crosses (a) the OBJ-07 calibration
-(`docs/quota-planner.md` §2.4: tiny 0.5%, small 2.1%, medium 4%,
-complex 24.8% of the Ollama window; micro 0.25% by order of magnitude),
-(b) the provider's free quota from the F2 forecast, (c) the F2 ETA.
-If the task's cost class exceeds 10% of its provider's remaining free
-quota, it logs `reassign` (to the provider with most headroom) or
-`triage` (no alternative has room). Phase 3.0 is OBSERVER-only (log
-pattern); the real veto runs with `--enforce` after a week without
-false positives. Tests: `test_budget_check.py`, `test_budget_hook.py`.
-
-**F2 backtest harness** (`backtest-f2.py`, cron every 15m after forecast):
-measures whether F2 actually hits the close criterion. Each run (1) SNAPS
-the current `forecast.json` into an append-only ledger
-(`~/.hermes/quota-governor/forecast-backtest.jsonl`) — the snapshot mode
-that survives forecast.json's per-tick overwrite; (2) EVALUATES every open
-snapshot/provider against the real crossing time in metrics-history:
-`error_pct = |t_cross_actual − eta_90_pred| / margin_to_reset × 100`
-(<20 → OK, else FAIL); before the milestone is crossed the error stays
-OPEN (never counted as failure), and snapshots past the milestone, without
-a usable ETA, or whose weekly window elapsed with no crossing resolve to
-NA. (3) Appends a daily OK/FAIL/OPEN verdict per provider whenever it
-changes; stdout announces only a NEW FAIL (watchdog pattern). Gate
-`--enforce` unlocks after 7 consecutive days of this ledger with no FAIL.
-Zero API calls — reads only forecast.json + metrics-history.jsonl. Tests:
-`test_backtest_f2.py` (15 cases incl. the tolerant-degradation set).
-Register:
-`HERMES_HOME=~/.hermes/profiles/pr-ollama hermes cron create "every 15m" --name backtest-f2 --script backtest-f2-cron.sh --no-agent --deliver local`
-
-Completeness criterion (from the task): with 24h of history the forecast
-must hit the 90% milestone with <20% error at reset time; zero quota
-wasted (board active while quota > margin, board self-off when
-eta_90 < 1h); the 15m tick, gate and burn-watchdog keep operating
-unchanged (metrics/forecast are additive and no_agent).
 
 ## Decision heuristic
 
@@ -320,21 +148,33 @@ Based on real cost data (Aug 2026):
 | `stop` | — | any | > 90% | 0 | none |
 | `stop` | — | any | — | 0 | none (spending limit exceeded) |
 
-**`paying` state:** When session usage hits 100% and `activity.cost` is
-rising (balance is being consumed), the governor enters `paying` mode. It
-warns but allows 1 worker to continue — spending real money. The governor
-transitions to `stop` when `activity.cost >= QUOTA_GOVERNOR_MAX_SPEND` or
-weekly quota is critical (> 90%).
+**`paying` state:** when session usage hits 100% and `activity.cost` is
+rising, the governor warns but allows 1 worker to continue — spending real
+money. It transitions to `stop` when `activity.cost >=
+QUOTA_GOVERNOR_MAX_SPEND` or weekly quota is critical (> 90%).
 
-Weekly override (most restrictive wins):
-- Weekly > 75% → tiny tasks only
-- Weekly > 90% → stop entirely
+Weekly override (most restrictive wins): weekly > 75% → tiny tasks only;
+weekly > 90% → stop entirely.
 
-## Quickstart
+## Installation
+
+Requirements:
+
+- Hermes Agent with kanban support
+- API keys in `~/.hermes/.env` (or `~/.hermes/profiles/<name>/.env`):
+  - `OLLAMA_API_KEY` (required — drives the decision)
+  - `NANO_GPT_API_KEY` (optional — informational)
+  - `OPENROUTER_API_KEY` (optional — informational)
+- Optional: Tor for GitHub interactions (this deployment enforces it; see
+  the `github-tor-privacy` skill)
+- Optional env var: `QUOTA_GOVERNOR_MAX_SPEND` (default `5.00`) — maximum
+  cumulative pay-as-you-go spend in USD before `paying` becomes `stop`.
+  Set to `0` to disable the cap (weekly quota limits still apply).
 
 ```bash
-# run the suite (1,000+ tests, no network needed; each file runs directly —
-# some module basenames repeat across dirs, so `unittest discover` is not usable)
+# clone and run the suite (1,000+ tests, no network needed; each file runs
+# directly — some module basenames repeat across dirs, so `unittest
+# discover` is not usable)
 git clone https://github.com/claude-elwood-shannon/hermes-plugin-quota-governor
 cd hermes-plugin-quota-governor
 failed=0
@@ -343,8 +183,12 @@ for t in $(find . -name 'test_*.py' -not -path './.git/*'); do
 done
 [ "$failed" -eq 0 ] && echo "suite green"
 
-# install as a Hermes plugin
+# install as a Hermes plugin (installs AND enables)
 hermes plugins install claude-elwood-shannon/hermes-plugin-quota-governor --enable
+hermes plugins list        # verify it shows self-govern (or quota-governor)
+
+# run the tests inside an agent session: the skill is loaded by name
+# (see docs/getting-started.md for the full first-flight walkthrough)
 ```
 
 Two tests exercise *deployed* scripts that live outside the repo
@@ -360,40 +204,22 @@ Two tests exercise *deployed* scripts that live outside the repo
 /quota-governor daemon-start    — start daemon with quota-aware --max
 /quota-governor daemon-stop     — stop daemon gracefully
 /quota-governor clear-signals   — remove stop-signal files
+/quota-governor set-limit [V]   — show or set the spending limit (USD)
+/quota-governor health          — fast burn, zombie workers, silent plugin
 ```
-
-## Status example
-
-When the system is in `paying` mode (included quota exhausted, spending
-pay-as-you-go balance), `/quota-governor status` shows `Mode` and `Cost`:
-
-```
-=== Quota Governor Status ===
-
-Ollama Cloud (primary):
-  Session:  100.0%  (337 requests)
-  Weekly:    43.5%  (1073 requests)
-  Mode:      PAYING  ⚠ spending pay-as-you-go balance
-  Cost:      $1.25  (limit: $5.00)
-
-Decision: PAYING
-  Workers: 1
-  Max task: small
-  Reason:  session exhausted, spending pay-as-you-go balance ($1.25 / $5.00)
-```
-
-In `run` mode, `Mode` shows `RUN` and `Cost` is omitted (no pay-as-you-go
-spend). In `stop` mode, `Mode` shows `STOP` with the stop signal active.
 
 ## Architecture
 
 ```
   Plugin hooks (observer-only)
     │
-    ├── kanban_task_claimed  → query quota → record → maybe write STOP signal
+    ├── kanban_task_claimed   → query quota → record → maybe write STOP signal
     ├── kanban_task_completed → record cost → re-evaluate
-    ├── post_tool_call       → periodic sample (every 50 calls)
-    └── on_session_end       → final snapshot
+    ├── kanban_task_blocked   → record for audit
+    ├── post_tool_call        → periodic sample (every 50 calls)
+    ├── on_session_end        → final snapshot
+    └── on_kanban_dispatch_tick → housekeeping (privacy router, assignee
+                                  fix, approval-ready fix)
     │
     ▼
   State file: $HERMES_HOME/quota-governor/observations.jsonl
@@ -401,45 +227,58 @@ spend). In `stop` mode, `Mode` shows `STOP` with the stop signal active.
     │
     ▼
   Cron (no_agent script, zero tokens)
-    │
     ├── reads STOP signal → if present, skip tick
     ├── queries quota → applies heuristic
     ├── if quota OK → start/adjust daemon with --max N
     └── if quota critical → stop daemon, write STOP signal
+
+  Mediator (Open WebUI) ──HTTP 9120──► bridge ──CLI──► hermes kanban / logs
+  Observability: trace JSONL ──► portal :8917 / OTLP / morning report
 ```
 
-## Files
+## Repository map
 
 ```
 hermes-plugin-quota-governor/
-├── plugin.yaml          — manifest (hooks, metadata)
-├── __init__.py           — hook registration + slash command
-├── providers.py          — multi-provider quota query (Ollama, NanoGPT, OpenRouter)
+├── plugin.yaml           — manifest (name, hooks, metadata)
+├── __init__.py           — hook registration + /quota-governor slash command
+├── providers.py          — multi-provider quota query
 ├── quota_planner.py      — decision heuristic
 ├── quota_governor.py     — core logic: state, observations, daemon control
-├── LICENSE
-└── README.md
+├── concurrency_guard.py  — concurrency + health checks for the daemon
+├── health_checks.py      — fast burn / zombie / silent-plugin checks
+├── capabilities/         — modular capability packs (manifest + guard)
+├── scripts/              — cron scripts: tick, gate, ledger, forecast,
+│                           bridge, watchdogs, obs stack
+├── docs/                 — design records, calibration notes, guides
+└── tests/                — offline-first test suites
 ```
 
-## Requirements
+Key docs:
 
-- Hermes Agent with kanban support
-- Tor (for GitHub interactions — see `github-tor-privacy` skill)
-- API keys in `~/.hermes/.env` or `~/.hermes/profiles/<name>/.env`:
-  - `OLLAMA_API_KEY` (required — drives the decision)
-  - `NANO_GPT_API_KEY` (optional — informational)
-  - `OPENROUTER_API_KEY` (optional — informational)
-- Optional env vars:
-  - `QUOTA_GOVERNOR_MAX_SPEND` (default: `5.00`) — Maximum cumulative
-    pay-as-you-go spend in USD (`activity.cost` from Ollama's `/api/usage`)
-    before the governor transitions from `paying` to `stop`. Set to `0` to
-    disable the spending limit (warn-only, never stop on cost; weekly quota
-    limits still apply).
+| Doc | What it covers |
+|-----|----------------|
+| [`docs/getting-started.md`](docs/getting-started.md) | first flight: install → enable → bootstrap → mediator |
+| [`docs/bridge-open-webui.md`](docs/bridge-open-webui.md) | the mediator bridge: endpoints, deployment, security |
+| [`docs/guardrails-autonomous-objectives.md`](docs/guardrails-autonomous-objectives.md) | the 11 governance guardrails |
+| [`docs/objectives.md`](docs/objectives.md) | objectives index (OBJ-*) |
+| [`docs/quota-planner.md`](docs/quota-planner.md) | quota decision machinery |
+| [`docs/obs-portal.md`](docs/obs-portal.md) | the local observability portal |
+| [`docs/coding-standards.md`](docs/coding-standards.md) | code conventions for contributions |
+
+## Additional features
+
+- **pr-vllm** local worker profile now integrated; see `docs/quota-planner.md` for routing rules.
+- **supply_ratio** knob in the planner controls perpetual supply; documented in `docs/obj29-perpetual-supply.md`.
+- **innovation fund (OBJ-30)** — an autonomous innovation fund with its own budget: pilot delivered, mechanisms running, and the funding contract awaits the owner's signature before any window opens; documented in `docs/obj30-innovation-fund.md`.
+
+## Contributing
+
+Run the offline suite before proposing changes (see Installation). Follow
+`docs/coding-standards.md`. Commit messages in English, `type(scope)`
+convention, with `Co-authored-by: Hermes Agent <agent@nousresearch.com>`
+when an agent did the work.
 
 ## License
 
 MIT
-## Additional Features
-- **pr‑vllm** local worker profile now integrated; see `docs/quota-planner.md` for routing rules.
-- **supply_ratio** knob in the planner controls perpetual supply; documented in `docs/obj29-perpetual-supply.md`.
-- **innovation fund (OBJ-30)** — an autonomous innovation fund with its own budget: pilot delivered, mechanisms running, and the funding contract awaits the owner's signature before any window opens; documented in `docs/obj30-innovation-fund.md`.
