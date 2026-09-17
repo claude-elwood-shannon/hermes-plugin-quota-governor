@@ -258,7 +258,11 @@ def load_capability(cap_dir=None):
         if key not in manifest:
             raise ValueError(f"manifest.yaml sin clave requerida: {key}")
     hosts_file = manifest.get("hosts_file", "hosts.yaml")
-    inv = _miniyaml.load(os.path.join(cap_dir, hosts_file))
+    if os.path.isabs(hosts_file) or hosts_file.startswith("~/"):
+        inv_path = os.path.expanduser(hosts_file)
+    else:
+        inv_path = os.path.join(cap_dir, hosts_file)
+    inv = _miniyaml.load(inv_path)
     hosts = inv.get("hosts") or []
     if not isinstance(hosts, list) or not hosts:
         raise ValueError("hosts.yaml sin lista 'hosts'")

@@ -5,8 +5,14 @@ directorio en `capabilities/` con:
 
 - `manifest.yaml` — permisos, scope, triggers y objetivo asociado
 - `skill.md` — documentacion que el agente lee al activarse
-- ficheros de configuracion (hosts.yaml, ...)
 - scripts propios si los necesita (p. ej. guard.py)
+
+El inventario de hosts (`hosts.yaml`) NO vive aqui: es un DATO con las IPs
+y permisos de esta casa, no codigo compartible (principio plugin=codigo,
+~/.hermes/=datos, t_7d102e2b). Vive en
+`~/.hermes/data/capabilities/<cap>/hosts.yaml` y el manifest lo apunta
+mediante `hosts_file` con ruta absoluta `~/...` (tambien se aceptan rutas
+relativas al directorio de la capacidad).
 
 Contrato:
 

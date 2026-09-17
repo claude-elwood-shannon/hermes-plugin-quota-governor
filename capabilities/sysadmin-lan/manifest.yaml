@@ -29,4 +29,7 @@ host_rules:
     docker_root: "/data/docker"
     note: "Toda instalación, volumen o dato nuevo debe ir en /data"
 
-hosts_file: hosts.yaml
+# Inventario de hosts: ~/.hermes/data/capabilities/sysadmin-lan/hosts.yaml
+# (principio plugin=código, ~/.hermes/=datos — t_7d102e2b; contiene IPs y
+# permisos específicos de esta casa, no código compartible).
+hosts_file: ~/.hermes/data/capabilities/sysadmin-lan/hosts.yaml
