@@ -262,6 +262,88 @@ def spark_row(label: str, values, value_s: str) -> str:
 # Data: board with events (the kanban log, rendered)
 # ---------------------------------------------------------------------------
 
+def _db_connect(db_path: Path):
+    """Open the kanban db read-only; None when sqlite refuses (fail open)."""
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        return con
+    except sqlite3.Error:
+        return None
+
+
+def _db_counts(con) -> tuple:
+    """Status counts + their total (the read_board_full "counts"/"total")."""
+    counts = {}
+    for r in con.execute(
+            "SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
+        counts[r["status"]] = r["c"]
+    return counts, sum(counts.values())
+
+
+def _db_done24(con, now: float) -> list:
+    """Tasks closed in the last 24h, newest first ("done24")."""
+    return [dict(r) for r in con.execute(
+        "SELECT id, title, completed_at, assignee FROM tasks "
+        "WHERE status='done' AND completed_at > ? "
+        "ORDER BY completed_at DESC LIMIT 20", (now - 86400,))]
+
+
+def _db_active(con) -> list:
+    """Dispatchable tasks ("active"): ready/running/blocked/triage."""
+    return [dict(r) for r in con.execute(
+        "SELECT id, status, assignee, title FROM tasks "
+        "WHERE status IN ('ready','running','blocked','triage') "
+        "ORDER BY status, id LIMIT 40")]
+
+
+def _db_daily(con, now: float, lo: float, window_days: int) -> list:
+    """Per-day (created, completed, crashed) buckets over the window."""
+    buckets = {}
+    for r in con.execute(
+            "SELECT kind, created_at FROM task_events "
+            "WHERE created_at > ? AND kind IN "
+            "('created','completed','crashed')", (lo,)):
+        d = dt.datetime.fromtimestamp(r["created_at"], CEST).date()
+        b = buckets.setdefault(d, {"created": 0, "completed": 0,
+                                   "crashed": 0})
+        if r["kind"] in b:
+            b[r["kind"]] += 1
+    today = dt.datetime.fromtimestamp(now, CEST).date()
+    return [
+        ((today - dt.timedelta(days=window_days - 1 - i)).isoformat(),
+         buckets.get(today - dt.timedelta(days=window_days - 1 - i),
+                     {}).get("created", 0),
+         buckets.get(today - dt.timedelta(days=window_days - 1 - i),
+                     {}).get("completed", 0),
+         buckets.get(today - dt.timedelta(days=window_days - 1 - i),
+                     {}).get("crashed", 0))
+        for i in range(window_days)]
+
+
+def _db_events_by_task(con) -> dict:
+    """Last 400 task_events grouped by task ("events")."""
+    ev_by_task = {}
+    for r in con.execute(
+            "SELECT task_id, kind, created_at FROM task_events "
+            "ORDER BY created_at DESC LIMIT 400"):
+        ev_by_task.setdefault(r["task_id"], []).append(
+            {"kind": r["kind"], "created_at": r["created_at"]})
+    return ev_by_task
+
+
+def _db_recent_runs(con) -> list:
+    """Last 120 task_runs shaped for "recent_events" (error truncated)."""
+    return [
+        {"task_id": r["task_id"], "status": r["status"],
+         "outcome": r["outcome"], "started_at": r["started_at"],
+         "ended_at": r["ended_at"],
+         "error": (r["error"] or "")[:160]}
+        for r in con.execute(
+            "SELECT task_id, status, outcome, started_at, ended_at, "
+            "error FROM task_runs ORDER BY id DESC LIMIT 120")]
+
+
 def read_board_full(hermes_home=None, now=None, window_days=DAYS) -> dict:
     """Board counts + 30d daily events + active tasks with their event log.
 
@@ -274,59 +356,16 @@ def read_board_full(hermes_home=None, now=None, window_days=DAYS) -> dict:
     db = ms.kanban_db_path(hermes_home)
     if not db.exists():
         return out
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        con.row_factory = sqlite3.Row
-    except sqlite3.Error:
+    con = _db_connect(db)
+    if con is None:
         return out
     try:
-        for r in con.execute(
-                "SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
-            out["counts"][r["status"]] = r["c"]
-        out["total"] = sum(out["counts"].values())
-        out["done24"] = [dict(r) for r in con.execute(
-            "SELECT id, title, completed_at, assignee FROM tasks "
-            "WHERE status='done' AND completed_at > ? "
-            "ORDER BY completed_at DESC LIMIT 20", (now - 86400,))]
-        out["active"] = [dict(r) for r in con.execute(
-            "SELECT id, status, assignee, title FROM tasks "
-            "WHERE status IN ('ready','running','blocked','triage') "
-            "ORDER BY status, id LIMIT 40")]
-        buckets = {}
-        for r in con.execute(
-                "SELECT kind, created_at FROM task_events "
-                "WHERE created_at > ? AND kind IN "
-                "('created','completed','crashed')", (lo,)):
-            d = dt.datetime.fromtimestamp(r["created_at"], CEST).date()
-            b = buckets.setdefault(d, {"created": 0, "completed": 0,
-                                       "crashed": 0})
-            if r["kind"] in b:
-                b[r["kind"]] += 1
-        today = dt.datetime.fromtimestamp(now, CEST).date()
-        out["daily"] = [
-            ((today - dt.timedelta(days=window_days - 1 - i)).isoformat(),
-             buckets.get(today - dt.timedelta(days=window_days - 1 - i),
-                         {}).get("created", 0),
-             buckets.get(today - dt.timedelta(days=window_days - 1 - i),
-                         {}).get("completed", 0),
-             buckets.get(today - dt.timedelta(days=window_days - 1 - i),
-                         {}).get("crashed", 0))
-            for i in range(window_days)]
-        ev_by_task = {}
-        for r in con.execute(
-                "SELECT task_id, kind, created_at FROM task_events "
-                "ORDER BY created_at DESC LIMIT 400"):
-            ev_by_task.setdefault(r["task_id"], []).append(
-                {"kind": r["kind"], "created_at": r["created_at"]})
-        out["events"] = ev_by_task
-        for r in con.execute(
-                "SELECT task_id, status, outcome, started_at, ended_at, "
-                "error FROM task_runs ORDER BY id DESC LIMIT 120"):
-            out["recent_events"].append({
-                "task_id": r["task_id"], "status": r["status"],
-                "outcome": r["outcome"], "started_at": r["started_at"],
-                "ended_at": r["ended_at"],
-                "error": (r["error"] or "")[:160]})
+        out["counts"], out["total"] = _db_counts(con)
+        out["done24"] = _db_done24(con, now)
+        out["active"] = _db_active(con)
+        out["daily"] = _db_daily(con, now, lo, window_days)
+        out["events"] = _db_events_by_task(con)
+        out["recent_events"] = _db_recent_runs(con)
         out["db"] = True
     except sqlite3.Error:
         pass
@@ -1371,9 +1410,10 @@ def page_providers(data: dict, query: dict = None) -> str:
 
 # --- alarms -------------------------------------------------------------------
 
-def page_alarms(data: dict, query: dict = None) -> str:
-    alarm_lines = data["alarm_lines"]
-    cards = data["alert_cards"]
+# --- alarms section builders (each card well under the 50-line cap) -----------
+
+def _alarms_trace_card(alarm_lines: list) -> list:
+    """Card 1: trace F2 incidents (danger on crash-loop, else warn)."""
     out = ['<section class="card"><h2>Alarmas del trace (F2 watchdog)'
            "</h2>"]
     if alarm_lines:
@@ -1384,9 +1424,13 @@ def page_alarms(data: dict, query: dict = None) -> str:
         out.append('<div class="alert ok">sin incidencias — el trace está '
                    "limpio</div>")
     out.append("</section>")
+    return out
 
-    out.append('<section class="card"><h2>Estado de alertas F2 '
-               "(regla del gate)</h2>")
+
+def _alarms_gate_card(cards: list) -> list:
+    """Card 2: F2 alert state (the gate rule)."""
+    out = ['<section class="card"><h2>Estado de alertas F2 '
+           "(regla del gate)</h2>"]
     if cards:
         for c in cards:
             out.append(f'<div class="alert {_esc(c["kind"])}">'
@@ -1395,33 +1439,40 @@ def page_alarms(data: dict, query: dict = None) -> str:
         out.append(empty_state("sin fuentes de alertas (trace/forecast/"
                                "board ausentes)"))
     out.append("</section>")
+    return out
 
+
+def _alarms_health_card(data: dict) -> list:
+    """Card 3: trace health table (doctor stats + living sources note)."""
     doctor = data["doctor"]
     parseable = bool(doctor.get("parseable"))
     parse_badge = _badge("ok" if parseable else "bad",
                          "sí" if parseable else "NO — líneas corruptas")
-    out.append('<section class="card"><h2>Salud del trace</h2><table>'
-               f"<tr><th>líneas</th><td class=num>{doctor.get('lines', 0)}"
-               "</td></tr>"
-               f"<tr><th>ventana</th><td>{_esc(data['window_s'])}</td></tr>"
-               f'<tr><th>parseable</th><td>{parse_badge}</td></tr>'
-               f"<tr><th>archivo activo</th><td class=mono>"
-               f"{doctor.get('trace_bytes', 0):,} bytes</td></tr>"
-               f"<tr><th>archivos rotados</th><td class=num>"
-               f"{doctor.get('archives', {}).get('count', 0)} "
-               f"({doctor.get('archives', {}).get('bytes', 0):,} bytes)"
-               "</td></tr>"
-               f"<tr><th>retención</th><td class=mono>"
-               f"{doctor.get('retention', {}).get('keep_days', '-')} días / "
-               f"{doctor.get('retention', {}).get('max_lines', '-')} líneas"
-               "</td></tr></table>"
-               '<div class="mut" style="font-size:11px;margin-top:6px">'
-               "fuentes vivas: trace.jsonl (nanogpt-requests · usage-audit · "
-               "task-events · model-cost-ledger) — el backfill reconstruye "
-               "el pasado desde ellas</div></section>")
+    return ['<section class="card"><h2>Salud del trace</h2><table>'
+            f"<tr><th>líneas</th><td class=num>{doctor.get('lines', 0)}"
+            "</td></tr>"
+            f"<tr><th>ventana</th><td>{_esc(data['window_s'])}</td></tr>"
+            f'<tr><th>parseable</th><td>{parse_badge}</td></tr>'
+            f"<tr><th>archivo activo</th><td class=mono>"
+            f"{doctor.get('trace_bytes', 0):,} bytes</td></tr>"
+            f"<tr><th>archivos rotados</th><td class=num>"
+            f"{doctor.get('archives', {}).get('count', 0)} "
+            f"({doctor.get('archives', {}).get('bytes', 0):,} bytes)"
+            "</td></tr>"
+            f"<tr><th>retención</th><td class=mono>"
+            f"{doctor.get('retention', {}).get('keep_days', '-')} días / "
+            f"{doctor.get('retention', {}).get('max_lines', '-')} líneas"
+            "</td></tr></table>"
+            '<div class="mut" style="font-size:11px;margin-top:6px">'
+            "fuentes vivas: trace.jsonl (nanogpt-requests · usage-audit · "
+            "task-events · model-cost-ledger) — el backfill reconstruye "
+            "el pasado desde ellas</div></section>"]
 
+
+def _alarms_loop_card(alarm_lines: list) -> list:
+    """Card 4: crash loops, each anchored to its kanban log."""
     loops = [a for a in alarm_lines if "crash-loop" in a]
-    out.append('<section class="card"><h2>Loops de crash</h2>')
+    out = ['<section class="card"><h2>Loops de crash</h2>']
     if loops:
         for line in loops:
             tid = line.split(":")[1].strip().split(" ")[0] \
@@ -1433,6 +1484,16 @@ def page_alarms(data: dict, query: dict = None) -> str:
         out.append('<div class="alert ok">ningún loop de crash en 24h'
                    "</div>")
     out.append("</section>")
+    return out
+
+
+def page_alarms(data: dict, query: dict = None) -> str:
+    """Alarms page: trace incidents, F2 gate state, trace health, loops."""
+    out = []
+    out.extend(_alarms_trace_card(data["alarm_lines"]))
+    out.extend(_alarms_gate_card(data["alert_cards"]))
+    out.extend(_alarms_health_card(data))
+    out.extend(_alarms_loop_card(data["alarm_lines"]))
     return "\n".join(out)
 
 
@@ -1620,58 +1681,77 @@ def page_docs(data: dict, query: dict = None) -> str:
 # Orchestration: one read pass -> all pages
 # ---------------------------------------------------------------------------
 
+def _real_usd(rows: list) -> float:
+    """Sum of REAL money in the window (nanogpt-requests, charged)."""
+    return sum(float(r.get("costUsd") or 0.0) for r in rows
+               if r.get("source") in REAL_SOURCES)
+
+
+def _supply_series(metrics: list) -> list:
+    """(epoch, supply_ratio) points; drops non-numeric ratios / bad ts."""
+    return [
+        (tr._parse_ts(m.get("ts")), m.get("supply_ratio"))
+        for m in metrics
+        if tr._parse_ts(m.get("ts")) is not None
+        and isinstance(m.get("supply_ratio"), (int, float))]
+
+
+def _provider_series(metrics: list) -> dict:
+    """Per-provider (epoch, pct) histories the board page charts."""
+    return {k: _metrics_series(metrics, k) for k in
+            ("ollama_weekly_pct", "nanogpt_weekly_pct",
+             "opencode_rolling_pct", "opencode_weekly_pct")}
+
+
+def _trace_window_s(agg: dict) -> str:
+    """Human "first → last" window of the trace ('' when empty)."""
+    if agg.get("first_ts"):
+        return (f"{_fmt_ts(agg['first_ts'])} → "
+                f"{_fmt_ts(agg['last_ts'])}")
+    return ""
+
+
+def _objective_budgets(rows: list, hermes_home, now: float) -> dict:
+    """OBJ-28 phase 0 rollup, LIVE from the same trace rows (fresh even
+    before the cron's first run) + the human-set ceilings merged back from
+    the persisted state file (sticky budgets)."""
+    try:
+        doc = ob.rollup(rows, window_days=DAYS, now=now)
+        return ob.preserve_human_decisions(doc, ob.load_existing(hermes_home))
+    except Exception:
+        return {"objectives": {}, "unattributed_cost": {},
+                "unattributed_events": {}, "cost_lines_attributed": 0,
+                "tagged_events": 0}
+
+
 def gather(hermes_home=None, now=None) -> dict:
     """Read every source once; everything downstream is pure shaping."""
     now = time.time() if now is None else float(now)
     rows = od.read_trace(hermes_home)
     agg = od.agg_trace(rows)
-    real = sum(float(r.get("costUsd") or 0.0) for r in rows
-               if r.get("source") in REAL_SOURCES)
-    agg["real_usd"] = real
-    dims = agg_dims(rows)
-    requests = read_requests(rows)
-    board = read_board_full(hermes_home, now=now)
+    agg["real_usd"] = _real_usd(rows)
     metrics = od.read_metrics(hermes_home)
     fc = ms._read_json(ms.forecast_path(hermes_home))
-    series = {
-        "spend": od.daily_series(rows, days=DAYS, now=now),
-        "supply": [
-            (tr._parse_ts(m.get("ts")), m.get("supply_ratio"))
-            for m in metrics
-            if tr._parse_ts(m.get("ts")) is not None
-            and isinstance(m.get("supply_ratio"), (int, float))],
-        "provider": {k: _metrics_series(metrics, k) for k in
-                     ("ollama_weekly_pct", "nanogpt_weekly_pct",
-                      "opencode_rolling_pct", "opencode_weekly_pct")},
-        "balance": _metrics_series(metrics, "nanogpt_balance_usd"),
-    }
-    doctor = tr.doctor(hermes_home)
-    window_s = ""
-    if agg.get("first_ts"):
-        window_s = (f"{_fmt_ts(agg['first_ts'])} → "
-                    f"{_fmt_ts(agg['last_ts'])}")
+    # read_gpu_health WRITES the gpu-health.json cache; alert_cards reads
+    # it back, so the call order below is observable — keep gpu first.
     gpu = read_gpu_health(hermes_home, now=now)
-    # OBJ-28 phase 0: rollup by objective, computed LIVE from the same
-    # trace rows (fresh even before the cron's first run) + the human-set
-    # ceilings merged back from the persisted state file (sticky budgets).
-    try:
-        ob_doc = ob.rollup(rows, window_days=DAYS, now=now)
-        ob_doc = ob.preserve_human_decisions(
-            ob_doc, ob.load_existing(hermes_home))
-    except Exception:
-        ob_doc = {"objectives": {}, "unattributed_cost": {},
-                  "unattributed_events": {}, "cost_lines_attributed": 0,
-                  "tagged_events": 0}
     return {
-        "now": now, "rows": rows, "agg": agg, "dims": dims,
-        "requests": requests, "board": board, "metrics": metrics,
+        "now": now, "rows": rows, "agg": agg,
+        "dims": agg_dims(rows), "requests": read_requests(rows),
+        "board": read_board_full(hermes_home, now=now), "metrics": metrics,
         "forecast": fc, "verdicts": od.provider_verdicts(fc),
-        "series": series, "doctor": doctor,
-        "objective_budgets": ob_doc,
+        "series": {
+            "spend": od.daily_series(rows, days=DAYS, now=now),
+            "supply": _supply_series(metrics),
+            "provider": _provider_series(metrics),
+            "balance": _metrics_series(metrics, "nanogpt_balance_usd"),
+        },
+        "doctor": tr.doctor(hermes_home),
+        "objective_budgets": _objective_budgets(rows, hermes_home, now),
         "alarm_lines": ta.run_checks(hermes_home, now=now),
         "alert_cards": od.alert_cards(hermes_home),
         "weekly_ledger": read_weekly_ledger(hermes_home),
-        "window_s": window_s,
+        "window_s": _trace_window_s(agg),
         "gpu": gpu,
     }
 
