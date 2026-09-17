@@ -52,11 +52,13 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import quota_governor as gov
 import quota_planner as planner
 import health_checks
+from providers import QuotaSnapshot
+from quota_planner import GovernorDecision
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +417,64 @@ The cron layer (no_agent script) reads signals and acts.
 """
 
 
+def _slash_query_decision() -> Tuple[QuotaSnapshot, GovernorDecision]:
+    """Query quota and translate it into a governor decision.
+
+    Shared plumbing for the ``decision`` and ``daemon-start`` subcommands;
+    performs the quota query and the planner call exactly once each.
+    """
+    snapshot = gov.query_quota()
+    spending_limit = gov.get_spending_limit()
+    previous_cost = gov.get_previous_cost()
+    decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
+                              spending_limit=spending_limit)
+    return snapshot, decision
+
+
+def _slash_decision_report() -> str:
+    """Render the ``decision`` subcommand: current quota + governor decision."""
+    snapshot, decision = _slash_query_decision()
+    return gov.format_decision(snapshot, decision)
+
+
+def _slash_daemon_start() -> str:
+    """Handle ``daemon-start``: refuse when quota is critical, else start."""
+    snapshot, decision = _slash_query_decision()
+    if decision.action == "stop":
+        return (
+            f"Refusing to start daemon: quota critical "
+            f"(session={snapshot.session_pct:.0f}%)."
+        )
+    return gov.daemon_start(max_workers=decision.max_workers)
+
+
+def _slash_set_limit(argv: List[str]) -> str:
+    """Handle ``set-limit [V]``: show the current limit or persist a new one."""
+    if len(argv) < 2:
+        # Show current limit
+        current = gov.get_spending_limit()
+        if current == 0:
+            return "Current spending limit: unlimited (cap disabled)"
+        return f"Current spending limit: ${current:.2f}"
+    try:
+        value = float(argv[1])
+        if value < 0:
+            return "Invalid limit: must be >= 0 (0 = unlimited)"
+        return gov.set_spending_limit(value)
+    except ValueError:
+        return f"Invalid limit value: {argv[1]!r} — expected a number (e.g. 10.00 or 0)"
+
+
+def _slash_health_report() -> str:
+    """Handle ``health``: run health checks and render their alerts."""
+    alerts = health_checks.run_all_health_checks()
+    if not alerts:
+        return "Health checks: all clear — no alerts."
+    lines = ["Health checks — " + str(len(alerts)) + " alert(s):", ""]
+    lines.append(health_checks.format_alerts_for_stdout(alerts))
+    return "\n".join(lines)
+
+
 def _handle_slash(raw_args: str) -> Optional[str]:
     argv = raw_args.strip().split()
     if not argv or argv[0] in {"help", "-h", "--help"}:
@@ -430,28 +490,13 @@ def _handle_slash(raw_args: str) -> Optional[str]:
         return gov.format_history(limit=limit)
 
     if sub == "decision":
-        snapshot = gov.query_quota()
-        spending_limit = gov.get_spending_limit()
-        previous_cost = gov.get_previous_cost()
-        decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
-                                  spending_limit=spending_limit)
-        return gov.format_decision(snapshot, decision)
+        return _slash_decision_report()
 
     if sub == "daemon":
         return gov.daemon_status()
 
     if sub == "daemon-start":
-        snapshot = gov.query_quota()
-        spending_limit = gov.get_spending_limit()
-        previous_cost = gov.get_previous_cost()
-        decision = planner.decide(snapshot, prev_activity_cost=previous_cost,
-                                  spending_limit=spending_limit)
-        if decision.action == "stop":
-            return (
-                f"Refusing to start daemon: quota critical "
-                f"(session={snapshot.session_pct:.0f}%)."
-            )
-        return gov.daemon_start(max_workers=decision.max_workers)
+        return _slash_daemon_start()
 
     if sub == "daemon-stop":
         return gov.daemon_stop()
@@ -460,27 +505,10 @@ def _handle_slash(raw_args: str) -> Optional[str]:
         return gov.clear_stop_signals()
 
     if sub == "health":
-        alerts = health_checks.run_all_health_checks()
-        if not alerts:
-            return "Health checks: all clear — no alerts."
-        lines = ["Health checks — " + str(len(alerts)) + " alert(s):", ""]
-        lines.append(health_checks.format_alerts_for_stdout(alerts))
-        return "\n".join(lines)
+        return _slash_health_report()
 
     if sub == "set-limit":
-        if len(argv) < 2:
-            # Show current limit
-            current = gov.get_spending_limit()
-            if current == 0:
-                return "Current spending limit: unlimited (cap disabled)"
-            return f"Current spending limit: ${current:.2f}"
-        try:
-            value = float(argv[1])
-            if value < 0:
-                return "Invalid limit: must be >= 0 (0 = unlimited)"
-            return gov.set_spending_limit(value)
-        except ValueError:
-            return f"Invalid limit value: {argv[1]!r} — expected a number (e.g. 10.00 or 0)"
+        return _slash_set_limit(argv)
 
     return f"Unknown subcommand: {sub}\n\n{_HELP_TEXT}"
 
