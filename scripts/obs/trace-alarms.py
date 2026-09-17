@@ -151,6 +151,20 @@ def _as_float(v):
         return None
 
 
+def _usd_or_zero(v):
+    """costUsd coercion: any missing/non-numeric value counts as $0.00.
+
+    Trace rows are file-fed and hand-backfilled, so costUsd can arrive as
+    a string ("0.07") or garbage ("free"). Same tolerance as obs-dashboard
+    .agg_trace: coerce or zero it — a sum over raw values would raise
+    TypeError (float + str) and tumble every consumer of the alarms.
+    """
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def check_burn(forecast: dict) -> list:
     """eta_90 < 1h -> board off; eta_90 < reset-2h -> reduce workers.
 
@@ -181,10 +195,10 @@ def check_burn(forecast: dict) -> list:
 
 def check_unattributed(rows: list) -> list:
     """objective=unattributed costUsd > PCT% of total -> one alarm line."""
-    total = sum(r.get("costUsd") or 0 for r in rows)
+    total = sum(_usd_or_zero(r.get("costUsd")) for r in rows)
     if total <= 0:
         return []
-    unatt = sum(r.get("costUsd") or 0 for r in rows
+    unatt = sum(_usd_or_zero(r.get("costUsd")) for r in rows
                 if r.get("objective") == "unattributed")
     pct = unatt / total * 100.0
     if pct > UNATTRIBUTED_SPEND_PCT:

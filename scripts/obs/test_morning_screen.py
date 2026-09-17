@@ -121,6 +121,39 @@ class TestTraceScreen(Base):
         out = screen.build_trace_screen(hermes_home=self.home())
         self.assertIn("SIN ETIQUETA (hueco)", out)
 
+    def test_string_costusd_is_coerced_not_fatal(self):
+        # Hand-backfilled rows can carry costUsd as a string ("0.07"):
+        # the screen shows the coerced total instead of a TypeError.
+        self._seed_trace()
+        _write_jsonl(
+            Path(self.tmp) / "quota-governor" / "obs" / "trace.jsonl", [
+                {"ts_epoch_utc": 1788998400.0, "consumer_class": "agent",
+                 "consumer_id": "req_str", "cause": "request", "model": None,
+                 "provider": "nanogpt", "tokens_in": None, "tokens_out": None,
+                 "costUsd": "0.07", "requestId": "rq-str",
+                 "objective": "unattributed", "source": "nanogpt-requests",
+                 "otel": {}},
+            ])
+        out = screen.build_trace_screen(hermes_home=self.home())
+        self.assertIn("CONSUMO", out)
+        self.assertIn("$0.0702", out)  # 0.0002 real + "0.07" coerced
+
+    def test_balance_spent_since_coerces_string_costusd(self):
+        self._seed_trace()
+        _write_jsonl(
+            Path(self.tmp) / "quota-governor" / "obs" / "trace.jsonl", [
+                {"ts_epoch_utc": 1788998400.0, "consumer_class": "agent",
+                 "consumer_id": "req_str", "cause": "request", "model": None,
+                 "provider": "nanogpt", "tokens_in": None, "tokens_out": None,
+                 "costUsd": "0.07", "requestId": "rq-str",
+                 "objective": "OBJ-27", "source": "nanogpt-requests",
+                 "otel": {}},
+            ])
+        self.assertAlmostEqual(
+            screen._balance_spent_since(self.home(),
+                                        week_start=1788000000.0),
+            0.0702)
+
     def test_empty_trace_returns_empty(self):
         self.assertEqual(screen.build_trace_screen(hermes_home=self.home()), "")
 
@@ -252,6 +285,22 @@ class TestAlerts(Base):
     def test_unattributed_over_threshold_alerts(self):
         # all cost is unattributed -> >20% -> alert
         self._seed_trace()
+        out = screen.build_alerts_screen(hermes_home=self.home())
+        self.assertIn("unattributed", out)
+
+    def test_string_costusd_does_not_kill_the_alerts_screen(self):
+        # One hand-backfilled row with costUsd "0.07" must not tumble the
+        # alerts screen (it feeds gather()/alert_cards in the portal too).
+        self._seed_trace()
+        _write_jsonl(
+            Path(self.tmp) / "quota-governor" / "obs" / "trace.jsonl", [
+                {"ts_epoch_utc": 1788998400.0, "consumer_class": "agent",
+                 "consumer_id": "req_str", "cause": "request", "model": None,
+                 "provider": "nanogpt", "tokens_in": None, "tokens_out": None,
+                 "costUsd": "0.07", "requestId": "rq-str",
+                 "objective": "unattributed", "source": "nanogpt-requests",
+                 "otel": {}},
+            ])
         out = screen.build_alerts_screen(hermes_home=self.home())
         self.assertIn("unattributed", out)
 

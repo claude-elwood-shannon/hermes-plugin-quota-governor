@@ -207,6 +207,27 @@ class TestUnattributed(Base):
                            tid="t_1", costUsd=0.8, objective="OBJ-27")]
         self.assertEqual(alarms.check_unattributed(rows), [])
 
+    def test_string_costusd_is_coerced_not_fatal(self):
+        # Hand-backfilled rows can carry costUsd as a string ("0.07").
+        # Coerced like obs-dashboard.agg_trace does: the share math still
+        # works and the alarm fires on real numbers (80% unattributed).
+        rows = [_trace_row(NOW - 100, source="nanogpt-requests",
+                           cause="request", tid="req_1", costUsd="0.80",
+                           objective="unattributed"),
+                _trace_row(NOW - 90, source="task-events", cause="claimed",
+                           tid="t_1", costUsd=0.20, objective="OBJ-27")]
+        out = alarms.check_unattributed(rows)
+        self.assertEqual(len(out), 1)
+        self.assertIn("80.0%", out[0])
+
+    def test_non_numeric_costusd_counts_as_zero(self):
+        # Garbage ("free") is not a price: coerced to 0.0, never a TypeError.
+        rows = [_trace_row(NOW - 100, cause="claimed", tid="t_1",
+                           costUsd="free", objective="OBJ-27"),
+                _trace_row(NOW - 90, cause="claimed", tid="t_2",
+                           costUsd=0.90, objective="OBJ-27")]
+        self.assertEqual(alarms.check_unattributed(rows), [])
+
     def test_zero_total_spend_is_silent(self):
         rows = [_trace_row(NOW - 100, cause="claimed", tid="t_1",
                            costUsd=None)]

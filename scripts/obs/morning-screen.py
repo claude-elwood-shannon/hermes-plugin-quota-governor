@@ -158,6 +158,20 @@ def _fmt_usd(v) -> str:
     return f"${v:,.4f}"
 
 
+def _usd_or_zero(v):
+    """costUsd coercion: any missing/non-numeric value counts as $0.00.
+
+    Trace rows are file-fed and hand-backfilled, so costUsd can arrive as
+    a string ("0.07") or garbage ("free"). Coerce or zero it — a raw sum
+    raises TypeError (float + str) and would tumble the screen, the
+    alerts and every portal consumer downstream (t_cecc9dfe).
+    """
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Screen builders
 # ---------------------------------------------------------------------------
@@ -171,7 +185,7 @@ def build_trace_screen(hermes_home=None) -> str:
     lines = []
     n = len(rows)
     with_cost = [r for r in rows if r.get("costUsd")]
-    total_usd = sum(r["costUsd"] for r in with_cost)
+    total_usd = sum(_usd_or_zero(r["costUsd"]) for r in with_cost)
     ts = [r["ts_epoch_utc"] for r in rows if r.get("ts_epoch_utc")]
     span = ""
     if ts:
@@ -185,7 +199,7 @@ def build_trace_screen(hermes_home=None) -> str:
     by_obj = Counter(r.get("objective", "unattributed") for r in rows)
     lines.append("  por objetivo:")
     for obj, c in by_obj.most_common(8):
-        usd = sum(r.get("costUsd") or 0 for r in rows
+        usd = sum(_usd_or_zero(r.get("costUsd")) for r in rows
                   if r.get("objective") == obj)
         mark = "  <-- SIN ETIQUETA (hueco)" if obj == "unattributed" else ""
         lines.append(f"    {obj:<14} {c:>5} lineas  {_fmt_usd(usd)}{mark}")
@@ -491,9 +505,9 @@ def _unattributed_alert(hermes_home: str | Path | None = None) -> str | None:
     total = 0.0
     unatt = 0.0
     for r in _read_jsonl(trace_path(hermes_home)):
-        total += r.get("costUsd") or 0
+        total += _usd_or_zero(r.get("costUsd"))
         if r.get("objective") == "unattributed":
-            unatt += r.get("costUsd") or 0
+            unatt += _usd_or_zero(r.get("costUsd"))
     if total > 0 and (unatt / total * 100) > UNATTRIBUTED_SPEND_PCT:
         return ("unattributed > {:.0f}% del gasto: {:.1f}% (hueco de join)"
                 .format(UNATTRIBUTED_SPEND_PCT, unatt / total * 100))
@@ -635,9 +649,9 @@ def _balance_spent_since(hermes_home: str | Path | None = None,
                          week_start: float = 0.0) -> float:
     """Balance-billed USD from the trace after ``week_start`` (costUsd > 0)."""
     trace_rows = _read_jsonl(trace_path(hermes_home))
-    return sum(r.get("costUsd") or 0 for r in trace_rows
+    return sum(_usd_or_zero(r.get("costUsd")) for r in trace_rows
                if (r.get("ts_epoch_utc") or 0) > week_start
-               and (r.get("costUsd") or 0) > 0)
+               and _usd_or_zero(r.get("costUsd")) > 0)
 
 
 def _render_flight_lines(by_obj: dict, total: int, spent: float) -> str:

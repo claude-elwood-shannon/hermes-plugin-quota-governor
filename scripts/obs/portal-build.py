@@ -1683,7 +1683,7 @@ def page_docs(data: dict, query: dict = None) -> str:
 
 def _real_usd(rows: list) -> float:
     """Sum of REAL money in the window (nanogpt-requests, charged)."""
-    return sum(float(r.get("costUsd") or 0.0) for r in rows
+    return sum(ms._usd_or_zero(r.get("costUsd")) for r in rows
                if r.get("source") in REAL_SOURCES)
 
 
@@ -1724,6 +1724,21 @@ def _objective_budgets(rows: list, hermes_home, now: float) -> dict:
                 "tagged_events": 0}
 
 
+def _alarm_lines(hermes_home, now: float) -> list:
+    """Trace watchdog lines; any internal failure degrades to silence.
+
+    trace-alarms already fails open over corrupt/missing SOURCES, but a
+    malformed VALUE inside a row (costUsd arriving as a string, say) can
+    still raise inside a check — and gather() is the portal's single read
+    pass, so one poisoned row must never take the whole build down.
+    Same fail-open contract as _objective_budgets above: [] on error.
+    """
+    try:
+        return ta.run_checks(hermes_home, now=now)
+    except Exception:
+        return []
+
+
 def gather(hermes_home=None, now=None) -> dict:
     """Read every source once; everything downstream is pure shaping."""
     now = time.time() if now is None else float(now)
@@ -1748,7 +1763,7 @@ def gather(hermes_home=None, now=None) -> dict:
         },
         "doctor": tr.doctor(hermes_home),
         "objective_budgets": _objective_budgets(rows, hermes_home, now),
-        "alarm_lines": ta.run_checks(hermes_home, now=now),
+        "alarm_lines": _alarm_lines(hermes_home, now),
         "alert_cards": od.alert_cards(hermes_home),
         "weekly_ledger": read_weekly_ledger(hermes_home),
         "window_s": _trace_window_s(agg),

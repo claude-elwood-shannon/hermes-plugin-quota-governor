@@ -34,3 +34,13 @@ def test_bar():
     h = _bar(50.5)
     assert '<div class="bar "' in h
     assert 'width:50%' in h
+
+
+def test_gather_alarm_lines_fail_open(monkeypatch, tmp_path):
+    """One poisoned source must never tumble the portal build (t_cecc9dfe):
+    alarm_lines degrades to [] like every other fail-open reader."""
+    def _poison(*a, **k):
+        raise RuntimeError("poisoned row")
+    monkeypatch.setattr(module.ta, "run_checks", _poison)
+    data = module.gather(hermes_home=str(tmp_path))
+    assert data["alarm_lines"] == []
