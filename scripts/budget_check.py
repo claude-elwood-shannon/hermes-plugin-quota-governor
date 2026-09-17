@@ -162,6 +162,71 @@ def pick_alternative(forecast, exclude_profile):
 # ── Núcleo ─────────────────────────────────────────────────────────────────────
 
 
+def _base_fields(row, profile, cls, class_pct, free):
+    """Decision fields shared by every budget verdict."""
+    return {
+        "task_id": row["id"],
+        "title": row["title"],
+        "profile": profile,
+        "class": cls,
+        "class_pct": class_pct,
+        "free_pct": round(free, 1),
+    }
+
+
+def _ng_budget_snapshot():
+    """(budget level, weekly subscription free %) for pr-nanogpt; either may be None."""
+    return _nanogpt_budget_level(), _nanogpt_subscription_free()
+
+
+def _ng_effective_free(free, level, sub_free):
+    """Blend forecast free % with the weekly subscription remainder.
+
+    A 'stop' budget level caps free at the remainder when known; otherwise
+    the remainder only fills in a missing forecast value.
+    """
+    if level == "stop" and sub_free is not None:
+        return sub_free if free is None else min(free, sub_free)
+    if free is None and sub_free is not None:
+        return sub_free
+    return free
+
+
+def _budget_threshold(free):
+    """Largest class_pct that still fits: 10% of the provider's free quota."""
+    return free * MAX_FREE_FRACTION_PCT / 100.0
+
+
+def _reassign_decision(row, profile, cls, class_pct, free, alt, alt_free, enforce):
+    """Build the 'reassign' verdict; execute the move only under --enforce."""
+    decision = _base_fields(row, profile, cls, class_pct, free)
+    decision.update({
+        "verdict": "reassign",
+        "to_profile": alt,
+        "to_free_pct": round(alt_free, 1),
+    })
+    if enforce:
+        _reassign(row["id"], alt)
+        decision["executed"] = True
+    return decision
+
+
+def _triage_decision(row, profile, cls, class_pct, free, enforce):
+    """Build the 'triage' verdict; execute the demotion only under --enforce."""
+    reason = (
+        f"{cls} ({class_pct}%) > 10% de cuota libre ({free:.1f}%) sin alternativa con holgura"
+    )
+    decision = _base_fields(row, profile, cls, class_pct, free)
+    decision.update({
+        "verdict": "triage",
+        "reason": reason,
+    })
+    if enforce:
+        _to_triage(row["id"], reason)
+        decision["executed"] = True
+    return decision
+
+
 def _evaluate_task(row, forecast, enforce):
     """Generate decision for a single task row."""
     profile = row["assignee"]
@@ -171,52 +236,16 @@ def _evaluate_task(row, forecast, enforce):
     class_pct = COST_CLASS_PCT.get(cls, COST_CLASS_PCT[DEFAULT_CLASS])
     free = provider_free_pct(forecast, profile)
     if profile == "pr-nanogpt":
-        ng_level = _nanogpt_budget_level()
-        sub_free = _nanogpt_subscription_free()
-        if ng_level == "stop" and sub_free is not None:
-            free = sub_free if free is None else min(free, sub_free)
-        elif free is None and sub_free is not None:
-            free = sub_free
+        level, sub_free = _ng_budget_snapshot()
+        free = _ng_effective_free(free, level, sub_free)
     if free is None:
         return None
-    free_needed = free * MAX_FREE_FRACTION_PCT / 100.0
-    if class_pct <= free_needed:
+    if class_pct <= _budget_threshold(free):
         return None
     alt, alt_free = pick_alternative(forecast, profile)
-    if alt is not None and alt_free is not None:
-        alt_needed = alt_free * MAX_FREE_FRACTION_PCT / 100.0
-        if class_pct <= alt_needed:
-            decision = {
-                "task_id": row["id"],
-                "title": row["title"],
-                "profile": profile,
-                "class": cls,
-                "class_pct": class_pct,
-                "free_pct": round(free, 1),
-                "verdict": "reassign",
-                "to_profile": alt,
-                "to_free_pct": round(alt_free, 1),
-            }
-            if enforce:
-                _reassign(row["id"], alt)
-                decision["executed"] = True
-            return decision
-    decision = {
-        "task_id": row["id"],
-        "title": row["title"],
-        "profile": profile,
-        "class": cls,
-        "class_pct": class_pct,
-        "free_pct": round(free, 1),
-        "verdict": "triage",
-        "reason": (
-            f"{cls} ({class_pct}%) > 10% de cuota libre ({free:.1f}%) sin alternativa con holgura"
-        ),
-    }
-    if enforce:
-        _to_triage(row["id"], decision["reason"])
-        decision["executed"] = True
-    return decision
+    if alt is not None and alt_free is not None and class_pct <= _budget_threshold(alt_free):
+        return _reassign_decision(row, profile, cls, class_pct, free, alt, alt_free, enforce)
+    return _triage_decision(row, profile, cls, class_pct, free, enforce)
 
 
 def evaluate(db_path=KANBAN_DB, forecast=None, enforce=False, dry_run=True):
