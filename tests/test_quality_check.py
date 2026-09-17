@@ -20,7 +20,8 @@ qc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(qc)
 
 REPORT_KEYS = {"py_compile_failures", "funcs_gt_50",
-               "public_missing_docstrings", "generated_at"}
+               "public_missing_docstrings", "public_missing_type_hints",
+               "generated_at"}
 
 
 def _big_func(name: str, total: int, doc: str | None = None,
@@ -61,6 +62,34 @@ def test_public_missing_docstring_counted(tmp_path):
            + "def another_no_docs():\n    return 4\n")
     rep = qc.scan_root(tmp_path)
     assert rep["public_missing_docstrings"] == 2
+
+
+def test_public_missing_type_hints_counted(tmp_path):
+    """(a) Public module-level functions missing annotations are counted."""
+    _write(tmp_path / "scripts" / "mod.py",
+           "def no_return():\n    return 1\n\n\n"
+           + "def unannotated_param(x):\n    return x\n\n\n"
+           + "def star_args(*args, **kwargs) -> int:\n    return 0\n")
+    rep = qc.scan_root(tmp_path)
+    assert rep["public_missing_type_hints"] == 3
+    assert rep["public_missing_docstrings"] == 3
+
+
+def test_public_type_hints_complete_not_counted(tmp_path):
+    """(b) Annotated/private/async/nested functions are not counted."""
+    _write(tmp_path / "scripts" / "mod.py",
+           "def annotated(x: int) -> int:\n    return x\n\n\n"
+           + "def self_style(self, x: int) -> int:\n    return x\n\n\n"
+           + "def cls_style(cls, x: int) -> int:\n    return x\n\n\n"
+           + "def _private(x):\n    return x\n\n\n"
+           + "async def async_fn(x):\n    return x\n\n\n"
+           + "def wrapper() -> object:\n"
+           + '    """Nested inner stays out of scope."""\n'
+           + "    def inner(x):\n        return x\n"
+           + "    return inner\n")
+    rep = qc.scan_root(tmp_path)
+    assert rep["public_missing_type_hints"] == 0
+    assert rep["public_missing_docstrings"] == 3
 
 
 def test_py_compile_failure_listed(tmp_path):
@@ -148,6 +177,7 @@ def test_missing_scripts_dir_fails_open(tmp_path, capsys):
     assert out["py_compile_failures"] == []
     assert out["funcs_gt_50"] == []
     assert out["public_missing_docstrings"] == 0
+    assert out["public_missing_type_hints"] == 0
     capsys.readouterr()  # drain stdout for cleanliness
 
 

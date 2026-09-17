@@ -23,6 +23,10 @@ Behavior:
     big inner helpers).
   - ``public_missing_docstrings`` counts module-level functions with a
     name not starting with ``_`` and no docstring.
+  - ``public_missing_type_hints`` counts module-level public functions
+    (sync ``def`` only, matching the docstring gauge) that lack a
+    return annotation or carry at least one parameter (``self`` and
+    ``cls`` excluded) without an annotation.
   - Exit code is 0 whenever the scan completes: findings are data, not
     errors -- this is a gauge, not a gate.
 
@@ -90,15 +94,38 @@ def _func_lines(node) -> int:
     return node.end_lineno - node.lineno + 1
 
 
-def scan_file(path: Path, rel: str) -> tuple[list[dict], int]:
-    """AST-scan one file: (entries over 50 lines, public-no-docstring count).
+def _arg_is_selfish(arg: ast.arg) -> bool:
+    """Whether an argument is a plain ``self``/``cls`` (no annotation)."""
+    return arg.arg in ("self", "cls") and arg.annotation is None
+
+
+def _is_unannotated(node: ast.FunctionDef) -> bool:
+    """Whether a module-level public function lacks a return annotation
+    or has any parameter (self/cls excluded) without an annotation."""
+    if node.returns is None:
+        return True
+    args = node.args
+    params = (args.posonlyargs + args.args + args.kwonlyargs
+              + [a for a in (args.vararg, args.kwarg) if a is not None])
+    return any(
+        arg.annotation is None and not _arg_is_selfish(arg)
+        for arg in params
+    )
+
+
+def scan_file(path: Path, rel: str) -> tuple[list[dict], int, list[dict]]:
+    """AST-scan one file: (entries over 50 lines, no-docstring count,
+    no-type-hints count).
 
     Counts module-level public functions (name not starting with "_")
-    lacking a docstring. Functions whose name is not a plain str (e.g.
-    after a broken parse) cannot happen on a compiled-clean file.
+    lacking a docstring, and module-level public sync functions lacking
+    type hints (no return annotation, or any self/cls-excluded parameter
+    without an annotation). Functions whose name is not a plain str
+    (e.g. after a broken parse) cannot happen on a compiled-clean file.
     """
     entries: list[dict] = []
     missing_docs = 0
+    missing_hints: list[dict] = []
     tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
     for node in _iter_functions(tree):
         lines = _func_lines(node)
@@ -108,10 +135,13 @@ def scan_file(path: Path, rel: str) -> tuple[list[dict], int]:
             isinstance(node, ast.FunctionDef)
             and node.col_offset == 0
             and not node.name.startswith("_")
-            and ast.get_docstring(node) is None
         ):
-            missing_docs += 1
-    return entries, missing_docs
+            if ast.get_docstring(node) is None:
+                missing_docs += 1
+            if _is_unannotated(node):
+                missing_hints.append({"file": rel, "func": node.name,
+                                      "lineno": node.lineno})
+    return entries, missing_docs, missing_hints
 
 
 def scan_root(root: Path) -> dict:
@@ -123,18 +153,21 @@ def scan_root(root: Path) -> dict:
     failures: list[str] = []
     funcs_gt_50: list[dict] = []
     public_missing_docstrings = 0
+    missing_hints: list[dict] = []
     for path in iter_py_files(root):
         rel = path.relative_to(root).as_posix()
         if not compiles(path):
             failures.append(rel)
             continue
-        entries, missing_docs = scan_file(path, rel)
+        entries, missing_docs, hints = scan_file(path, rel)
         funcs_gt_50.extend(entries)
         public_missing_docstrings += missing_docs
+        missing_hints.extend(hints)
     return {
         "py_compile_failures": failures,
         "funcs_gt_50": funcs_gt_50,
         "public_missing_docstrings": public_missing_docstrings,
+        "public_missing_type_hints": len(missing_hints),
         "generated_at": datetime.now(timezone.utc).isoformat(
             timespec="seconds"),
     }
@@ -152,8 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(
         description="OBJ-CODEQUALITY gauge: py_compile failures, functions "
-                    "over 50 lines, and public functions missing docstrings "
-                    "under scripts/.")
+                    "over 50 lines, public functions missing docstrings, and "
+                    "public functions missing type hints under scripts/.")
     ap.add_argument("--root", type=Path, default=repo_root,
                     help="repo root whose scripts/ is scanned "
                          "(default: the repo containing this script)")
