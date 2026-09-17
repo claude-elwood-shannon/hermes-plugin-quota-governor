@@ -264,6 +264,7 @@ Key docs:
 | [`docs/objectives.md`](docs/objectives.md) | objectives index (OBJ-*) |
 | [`docs/quota-planner.md`](docs/quota-planner.md) | quota decision machinery |
 | [`docs/obs-portal.md`](docs/obs-portal.md) | the local observability portal |
+| [`docs/crontab-guard.md`](docs/crontab-guard.md) | crontab deploy guard: merge-install + anti-stall canary |
 | [`docs/coding-standards.md`](docs/coding-standards.md) | code conventions for contributions |
 
 ## Additional features

@@ -477,4 +477,21 @@ else
     bash "$HOME/.hermes/scripts/cron-health-check.sh" >> "$CHC_LOG" 2>&1 || true
 fi
 
+# ── Crontab guard (t_da32e7f9): canario anti-REPLACE del crontab ─────────
+# El 2026-09-15 01:25 un deploy REPLACE dejó el crontab de usuario con un
+# solo job durante 32 min (murieron todos los */5 con él). Este tick es el
+# único ejecutor que sobrevivió al incidente (ticker de cron de Hermes,
+# FUERA del crontab de usuario), así que el canario vive aquí: si el número
+# de jobs activos baja respecto al baseline pre-deploy, crontab-guard escribe
+# alarma en cron-alarms.jsonl y restaura el crontab anterior automáticamente.
+# Fail-open: un fallo del canario nunca rompe el tick. DIRECCION-STOP ->
+# solo alarma, sin restauración (ver scripts/crontab-guard.sh).
+CRONTAB_GUARD="$HOME/.hermes/scripts/crontab-guard.sh"
+if [ -x "$CRONTAB_GUARD" ]; then
+    bash "$CRONTAB_GUARD" canary >> "$LOG_FILE" 2>&1 || \
+        log "crontab-guard canary rc!=0 (no fatal; detalle en cron-alarms.jsonl)"
+else
+    log "crontab-guard ausente en $CRONTAB_GUARD — canario NO armado"
+fi
+
 exit 0
