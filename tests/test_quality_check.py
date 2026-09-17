@@ -126,6 +126,48 @@ def test_excluded_paths_never_scanned(tmp_path):
     assert [e["file"] for e in rep["funcs_gt_50"]] == ["scripts/obs/keep.py"]
 
 
+def test_root_module_function_detected(tmp_path):
+    """A >50-line function in a root *.py module is reported under its
+    root-relative name (a), scripts/ stays scanned (b), and no file is
+    reported twice despite both scopes covering the root (c)."""
+    _write(tmp_path / "root_mod.py",
+           _big_func("root_huge", 57, doc="Root module function."))
+    _write(tmp_path / "scripts" / "mod.py",
+           _big_func("scripts_huge", 52, doc="Scripts function."))
+    rep = qc.scan_root(tmp_path)
+    by_file = {e["file"]: e for e in rep["funcs_gt_50"]}
+    assert by_file["root_mod.py"] == {
+        "file": "root_mod.py", "func": "root_huge", "lines": 57}
+    assert by_file["scripts/mod.py"] == {
+        "file": "scripts/mod.py", "func": "scripts_huge", "lines": 52}
+    assert len(rep["funcs_gt_50"]) == 2  # scripts/ traversed only once
+    assert rep["py_compile_failures"] == []
+
+
+def test_root_subdirs_other_than_scripts_not_traversed(tmp_path):
+    """The root walk is non-recursive: big functions in root
+    subdirectories other than scripts/ stay out of scope."""
+    _write(tmp_path / "tmp" / "scratch.py",
+           _big_func("scratch", 60, doc="Scratch space."))
+    _write(tmp_path / ".worktrees" / "wt" / "copy.py",
+           _big_func("copy", 60, doc="Worktree copy."))
+    _write(tmp_path / "__pycache__" / "junk.py",
+           _big_func("junk", 60, doc="Bytecode."))
+    _write(tmp_path / "scripts" / "mod.py",
+           'def fine():\n    """Doc."""\n    return 1\n')
+    rep = qc.scan_root(tmp_path)
+    assert rep["funcs_gt_50"] == []
+    assert rep["py_compile_failures"] == []
+
+
+def test_root_public_missing_docstring_counted(tmp_path):
+    """Docstring/hint counting covers root modules like scripts/ ones."""
+    _write(tmp_path / "root_mod.py", "def no_docs():\n    return 1\n")
+    rep = qc.scan_root(tmp_path)
+    assert rep["public_missing_docstrings"] == 1
+    assert rep["public_missing_type_hints"] == 1
+
+
 def test_nested_function_reported_with_own_span(tmp_path):
     """A function nested inside a big one reports its own >50 span too."""
     inner = "\n".join(

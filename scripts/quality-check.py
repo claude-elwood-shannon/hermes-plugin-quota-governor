@@ -1,5 +1,6 @@
 #!/usr/bin/python3.12
-"""OBJ-CODEQUALITY gauge: deterministic code-quality scan of scripts/.
+"""OBJ-CODEQUALITY gauge: deterministic code-quality scan of the repo
+root and scripts/.
 
 The OBJ-CODEQUALITY success criterion asks that every versioned function
 stays <= 50 lines and that public functions carry docstrings, but no tool
@@ -12,9 +13,12 @@ Usage:
 
 Behavior:
   - Scan scope: the ``scripts/`` directory of --root (default: repo root
-    derived from this file's location). Excluded: ``attic/`` directories,
-    ``test_*`` files under ``scripts/obs/``, ``__pycache__/`` trees, and
-    anything that is not a ``.py`` file.
+    derived from this file's location), recursively, plus the ``*.py``
+    files directly in --root itself (non-recursive: subdirectories of
+    the root other than ``scripts/`` are out of scope). Excluded:
+    ``attic/`` directories, ``test_*`` files under ``scripts/obs/``,
+    ``__pycache__/`` trees, and anything that is not a ``.py`` file.
+    Paths in the report are POSIX-relative to --root (e.g. ``quota_governor.py``).
   - ``py_compile_failures`` lists files that fail compilation (their
     AST findings are skipped).
   - ``funcs_gt_50`` lists every module-level or nested function whose
@@ -50,16 +54,21 @@ EXCLUDED_DIR_NAMES = {"attic", "__pycache__"}
 
 
 def iter_py_files(root: Path) -> list[Path]:
-    """All .py files under root/scripts/ in sorted order, minus exclusions.
+    """All .py files under root/scripts/ plus root's own .py files, sorted.
 
-    Excluded: attic/ and __pycache__/ directories at any depth, and
-    test_* files directly under scripts/obs/ (they are offline suites,
-    already covered by pytest).
+    scripts/ is walked recursively; the repo root contributes only the
+    *.py files directly inside it (subdirectories other than scripts/
+    are not traversed). Excluded: attic/ and __pycache__/ directories
+    at any depth under scripts/, and test_* files directly under
+    scripts/obs/ (they are offline suites, already covered by pytest).
     """
+    found: list[Path] = []
+    for path in sorted(root.glob("*.py")):
+        if path.is_file():
+            found.append(path)
     base = root / SCAN_DIRNAME
     if not base.is_dir():
-        return []
-    found: list[Path] = []
+        return found
     for path in sorted(base.rglob("*.py")):
         if EXCLUDED_DIR_NAMES & set(path.relative_to(base).parts):
             continue
@@ -186,9 +195,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="OBJ-CODEQUALITY gauge: py_compile failures, functions "
                     "over 50 lines, public functions missing docstrings, and "
-                    "public functions missing type hints under scripts/.")
+                    "public functions missing type hints under the repo "
+                    "root and scripts/.")
     ap.add_argument("--root", type=Path, default=repo_root,
-                    help="repo root whose scripts/ is scanned "
+                    help="repo root whose top-level *.py files and "
+                         "scripts/ tree are scanned "
                          "(default: the repo containing this script)")
     ap.add_argument("--json", type=Path, default=None, metavar="OUTFILE",
                     help="also write the report to OUTFILE, creating the "
