@@ -100,6 +100,8 @@ def hermes_root() -> Path:
 
 
 def kanban_db_path() -> Path:
+    """kanban.db location: $AO_KANBAN_DB override, else the shared root
+    copy when it exists, else the pr-ollama profile copy."""
     env = os.environ.get("AO_KANBAN_DB", "").strip()
     if env:
         return Path(env)
@@ -109,6 +111,8 @@ def kanban_db_path() -> Path:
 
 
 def trace_path() -> Path:
+    """trace.jsonl location: $AO_TRACE override, else the pr-ollama profile
+    copy when it exists, else the shared-root copy."""
     env = os.environ.get("AO_TRACE", "").strip()
     if env:
         return Path(env)
@@ -153,6 +157,8 @@ def ensure_table(db: Path) -> bool:
 
 
 def table_exists(db: Path) -> bool:
+    """True when the approved_objectives table exists in db (read-only
+    check; sqlite3.Error counts as absent)."""
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         row = con.execute(
@@ -164,7 +170,9 @@ def table_exists(db: Path) -> bool:
         return False
 
 
-def list_objectives(db: Path, status: Optional[str] = None) -> list:
+def list_objectives(db: Path, status: Optional[str] = None) -> list[dict]:
+    """All objectives as dicts ordered by id, optionally filtered by status.
+    Missing table or sqlite3.Error -> []."""
     if not table_exists(db):
         return []
     try:
@@ -184,6 +192,8 @@ def list_objectives(db: Path, status: Optional[str] = None) -> list:
 
 
 def get_objective(db: Path, oid: str) -> Optional[dict]:
+    """One objective row as a dict, or None when absent (missing table or
+    sqlite3.Error also return None)."""
     if not table_exists(db):
         return None
     try:
@@ -278,6 +288,35 @@ def spend_by_objective_today(trace_file: Path, now: float) -> dict:
     return out
 
 
+def _spend_new_values(r, sums: dict, day: str) -> tuple:
+    """New (spent_today, spent_total, exhausted_days) for one objective row
+    against today's trace sums. delta: the stored spent_today belongs to the
+    day it was last written (last_exhausted_day tracks the last ticked day).
+    A new CEST day means the previous value was yesterday's — the full new
+    sum is today's delta (implicit midnight reset)."""
+    obj = r["id"]
+    new_today = round(sums.get(obj, 0.0), 6)
+    prev_today = r["spent_today"] or 0.0
+    prev_day = r["last_exhausted_day"]
+    if prev_day == day:
+        delta = new_today - prev_today
+    else:
+        delta = new_today
+    new_total = round((r["spent_total"] or 0.0) + max(delta, 0.0), 6)
+    exhausted = 1 if (new_today >= r["budget_daily"]
+                      and r["budget_daily"] > 0) else 0
+    if exhausted:
+        if prev_day == day:
+            ed = r["exhausted_days"] or 0  # already counted today
+        elif prev_day and _prev_day_of(day) == prev_day:
+            ed = (r["exhausted_days"] or 0) + 1
+        else:
+            ed = 1
+    else:
+        ed = 0
+    return new_today, new_total, ed
+
+
 def update_spend(db: Path, now: float | None = None) -> dict:
     """Tick-side spend update (§5.1-5.4). spent_today = trace sum for the
     current CEST day (implicit midnight reset); spent_total += positive
@@ -299,29 +338,7 @@ def update_spend(db: Path, now: float | None = None) -> dict:
             if r["status"] == "discarded":
                 continue
             obj = r["id"]
-            new_today = round(sums.get(obj, 0.0), 6)
-            prev_today = r["spent_today"] or 0.0
-            prev_day = r["last_exhausted_day"]
-            # delta: the stored spent_today belongs to the day it was last
-            # written (last_exhausted_day tracks the last ticked day). A
-            # new CEST day means the previous value was yesterday's — the
-            # full new sum is today's delta (implicit midnight reset).
-            if prev_day == day:
-                delta = new_today - prev_today
-            else:
-                delta = new_today
-            new_total = round((r["spent_total"] or 0.0) + max(delta, 0.0), 6)
-            exhausted = 1 if (new_today >= r["budget_daily"]
-                              and r["budget_daily"] > 0) else 0
-            if exhausted:
-                if prev_day == day:
-                    ed = r["exhausted_days"] or 0  # already counted today
-                elif prev_day and _prev_day_of(day) == prev_day:
-                    ed = (r["exhausted_days"] or 0) + 1
-                else:
-                    ed = 1
-            else:
-                ed = 0
+            new_today, new_total, ed = _spend_new_values(r, sums, day)
             con.execute(
                 "UPDATE approved_objectives SET spent_today=?, spent_total=?,"
                 " exhausted_days=?, last_exhausted_day=?, updated_at=?, "
@@ -374,6 +391,8 @@ def _events_path() -> Path:
 
 
 def _log_event(entry: dict) -> None:
+    """Append one JSON line to logs/objective-events.jsonl under the Hermes
+    root (best-effort: OSError is swallowed)."""
     try:
         p = _events_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +480,35 @@ _CHECKERS = {"OBJ-VLLM": _check_vllm_criterion,
              "OBJ-METRICS": _check_metrics_criterion}
 
 
+def _lifecycle_from_active(con, r, oid: str, now: float,
+                           dry: bool) -> Optional[str]:
+    """§8 transitions for one ACTIVE objective row. Executes the DB update
+    (unless dry) and logs the event; returns the human line for the tick
+    screen, or None when no transition applies."""
+    checker = _CHECKERS.get(oid)
+    if checker:
+        verified, detail = checker()
+        if verified:
+            if not dry:
+                con.execute(
+                    "UPDATE approved_objectives SET "
+                    "status='achieved', updated_at=?, "
+                    "updated_by='system' WHERE id=? AND "
+                    "status='active'", (now, oid))
+            _log_event({"ts": now, "id": oid,
+                        "event": "achieved", "detail": detail})
+            return f"✅ {oid} achieved — success criterion verificado ({detail})"
+    if (r["exhausted_days"] or 0) >= 3 and r["budget_daily"]:
+        if not dry:
+            con.execute(
+                "UPDATE approved_objectives SET status='paused',"
+                " updated_at=?, updated_by='system' WHERE id=?"
+                " AND status='active'", (now, oid))
+        _log_event({"ts": now, "id": oid, "event": "paused"})
+        return f"⚠ {oid} paused — budget agotado 3 días seguidos"
+    return None
+
+
 def run_lifecycle(db: Path, now: float | None = None, dry: bool = False) -> list:
     """§8 transitions. Returns list of human lines for the tick/screen:
     '✅ OBJ-X achieved — ...' / '⚠ OBJ-X paused — ...' / '↻ OBJ-X reactivated'."""
@@ -479,30 +527,10 @@ def run_lifecycle(db: Path, now: float | None = None, dry: bool = False) -> list
             if oid in PERPETUAL:
                 continue
             if status == "active":
-                checker = _CHECKERS.get(oid)
-                if checker:
-                    verified, detail = checker()
-                    if verified:
-                        if not dry:
-                            con.execute(
-                                "UPDATE approved_objectives SET "
-                                "status='achieved', updated_at=?, "
-                                "updated_by='system' WHERE id=? AND "
-                                "status='active'", (now, oid))
-                        line = f"✅ {oid} achieved — success criterion verificado ({detail})"
-                        out.append(line)
-                        _log_event({"ts": now, "id": oid,
-                                    "event": "achieved", "detail": detail})
-                        continue
-                if (r["exhausted_days"] or 0) >= 3 and r["budget_daily"]:
-                    if not dry:
-                        con.execute(
-                            "UPDATE approved_objectives SET status='paused',"
-                            " updated_at=?, updated_by='system' WHERE id=?"
-                            " AND status='active'", (now, oid))
-                    line = f"⚠ {oid} paused — budget agotado 3 días seguidos"
-                    out.append(line)
-                    _log_event({"ts": now, "id": oid, "event": "paused"})
+                line = _lifecycle_from_active(con, r, oid, now, dry)
+                if line is None:
+                    continue
+                out.append(line)
             elif status == "paused":
                 if (r["spent_today"] or 0.0) < r["budget_daily"]:
                     if not dry:
@@ -511,8 +539,8 @@ def run_lifecycle(db: Path, now: float | None = None, dry: bool = False) -> list
                             " exhausted_days=0, updated_at=?, "
                             "updated_by='system' WHERE id=? AND "
                             "status='paused'", (now, oid))
-                    line = f"↻ {oid} reactivado — budget disponible de nuevo"
-                    out.append(line)
+                    out.append(f"↻ {oid} reactivado — "
+                               "budget disponible de nuevo")
                     _log_event({"ts": now, "id": oid,
                                 "event": "reactivated"})
         if not dry:
@@ -527,7 +555,9 @@ def run_lifecycle(db: Path, now: float | None = None, dry: bool = False) -> list
 # CLI (ops)
 # ---------------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def main(argv: Optional[list] = None) -> int:
+    """CLI: --ensure / --update-spend / --lifecycle [--dry-run] / --list
+    [--status] with --db override; defaults to the inventory listing."""
     import argparse
     ap = argparse.ArgumentParser(description="approved objectives inventory")
     ap.add_argument("--db", default=None)
