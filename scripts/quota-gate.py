@@ -75,6 +75,8 @@ Design references:
   - ~/.hermes/profiles/pr-ollama/docs/privacy-by-provider-design.md §7
   - ~/.hermes/profiles/pr-ollama/docs/autonomous-objectives.md §8.6
 """
+from __future__ import annotations
+
 import datetime
 import json
 import os
@@ -84,6 +86,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from typing import Any
 
 # Modo sugerente (OBJ-24 F2): --suggest inyecta forecast_warning en el
 # contexto (OBSERVADOR, nunca cambia wakeAgent ni la recomendación).
@@ -245,7 +248,9 @@ def _nanogpt_balance_module():
     return _NANOGPT_BALANCE_MOD
 
 
-def nanogpt_budget_context(hermes_home=None):
+def nanogpt_budget_context(
+    hermes_home: str | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
     """Best-effort OBJ-26 balance budget block for the gate snapshot.
 
     Returns (context_dict_or_None, warning_list).  Never fatal: any error
@@ -311,7 +316,7 @@ PROVIDERS_CONFIG_PATH = os.path.join(
 )
 
 
-def load_providers_config(path=None):
+def load_providers_config(path: str | None = None) -> dict[str, Any]:
     """Read providers.json (provider-profile config). Returns {} if absent.
 
     Format: {"providers": {"<profile>": {"parked": bool, "reason": str}}}
@@ -329,7 +334,7 @@ def load_providers_config(path=None):
         return {}
 
 
-def get_parked_profiles(config=None):
+def get_parked_profiles(config: dict[str, Any] | None = None) -> set[str]:
     """Set of profile names marked parked:true — temporarily out of use.
 
     Parked profiles are excluded from the candidate set BEFORE
@@ -349,7 +354,7 @@ def get_parked_profiles(config=None):
 # Environment helpers
 # ---------------------------------------------------------------------------
 
-def get_env(key):
+def get_env(key: str) -> str | None:
     """Read from environment or .env file."""
     val = os.environ.get(key)
     if val:
@@ -464,7 +469,7 @@ def _write_cache(provider, data):
         pass
 
 
-def load_burn_warnings():
+def load_burn_warnings() -> dict[str, Any]:
     """Read the burn-watchdog's active warnings (MULTI-PROV-08).
 
     The watchdog persists open burn warnings to
@@ -483,7 +488,7 @@ def load_burn_warnings():
         return {}
 
 
-def load_forecast():
+def load_forecast() -> dict[str, Any]:
     """Read the OBJ-24 F2 predictor output (forecast.json).
 
     Written by quota-forecast.py (no_agent cron, every 15m after
@@ -498,7 +503,7 @@ def load_forecast():
         return {}
 
 
-def forecast_context(forecast):
+def forecast_context(forecast: dict[str, Any]) -> dict[str, Any] | None:
     """Build the ``forecast_warning`` block for the creator context (F2).
 
     Decision rule (criterio definido en la tarea OBJ-24):
@@ -565,7 +570,7 @@ def _forecast_fired_rules(providers, reset_h):
 # Profile validation (Guardrail G1)
 # ---------------------------------------------------------------------------
 
-def get_existing_profiles():
+def get_existing_profiles() -> set[str]:
     """Return the set of profile names that actually exist on this host.
 
     Parses `hermes profile list` output. Falls back to the known-good
@@ -598,8 +603,10 @@ def get_existing_profiles():
     return profiles
 
 
-def validate_recommended_profile(recommended, existing, warnings,
-                                 providers_list=None, parked=None):
+def validate_recommended_profile(recommended: str, existing: set[str],
+                                 warnings: list[str],
+                                 providers_list: list[dict[str, Any]] | None = None,
+                                 parked: set[str] | None = None) -> str | None:
     """Return a profile that is safe to assign tasks to.
 
     Guardrail G1: the recommended profile must (a) exist on the host and
@@ -674,7 +681,7 @@ def _fallback_allowed_profile(providers_list, existing, parked):
 # Provider queries
 # ---------------------------------------------------------------------------
 
-def query_ollama():
+def query_ollama() -> dict[str, Any]:
     """Query Ollama Cloud usage. Returns dict or raises."""
     api_key = get_env("OLLAMA_API_KEY")
     if not api_key:
@@ -710,7 +717,7 @@ def query_ollama():
     return result
 
 
-def query_nanogpt():
+def query_nanogpt() -> dict[str, Any]:
     """Query NanoGPT subscription usage. Returns dict or raises.
 
     Falls back to last-known-good cache on transient errors (OBJ-20).
@@ -750,7 +757,7 @@ def query_nanogpt():
     return result
 
 
-def query_openrouter():
+def query_openrouter() -> dict[str, Any]:
     """Query OpenRouter key usage. Returns dict or raises.
 
     Falls back to last-known-good cache on transient errors (OBJ-20).
@@ -794,7 +801,7 @@ def query_openrouter():
     return result
 
 
-def query_opencode_go():
+def query_opencode_go() -> dict[str, Any]:
     """Query OpenCode Go usage (MULTI-PROV-06). Returns dict or raises.
 
     Endpoint: GET https://opencode.ai/zen/go/v1/usage
@@ -969,7 +976,7 @@ PEAK_AFFECTED_MODELS = {
 }
 
 
-def is_peak_hours(now=None):
+def is_peak_hours(now: datetime.datetime | None = None) -> bool:
     """True if *now* (UTC, default: current time) falls in peak pricing hours.
 
     Peak = Monday–Friday within any PEAK_WINDOWS_UTC hour range.
@@ -982,7 +989,7 @@ def is_peak_hours(now=None):
     return any(start <= now.hour < end for start, end in PEAK_WINDOWS_UTC)
 
 
-def peak_pricing_context(now=None):
+def peak_pricing_context(now: datetime.datetime | None = None) -> dict[str, Any]:
     """Build the peak_pricing block for the gate output context."""
     active = is_peak_hours(now)
     return {
@@ -999,7 +1006,7 @@ def peak_pricing_context(now=None):
     }
 
 
-def worker_model_for(profile):
+def worker_model_for(profile: str) -> str | None:
     """Cheap worker model for *profile* (MULTI-PROV-07 rule).
 
     Falls back to the interactive PROFILE_MODELS entry if the profile has
@@ -1040,7 +1047,9 @@ _LEDGER_UNSET = object()
 _MODEL_LEDGER_MOD = _LEDGER_UNSET
 
 
-def model_cost_context(rolling_resets_at=None):
+def model_cost_context(
+    rolling_resets_at: str | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
     """Best-effort per-model cost block for the gate snapshot.
 
     Returns (context_dict_or_None, warning_list).  Opportunistically syncs
@@ -1068,7 +1077,7 @@ PROVIDER_PREFERENCE = {
 }
 
 
-def compute_ollama_status():
+def compute_ollama_status() -> dict[str, Any]:
     """Build a ProviderStatus dict for Ollama Cloud."""
     raw = query_ollama()
     s = raw["session_pct"]
@@ -1098,7 +1107,7 @@ def compute_ollama_status():
     }
 
 
-def compute_nanogpt_status(budget=None):
+def compute_nanogpt_status(budget: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build a ProviderStatus dict for NanoGPT.
 
     OBJ-26 covered-first policy: when the subscription is healthy the
@@ -1206,7 +1215,7 @@ def _nanogpt_availability(weekly_pct, budget):
     return availability, bottleneck_window, bottleneck_pct
 
 
-def compute_openrouter_status():
+def compute_openrouter_status() -> dict[str, Any]:
     """Build a ProviderStatus dict for OpenRouter."""
     raw = query_openrouter()
     limit = raw.get("limit")
@@ -1278,7 +1287,7 @@ def _openrouter_bottleneck(limit, usage, weekly_usd):
     return bottleneck_pct, bottleneck_window
 
 
-def compute_opencode_go_status():
+def compute_opencode_go_status() -> dict[str, Any]:
     """Build a ProviderStatus dict for OpenCode Go (MULTI-PROV-06).
 
     All three windows (rolling, weekly, monthly) contribute to the
@@ -1392,7 +1401,7 @@ def _opencode_window_pcts(windows):
 # Decision algorithm
 # ---------------------------------------------------------------------------
 
-def bottleneck_to_max_cost(bottleneck_pct):
+def bottleneck_to_max_cost(bottleneck_pct: float) -> str:
     """Map bottleneck percentage to max_task_cost tier."""
     if bottleneck_pct < 30:
         return "any"
@@ -1405,7 +1414,7 @@ def bottleneck_to_max_cost(bottleneck_pct):
     return "micro"
 
 
-def bottleneck_to_max_workers(bottleneck_pct):
+def bottleneck_to_max_workers(bottleneck_pct: float) -> int:
     """Map bottleneck percentage to max workers."""
     if bottleneck_pct < 50:
         return 2
@@ -1456,8 +1465,8 @@ def _normalise_privacy_value(value):
     return None
 
 
-def parse_privacy_tag(text):
-    """Extract the privacy level from a task body or arbitrary text.
+def parse_privacy_tag(text: str | None) -> str | None:
+    """Extrae el nivel de privacidad de un cuerpo de tarea o texto.
 
     Looks for ``privacy: <level>`` where <level> is one of
     public, sensitive, or confidential — or the high/medium/low
@@ -1635,8 +1644,9 @@ def _compute_privacy_summary_core(kanban_db_path=None, warnings=None):
 
 
 
-def compute_privacy_summary(kanban_db_path=None, warnings=None):
-    """Census the privacy: tags of active tasks in kanban.db (OBJ-18 S1)."""
+def compute_privacy_summary(kanban_db_path: str | None = None,
+                            warnings: list[str] | None = None) -> dict[str, int]:
+    """Censa las etiquetas privacy: de las tareas activas (OBJ-18 S1)."""
     return _compute_privacy_summary_core(kanban_db_path, warnings)
 
 def _tally_privacy_rows(rows, summary, warnings):
@@ -1689,8 +1699,9 @@ def _tally_privacy_rows(rows, summary, warnings):
 # lives in approved_objectives.budget_check (§6), which the tick applies.
 # ---------------------------------------------------------------------------
 
-def compute_objectives_snapshot(kanban_db_path=None, warnings=None):
-    """Read-only snapshot of active approved_objectives rows.
+def compute_objectives_snapshot(kanban_db_path: str | None = None,
+                                warnings: list[str] | None = None) -> list[dict[str, Any]]:
+    """Snapshot de solo lectura de las filas activas de approved_objectives.
 
     Returns a list of dicts (id, name, status, budget_daily, spent_today,
     description, success_criterion) sorted by id, ACTIVE rows only — the
@@ -1733,7 +1744,9 @@ def compute_objectives_snapshot(kanban_db_path=None, warnings=None):
     return out
 
 
-def compute_zombie_check(kanban_db_path=None, warnings=None, now=None):
+def compute_zombie_check(kanban_db_path: str | None = None,
+                         warnings: list[str] | None = None,
+                         now: float | None = None) -> dict[str, Any]:
     """Deterministic G3 zombie guard (OBJ-21, t_e793b2b9, Sep 2026).
 
     Scans kanban.db ``running`` tasks whose live age exceeds
@@ -1846,7 +1859,7 @@ def _zombie_rows(rows, now):
     return zombies
 
 
-def parse_privacy_level():
+def parse_privacy_level() -> str | None:
     """Determine the privacy level for this gate run.
 
     Resolution order:
@@ -1878,8 +1891,10 @@ def parse_privacy_level():
     return None
 
 
-def select_provider(providers_list, privacy_level=None, parked=None,
-                    nanogpt_budget=None):
+def select_provider(providers_list: list[dict[str, Any]],
+                    privacy_level: str | None = None,
+                    parked: set[str] | None = None,
+                    nanogpt_budget: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Pick the provider with the most available quota.
 
     *parked* (t_7da69d59): profiles marked ``parked: true`` are removed
@@ -2213,7 +2228,8 @@ def _emit_active(providers_list, warnings, privacy_level, zombie_check,
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
+    """Punto de entrada del gate: sondea proveedores y emite el veredicto."""
     warnings = []
 
     # --- Parse privacy level (Phase 2) ---
