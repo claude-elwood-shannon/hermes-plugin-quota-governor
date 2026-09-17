@@ -1,4 +1,4 @@
-name: quota-governor
+name: self-govern
 version: 0.2.0
 description: "Self-governance by quota — observe kanban lifecycle, query provider quota, and coordinate the daemon accordingly."
 author: "claude-elwood-shannon + Hermes Agent"
