@@ -16,13 +16,16 @@ subset lanza ValueError — los consumidores deben hacer fail-closed.
 Test de conformance: tests/test_capability_guard.py compara su salida contra
 PyYAML (en entornos de desarrollo donde existe) para cada manifest del repo.
 """
+from __future__ import annotations
+
 import re
+from typing import Any
 
 
 _KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:")
 
 
-def strip_comment(s):
+def strip_comment(s: str) -> str:
     """Elimina ' #' de comentario fuera de comillas."""
     out = []
     quote = None
@@ -45,7 +48,7 @@ def strip_comment(s):
     return "".join(out).rstrip()
 
 
-def scalar(tok):
+def scalar(tok: str) -> str | bool | int | float | None:
     tok = tok.strip()
     if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
         return tok[1:-1]
@@ -67,7 +70,7 @@ def scalar(tok):
     return tok
 
 
-def flow(tok):
+def flow(tok: str) -> list[str | bool | int | float | None]:
     """'[a, b]' → ['a', 'b'] (sin comas anidadas: no se usa en estos manifests)."""
     inner = tok.strip()[1:-1].strip()
     if not inner:
@@ -75,7 +78,7 @@ def flow(tok):
     return [scalar(p) for p in inner.split(",")]
 
 
-def _sig_lines(raw):
+def _sig_lines(raw: str) -> list[tuple[int, str]]:
     out = []
     for line in raw.splitlines():
         if not line.strip() or line.strip().startswith("#"):
@@ -88,7 +91,7 @@ def _sig_lines(raw):
     return out
 
 
-def _parse_block(sigs, i, indent):
+def _parse_block(sigs: list[tuple[int, str]], i: int, indent: int) -> tuple[Any, int]:
     """Parsea un bloque (mapa o lista) en sigs[i] con columna `indent`."""
     if sigs[i][1] == "-" or sigs[i][1].startswith("- "):
         return _parse_list(sigs, i, indent)
@@ -116,7 +119,7 @@ def _parse_block(sigs, i, indent):
     return out, i
 
 
-def _parse_list(sigs, i, indent):
+def _parse_list(sigs: list[tuple[int, str]], i: int, indent: int) -> tuple[list, int]:
     out = []
     while i < len(sigs) and sigs[i][0] == indent and (
             sigs[i][1] == "-" or sigs[i][1].startswith("- ")):
@@ -162,7 +165,7 @@ def _parse_list(sigs, i, indent):
     return out, i
 
 
-def load(path) -> dict:
+def load(path: str) -> dict:
     """Carga `path` (subset YAML) → dict. Lanza ValueError/OSError si el
     contenido está fuera del subset (los consumidores hacen fail-closed)."""
     with open(path, encoding="utf-8") as fh:
