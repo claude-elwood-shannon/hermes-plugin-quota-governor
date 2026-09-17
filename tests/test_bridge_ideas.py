@@ -213,7 +213,7 @@ def test_ideas_sorted_missing_dir(monkeypatch, tmp_path):
 def test_openapi_declares_new_endpoints():
     code, spec = req("GET", "/openapi.json")
     assert code == 200
-    assert spec["info"]["version"] == "1.7.0"
+    assert spec["info"]["version"] == "1.9.0"
     paths = spec["paths"]
     assert paths["/save-idea"]["post"]["operationId"] == "save_idea"
     assert paths["/ideas"]["get"]["operationId"] == "list_ideas"

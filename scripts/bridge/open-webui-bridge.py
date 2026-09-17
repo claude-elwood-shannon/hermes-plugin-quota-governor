@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """Hermes Bridge API — expone operaciones de Hermes para Open WebUI.
 
+v1.9.0 — t_a003af3e (MEDIATOR 2026-09-17): bootstrap — contexto inicial
+      consolidado en una sola llamada (punto de partida único para cualquier
+      mediador):
+      GET  /bootstrap — plugin info (plugin.yaml vía miniyaml, misma fuente
+                        única que las capabilities), board stats, objectives,
+                        capabilities, health (bridge + crons) y lista de
+                        endpoints. Best-effort por bloque: una fuente caída
+                        degrada a {"error": ...}, jamás tumba la respuesta.
+                        NO incluye ideas pendientes (parking lot aparte:
+                        GET /ideas, t_0c6a7847).
+
 v1.8.0 — t_d8df248b (MEDIATOR 2026-09-17): gobernanza P3 — endpoints de
       presets y objectives extendidos (schema P1 en kanban.db, t_67876b3f).
       GET  /presets          — inventario adjustment_presets (5 del sistema)
@@ -402,6 +413,9 @@ IDEAS_DIR = os.path.join(HERMES_HOME, "data", "ideas")
 # saves consecutivos en el mismo segundo; el último tramo se incrementa si el
 # fichero ya existe.
 IDEA_ID_RE = re.compile(r"^idea_[0-9]{8}_[0-9]{6}_[0-9]{3}$")
+# t_a003af3e v1.9: bootstrap — tamaño máximo del tail de un log embebido;
+# los logs completos siguen disponibles por sus endpoints individuales.
+_BOOTSTRAP_LOG_LINES = 5
 METRICS_JSONL = os.path.join(
     HERMES_HOME, "profiles", "pr-ollama", "quota-governor", "metrics-history.jsonl")
 DEFAULT_GIT_REPO = PLUGIN_REPO
@@ -442,7 +456,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.7.0",
+    "info": {"title": "Hermes Bridge", "version": "1.9.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -489,6 +503,11 @@ OPENAPI_SPEC = {
                     "description": "Returns the ideas parked under ~/.hermes/data/ideas/, newest first. Not part of the bootstrap: read on demand.",
                     "operationId": "list_ideas",
                     "responses": {"200": {"description": "Ideas list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        # ---- t_a003af3e v1.9: bootstrap (contexto inicial consolidado) ----
+        "/bootstrap": {"get": {"summary": "One-call initial context for mediators",
+                    "description": "Consolidates plugin info (plugin.yaml), kanban board stats, approved objectives, modular capabilities, health (bridge + cron health summary) and the list of bridge endpoints. Best-effort per block: a failed source degrades to {\"error\": ...} and never breaks the response. Does NOT include parked ideas (see GET /ideas).",
+                    "operationId": "get_bootstrap",
+                    "responses": {"200": {"description": "Bootstrap context", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_74f5f315 v1.6: métricas Prometheus (texto 0.0.4) ----
         "/metrics-prometheus": {"get": {"summary": "Prometheus metrics", "description": "Returns bridge/board metrics as Prometheus text format 0.0.4 (pull-only): tasks by status, objective spend/budget, quotas, supply ratio, cron health, GPU ml-host. All sources best-effort; zero dependencies.", "operationId": "get_metrics_prometheus", "responses": {"200": {"description": "Prometheus exposition", "content": {"text/plain": {"schema": {"type": "string"}}}}}}},
         # ---- t_2c9322f1 v1.5: capacidades modulares (SOLO LECTURA) ----
@@ -1337,6 +1356,42 @@ def _bw_approve_promote_move(task_id, run):
     return False, "promote did not reach ready"
 
 
+# ------------------------------------------------ bootstrap (t_a003af3e)
+
+def _bs_cron_health():
+    """Resumen del último run de cron-health-check (JSONL de cron-health.sh).
+
+    Devuelve dict con ts/checked/ok/dead/never_run/zombie o {"error": ...}
+    si el fichero no existe o la última línea no parsea (best-effort)."""
+    path = os.path.join(HERMES_HOME, "logs", "cron-health-check.jsonl")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            last = None
+            for line in f:
+                line = line.strip()
+                if line:
+                    last = line
+        if last:
+            d = json.loads(last)
+            if isinstance(d, dict):
+                return d
+    except Exception as e:
+        return {"error": str(e)}
+    return {"error": f"no summary line in {os.path.basename(path)}"}
+
+
+def _bs_capabilities_block():
+    """Bloque capabilities para /bootstrap (best-effort, mismas reglas que
+    GET /capabilities: cache 60 s, capacidades rotas saltadas + load_errors)."""
+    try:
+        caps = _load_capabilities()
+        return {"capabilities": [_capability_payload(c) for c in caps],
+                "count": len(caps),
+                "load_errors": _CAP_MANIFEST_CACHE["errors"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ------------------------------------------------------------------- server
 
 # ------------------------------------------- idea parking lot (t_0c6a7847)
@@ -1378,7 +1433,7 @@ def _ideas_sorted():
 
 
 class HermesBridge(BaseHTTPRequestHandler):
-    server_version = "HermesBridge/1.6"
+    server_version = "HermesBridge/1.9"
 
     def _send_json(self, data, code=200):
         self.send_response(code)
@@ -1491,6 +1546,8 @@ class HermesBridge(BaseHTTPRequestHandler):
             self._handle_prometheus()
         elif path == "/objectives":
             self._handle_objectives(qs)
+        elif path == "/bootstrap":
+            self._handle_bootstrap()
         elif path == "/ideas":
             self._handle_ideas()
         else:
@@ -1583,6 +1640,72 @@ class HermesBridge(BaseHTTPRequestHandler):
                                       "(kanban.db missing or table absent)"}, 503)
         else:
             self._send_json({"objectives": rows, "count": len(rows)})
+
+    def _handle_bootstrap(self) -> None:
+        """GET /bootstrap — contexto inicial consolidado (t_a003af3e, v1.9).
+
+        Punto de partida único para cualquier mediador: plugin info, board
+        stats, objectives, capabilities, health y lista de endpoints. Cada
+        bloque es best-effort (un fallo degrada a {"error": ...} en su
+        bloque, jamás tumba la respuesta). NO incluye ideas pendientes —
+        el parking lot se consulta aparte (GET /ideas)."""
+        # plugin.yaml: misma fuente única (_miniyaml) que las capabilities.
+        try:
+            _miniyaml = _cap_miniyaml()
+            plugin_info = _miniyaml.load(os.path.join(PLUGIN_REPO, "plugin.yaml"))
+            if not isinstance(plugin_info, dict):
+                plugin_info = {"error": "plugin.yaml did not parse to a mapping"}
+        except Exception as e:
+            plugin_info = {"error": str(e)}
+        # stats: mismo comando que GET /board (15s cap, fallback SQLite
+        # dentro de _load_tasks si el CLI no responde).
+        raw = "ERROR: cli unavailable"
+        try:
+            raw = self._run(["hermes", "kanban", "stats", "--json"])
+        except Exception as e:
+            raw = f"ERROR: {e}"
+        try:
+            stats = json.loads(raw)
+            if not isinstance(stats, dict):
+                stats = {"error": "unexpected kanban stats output"}
+        except Exception:
+            stats = {"error": raw[:200] if raw.startswith("ERROR:")
+                     else "unexpected kanban stats output"}
+        # objectives: reuso exacto de la lógica de /objectives.
+        status = None
+        rows = _ao_list(status)
+        objectives = ({"objectives": rows, "count": len(rows)}
+                      if rows is not None else
+                      {"error": "approved_objectives unavailable "
+                                "(kanban.db missing or table absent)"})
+        # health: bridge vivo (esta respuesta) + último resumen de crons.
+        health = {
+            "bridge": {"alive": True, "port": PORT,
+                       "server_version": self.server_version,
+                       "spec_version": OPENAPI_SPEC["info"]["version"]},
+            "crons": _bs_cron_health(),
+        }
+        # Lista de endpoints extraída del propio spec (fuente única: cualquier
+        # endpoint futuro aparece aquí automáticamente al documentarse).
+        endpoints = sorted(
+            f"{'POST' if 'post' in ops else 'GET'} {p}"
+            for p, ops in OPENAPI_SPEC["paths"].items())
+        self._send_json({
+            "bootstrap_version": 1,
+            "plugin": plugin_info,
+            "board": {"stats": stats},
+            "objectives": objectives,
+            "capabilities": _bs_capabilities_block(),
+            "health": health,
+            "endpoints": endpoints,
+            "endpoint_count": len(endpoints),
+            "logs_tail": {
+                "watchdog": self._read_log("logs/kanban-watchdog.log",
+                                           _BOOTSTRAP_LOG_LINES),
+                "tick": self._read_log("logs/quota-governor-tick.log",
+                                       _BOOTSTRAP_LOG_LINES),
+                "health": self._read_log("logs/cron-health-check.log",
+                                         _BOOTSTRAP_LOG_LINES)}})
 
     def _handle_get_task(self, qs):
         task_id = (qs.get("task_id") or [""])[0].strip()
@@ -1922,7 +2045,7 @@ class HermesBridge(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Hermes Bridge API v1.7 on http://0.0.0.0:{PORT}")
+    print(f"Hermes Bridge API v1.9 on http://0.0.0.0:{PORT}")
     HTTPServer(("0.0.0.0", PORT), HermesBridge).serve_forever()
 
 

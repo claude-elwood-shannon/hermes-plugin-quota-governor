@@ -1,7 +1,7 @@
 # Bridge Guide — Hermes Bridge API (port 9120)
 
 Complete, self-contained reference for every endpoint of the Hermes Bridge
-(`scripts/bridge/open-webui-bridge.py`, server version 1.6). If you read only
+(`scripts/bridge/open-webui-bridge.py`, server version 1.9). If you read only
 this file, you know how to use the bridge. Infrastructure and lifecycle
 (systemd unit, cron monitor, convergence) are covered in
 [`bridge-open-webui.md`](bridge-open-webui.md); this guide is about the API
@@ -45,10 +45,7 @@ board stats, objectives inventory, capabilities, health and the list of
 bridge endpoints. It is the single starting point — everything it returns
 can also be fetched individually (see the endpoint tables below).
 
-> Deployment note: `/bootstrap` is being added by task `t_a003af3e` and is
-> **not present in v1.6 yet**. Until it ships, assemble the same context
-> from `GET /snapshot` + `GET /objectives` + `GET /capabilities` +
-> `GET /health` (all documented below).
+> Deployment note: `/bootstrap` shipped in **v1.9** (task `t_a003af3e`).
 
 Machine-readable contract and liveness probe (what the monitor curls):
 
@@ -70,7 +67,7 @@ curl -s 'http://localhost:9120/backup/health'
 | # | Endpoint | Parameters | Description |
 |---|----------|------------|-------------|
 | 1 | `GET /openapi.json` | — | OpenAPI 3.0 spec of the whole API; doubles as the health probe (200 = alive). |
-| 2 | `GET /bootstrap` | — | One-call initial context: plugin info, board stats, objectives, capabilities, health, endpoints list. *(Scheduled, `t_a003af3e` — not in v1.6 yet.)* |
+| 2 | `GET /bootstrap` | — | One-call initial context: plugin info, board stats, objectives, capabilities, health (bridge + cron summary), endpoints list and short log tails. Best-effort per block: a failed source degrades to `{"error": ...}` and the rest still answers. Does NOT include parked ideas (see `GET /ideas`). |
 | 3 | `GET /board` | — | Kanban stats plus active tasks (`ready`/`running`/`blocked`): `{stats, active[]}`. |
 | 4 | `GET /snapshot` | — | Board + active + `triage` queue (with tags) + last lines of watchdog/tick/health/efficiency logs. The everything-at-a-glance read. |
 | 5 | `GET /watchdog` | — | Last 15 lines of `logs/kanban-watchdog.log`. |
@@ -145,7 +142,7 @@ task and a version bump.
 1. **Zero dependencies.** Python stdlib only (`http.server`, `subprocess`,
    `sqlite3`); it shells out to the `hermes` and `git` CLIs and `restic`.
    No pip install, no venv, no tokens burned serving reads.
-2. **Read-only by default.** 24 GET endpoints vs 6 POST endpoints. The
+2. **Read-only by default.** 25 GET endpoints vs 6 POST endpoints. The
    monitoring families (`/backup/*`, `/gpu/health`, `/capabilities/*`)
    never mutate anything — backup endpoints never run
    backup/restore/prune; capability probes only ever SSH to hosts declared
@@ -181,8 +178,9 @@ pointing at `http://192.168.1.57:9120`; raw `curl` works identically.
 
 ### Standing routine
 
-1. **Orient** — `GET /bootstrap` (or `GET /snapshot` on v1.6). One call
-   tells you board state, objectives, capabilities and health.
+1. **Orient** — `GET /bootstrap` (or `GET /snapshot` on older bridges). One
+   call tells you plugin info, board state, objectives, capabilities and
+   health.
 2. **Review the triage queue** — `GET /tasks?status=triage`, read each
    candidate with `GET /task?task_id=...`. Approve with
    `POST /approve-task` (moves to ready and stamps the audit comment) or
