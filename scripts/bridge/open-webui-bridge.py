@@ -93,6 +93,64 @@ def _ao_list(status=None):
         con.close()
 
 
+def _bw_ao_validate(data):
+    """Valida el payload de /update-objective.
+
+    Devuelve (oid, name, budget_daily, status, err); err es None cuando el
+    payload es válido, o el dict de error 400 (id/name requeridos, budget
+    numérico no bool, status dentro de _AO_VALID_STATUSES). No toca disco.
+    """
+    oid = (data.get("id") or "").strip()
+    name = (data.get("name") or "").strip()
+    budget = data.get("budget_daily")
+    if not oid or not name or not isinstance(budget, (int, float)) \
+            or isinstance(budget, bool):
+        return None, None, None, None, {
+            "error": "id, name and numeric budget_daily are required"}
+    status = (data.get("status") or "active").strip()
+    if status not in _AO_VALID_STATUSES:
+        return None, None, None, None, {
+            "error": f"invalid status {status!r} "
+                     f"(valid: {sorted(_AO_VALID_STATUSES)})"}
+    return oid, name, budget, status, None
+
+
+def _bw_ao_apply(con, oid, name, budget, status, data, now):
+    """INSERT o UPDATE (campos provistos) dentro de la transacción abierta.
+
+    Housekeeping (spent_*, exhausted_days) nunca se toca aquí: es tick-owned.
+    Devuelve 'created' | 'updated'.
+    """
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS approved_objectives ("
+        "id TEXT PRIMARY KEY, name TEXT NOT NULL, budget_daily REAL "
+        "NOT NULL DEFAULT 0.0, description TEXT, status TEXT NOT NULL "
+        "DEFAULT 'active', success_criterion TEXT, spent_today REAL "
+        "DEFAULT 0.0, spent_total REAL DEFAULT 0.0, created_at REAL, "
+        "updated_at REAL, updated_by TEXT, exhausted_days INTEGER "
+        "DEFAULT 0, last_exhausted_day TEXT)")
+    row = con.execute("SELECT id FROM approved_objectives WHERE id=?",
+                      (oid,)).fetchone()
+    if row:
+        sets, vals = ["updated_at=?", "updated_by=?"], [now, "mediator"]
+        for f in ("name", "budget_daily", "description",
+                  "success_criterion", "status"):
+            if f in data and data[f] is not None:
+                sets.append(f"{f}=?")
+                vals.append(data[f])
+        vals.append(oid)
+        con.execute(f"UPDATE approved_objectives SET {', '.join(sets)} "
+                    "WHERE id=?", vals)
+        return "updated"
+    con.execute(
+        "INSERT INTO approved_objectives (id, name, budget_daily, "
+        "description, status, success_criterion, created_at, "
+        "updated_at, updated_by) VALUES (?,?,?,?,?,?,?,?,?)",
+        (oid, name, float(budget), data.get("description"), status,
+         data.get("success_criterion"), now, now, "mediator"))
+    return "created"
+
+
 def _ao_upsert(data):
     """POST /update-objective: INSERT or UPDATE of PROVIDED fields only.
     Declared columns for the bridge: id/name/budget_daily/description/
@@ -100,51 +158,16 @@ def _ao_upsert(data):
     tick-owned and never wiped."""
     import sqlite3
     import time as _t
-    oid = (data.get("id") or "").strip()
-    name = (data.get("name") or "").strip()
-    budget = data.get("budget_daily")
-    if not oid or not name or not isinstance(budget, (int, float)) \
-            or isinstance(budget, bool):
-        return 400, {"error": "id, name and numeric budget_daily are required"}
-    status = (data.get("status") or "active").strip()
-    if status not in _AO_VALID_STATUSES:
-        return 400, {"error": f"invalid status {status!r} "
-                              f"(valid: {sorted(_AO_VALID_STATUSES)})"}
+    oid, name, budget, status, err = _bw_ao_validate(data)
+    if err:
+        return 400, err
     if not os.path.exists(_AO_DB):
         return 500, {"error": "kanban.db not found"}
     now = _t.time()
     con = None
     try:
         con = sqlite3.connect(_AO_DB)
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS approved_objectives ("
-            "id TEXT PRIMARY KEY, name TEXT NOT NULL, budget_daily REAL "
-            "NOT NULL DEFAULT 0.0, description TEXT, status TEXT NOT NULL "
-            "DEFAULT 'active', success_criterion TEXT, spent_today REAL "
-            "DEFAULT 0.0, spent_total REAL DEFAULT 0.0, created_at REAL, "
-            "updated_at REAL, updated_by TEXT, exhausted_days INTEGER "
-            "DEFAULT 0, last_exhausted_day TEXT)")
-        row = con.execute("SELECT id FROM approved_objectives WHERE id=?",
-                          (oid,)).fetchone()
-        if row:
-            sets, vals = ["updated_at=?", "updated_by=?"], [now, "mediator"]
-            for f in ("name", "budget_daily", "description",
-                      "success_criterion", "status"):
-                if f in data and data[f] is not None:
-                    sets.append(f"{f}=?")
-                    vals.append(data[f])
-            vals.append(oid)
-            con.execute(f"UPDATE approved_objectives SET {', '.join(sets)} "
-                        "WHERE id=?", vals)
-            action = "updated"
-        else:
-            con.execute(
-                "INSERT INTO approved_objectives (id, name, budget_daily, "
-                "description, status, success_criterion, created_at, "
-                "updated_at, updated_by) VALUES (?,?,?,?,?,?,?,?,?)",
-                (oid, name, float(budget), data.get("description"), status,
-                 data.get("success_criterion"), now, now, "mediator"))
-            action = "created"
+        action = _bw_ao_apply(con, oid, name, budget, status, data, now)
         con.commit()
         con.row_factory = sqlite3.Row
         out = con.execute("SELECT * FROM approved_objectives WHERE id=?",
@@ -267,6 +290,77 @@ def _backup_parse_ts(v):
             v.strip().replace("Z", "+00:00")).timestamp()
     except Exception:
         return None
+
+
+def _bw_backup_check_snapshot():
+    """Check 1 de /backup/health: snapshot mas reciente con <3h.
+
+    Devuelve (fresh, last_time, age_hours); age None si no hay snapshots
+    parseables o restic fallo."""
+    snaps, err = _run_restic(["snapshots", "--json"])
+    last_time, age = None, None
+    if not err and isinstance(snaps, list):
+        best_ts = None
+        for s in snaps:
+            if not isinstance(s, dict):
+                continue
+            ts = _backup_parse_ts(s.get("time"))
+            if ts is not None and (best_ts is None or ts > best_ts):
+                best_ts, last_time = ts, s.get("time")
+        if best_ts is not None:
+            age = round((time.time() - best_ts) / 3600.0, 2)
+    return bool(age is not None and age <= 3.0), last_time, age
+
+
+def _bw_backup_check_log():
+    """Check 2 de /backup/health: lineas ERROR bajo cabecera datada en las
+    ultimas 24h de backup.log. Devuelve el numero de errores (0 si no hay)."""
+    cutoff = time.time() - 24 * 3600
+    log_errors = 0
+    header_ts = None
+    try:
+        with open(_BACKUP_LOG, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(
+                    r"=== Backup (?:started|completed): "
+                    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                if m:
+                    try:
+                        from datetime import datetime
+                        header_ts = datetime.strptime(
+                            m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+                    except Exception:
+                        pass
+                    continue
+                if "ERROR" in line and header_ts is not None \
+                        and header_ts >= cutoff:
+                    log_errors += 1
+    except OSError:
+        pass
+    return log_errors
+
+
+def _bw_backup_check_cron():
+    """Check 3 de /backup/health: entrada hermes-backup en el crontab."""
+    try:
+        r = subprocess.run(["crontab", "-l"], capture_output=True,
+                           text=True, timeout=10)
+        return r.returncode == 0 and "hermes-backup" in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _bw_backup_check_repo():
+    """Check 4 de /backup/health: tamano raw-data del repo por debajo del
+    limite (lo que el bucket almacena de verdad; dominado por state.db).
+    Devuelve (ok, repo_mb)."""
+    stats, err2 = _run_restic(["stats", "--mode", "raw-data", "--json"])
+    repo_mb = None
+    if isinstance(stats, dict) \
+            and isinstance(stats.get("total_size"), (int, float)):
+        repo_mb = round(stats["total_size"] / (1024 * 1024), 1)
+    return bool(repo_mb is not None
+                and repo_mb < _BACKUP_REPO_SIZE_LIMIT_MB), repo_mb
 
 
 # raíz del plugin repo: derivada del script (copia repo: <repo>/scripts/bridge/
@@ -635,24 +729,25 @@ def _http_json(url, timeout=5):
     except Exception:
         return {}
 
-def _gpu_health_snapshot():
-    now = time.time()
-    data = {"ts": now, "host": "ml-host (192.168.1.32)"}
+def _bw_gpu_parse_smi(smi, data):
+    """Rellena temp_c/vram_used_mib/vram_total_mib/util_pct desde la linea
+    CSV de nvidia-smi (>=4 campos); no-op si falta o no parsea."""
+    if not smi:
+        return
+    parts = [p.strip() for p in smi.split(",")]
+    if len(parts) < 4:
+        return
+    try:
+        data["temp_c"] = int(parts[0])
+        data["vram_used_mib"] = int(parts[1])
+        data["vram_total_mib"] = int(parts[2])
+        data["util_pct"] = int(parts[3])
+    except ValueError:
+        pass
 
-    smi = _ssh_gpu(
-        "nvidia-smi --query-gpu=temperature.gpu,memory.used,"
-        "memory.total,utilization.gpu --format=csv,noheader,nounits")
-    if smi:
-        parts = [p.strip() for p in smi.split(",")]
-        if len(parts) >= 4:
-            try:
-                data["temp_c"] = int(parts[0])
-                data["vram_used_mib"] = int(parts[1])
-                data["vram_total_mib"] = int(parts[2])
-                data["util_pct"] = int(parts[3])
-            except ValueError:
-                pass
 
+def _bw_gpu_probe_model(data):
+    """Marca vllm_active y (si hay) modelo/ctx len desde /v1/models."""
     models = _http_json(f"{_GPU_API}/v1/models")
     if models.get("data"):
         m = models["data"][0]
@@ -662,14 +757,11 @@ def _gpu_health_snapshot():
     else:
         data["vllm_active"] = False
 
-    data["vllm_service"] = _ssh_gpu(
-        "systemctl --user is-active vllm 2>/dev/null") or "unknown"
-    data["rounds_timer"] = _ssh_gpu(
-        "systemctl --user is-active vllm-rounds.timer 2>/dev/null") \
-        or "unknown"
 
-    data["rounds_today"] = None
-    data["last_round"] = None
+def _bw_gpu_rounds(data):
+    """Escanea las ultimas 300 lineas de rounds.jsonl (via SSH) y rellena
+    rounds_today/last_round con las rondas de hoy; cualquier fallo deja
+    los valores a None (best-effort)."""
     try:
         import datetime as _dt
         tail = _ssh_gpu(f"tail -n 300 {_GPU_ROUNDS}", timeout=15)
@@ -697,18 +789,44 @@ def _gpu_health_snapshot():
     except Exception:
         pass
 
-    data["alerts"] = []
+
+def _bw_gpu_alerts(data):
+    """Reglas de alerta sobre el snapshot ya relleno (temp/VRAM/vLLM/idle)."""
+    alerts = []
     t = data.get("temp_c")
     if isinstance(t, int) and t >= 80:
-        data["alerts"].append("GPU TEMP CRITICAL")
+        alerts.append("GPU TEMP CRITICAL")
     u, tot = data.get("vram_used_mib"), data.get("vram_total_mib")
     if isinstance(u, int) and isinstance(tot, int) and tot > 0 \
             and u / tot * 100.0 > 90:
-        data["alerts"].append("GPU VRAM NEAR LIMIT")
+        alerts.append("GPU VRAM NEAR LIMIT")
     if data.get("vllm_active") is False:
-        data["alerts"].append("vLLM SERVICE DOWN")
+        alerts.append("vLLM SERVICE DOWN")
     if data.get("vllm_active") and data.get("rounds_today") == 0:
-        data["alerts"].append("GPU IDLE")
+        alerts.append("GPU IDLE")
+    return alerts
+
+
+def _gpu_health_snapshot():
+    now = time.time()
+    data = {"ts": now, "host": "ml-host (192.168.1.32)"}
+
+    _bw_gpu_parse_smi(_ssh_gpu(
+        "nvidia-smi --query-gpu=temperature.gpu,memory.used,"
+        "memory.total,utilization.gpu --format=csv,noheader,nounits"), data)
+    _bw_gpu_probe_model(data)
+
+    data["vllm_service"] = _ssh_gpu(
+        "systemctl --user is-active vllm 2>/dev/null") or "unknown"
+    data["rounds_timer"] = _ssh_gpu(
+        "systemctl --user is-active vllm-rounds.timer 2>/dev/null") \
+        or "unknown"
+
+    data["rounds_today"] = None
+    data["last_round"] = None
+    _bw_gpu_rounds(data)
+
+    data["alerts"] = _bw_gpu_alerts(data)
     return data
 
 _GPU_HEALTH = _gpu_health_snapshot
@@ -1060,15 +1178,10 @@ def _metrics_prom_text():
     return "\n".join(buf) + "\n"
 
 
-def _verify_logic(task):
-    status = (task.get("status") or "").lower()
-    if status != "done":
-        return {"verdict": "NOT_DONE", "status": status or None}
-    body = task.get("body") or ""
-    result = task.get("result") or ""
-    body_l = body.lower()
-    result_l = result.lower()
-
+def _bw_verify_criterion(body):
+    """Extrae el success criterion del body (seccion CRITERION_RE, con
+    continuacion de lineas hasta blank/heading/cota 300 chars o 5 partes;
+    fallback: primera linea que menciona criterio/criterion)."""
     criterion = None
     m = CRITERION_RE.search(body)
     if m:
@@ -1091,10 +1204,12 @@ def _verify_logic(task):
             if "criterio" in ll or "criterion" in ll:
                 criterion = ln.strip() or None
                 break
+    return criterion
 
-    if criterion is None:
-        return {"verdict": "NO_CRITERION"}
 
+def _bw_verify_verdict(body_l, result_l):
+    """Devuelve (verdict, evidence_lines): evidencia fuerte/marcador -> PASS,
+    solo evidencia debil -> INCONCLUSIVE, nada -> FAIL."""
     strong = ("verificado", "verified", "completado", "completed", "passing",
               "tests pass", "pytest", "exit_code 0", "exit 0", "sha256", "md5")
     weak = ("pass", "done")
@@ -1114,18 +1229,60 @@ def _verify_logic(task):
 
     if not evidence:
         weak_hits = [w for w in weak if w in hay]
-        verdict = "FAIL" if not weak_hits else "INCONCLUSIVE"
-    elif has_marker or strong_hits:
-        verdict = "PASS"
-    else:
-        verdict = "INCONCLUSIVE"
+        return ("FAIL" if not weak_hits else "INCONCLUSIVE"), evidence
+    if has_marker or strong_hits:
+        return "PASS", evidence
+    return "INCONCLUSIVE", evidence
 
+
+def _verify_logic(task):
+    status = (task.get("status") or "").lower()
+    if status != "done":
+        return {"verdict": "NOT_DONE", "status": status or None}
+    body = task.get("body") or ""
+    result = task.get("result") or ""
+    criterion = _bw_verify_criterion(body)
+    if criterion is None:
+        return {"verdict": "NO_CRITERION"}
+    verdict, evidence = _bw_verify_verdict(body.lower(), result.lower())
     return {
         "task_id": task.get("id"), "status": "done",
         "success_criterion": criterion[:300],
         "evidence_found": ("; ".join(evidence))[:300] or None,
         "verdict": verdict,
     }
+
+
+def _bw_approve_triage_move(task_id, run):
+    """Rama triage: `specify` (LLM especificador, timeout 150s) y luego
+    `promote` a ready. Devuelve (moved, move_err)."""
+    out = run(["hermes", "kanban", "specify", task_id,
+               "--author", "mediator", "--json"], timeout=150)
+    if out.startswith("ERROR:"):
+        return False, f"specify failed: {out[:200]}"
+    t2 = _find_task(task_id) or {}
+    if t2.get("status") != "todo":
+        return False, "specify did not reach todo"
+    out2 = run(["hermes", "kanban", "promote", task_id,
+                "approved via bridge /approve-task", "--json"])
+    if out2.startswith("ERROR:"):
+        return False, f"promote failed: {out2[:200]}"
+    t3 = _find_task(task_id) or {}
+    if t3.get("status") == "ready":
+        return True, None
+    return False, "promote did not reach ready"
+
+
+def _bw_approve_promote_move(task_id, run):
+    """Rama todo/blocked: `promote` directo a ready. Devuelve (moved, move_err)."""
+    out = run(["hermes", "kanban", "promote", task_id,
+               "approved via bridge /approve-task", "--json"])
+    if out.startswith("ERROR:"):
+        return False, f"promote failed: {out[:200]}"
+    t2 = _find_task(task_id) or {}
+    if t2.get("status") == "ready":
+        return True, None
+    return False, "promote did not reach ready"
 
 
 # ------------------------------------------------------------------- server
@@ -1460,65 +1617,16 @@ class HermesBridge(BaseHTTPRequestHandler):
              "lines": lines}))
 
     def _handle_backup_health(self):
-        checks = {}
-        # 1. ¿último snapshot en las últimas 3h?
-        snaps, err = _run_restic(["snapshots", "--json"])
-        last_time, age = None, None
-        if not err and isinstance(snaps, list):
-            best_ts = None
-            for s in snaps:
-                if not isinstance(s, dict):
-                    continue
-                ts = _backup_parse_ts(s.get("time"))
-                if ts is not None and (best_ts is None or ts > best_ts):
-                    best_ts, last_time = ts, s.get("time")
-            if best_ts is not None:
-                age = round((time.time() - best_ts) / 3600.0, 2)
-        checks["last_snapshot_fresh"] = bool(
-            age is not None and age <= 3.0)
-        # 2. ¿log sin ERROR en las últimas 24h? (ERROR bajo cabecera datada)
-        cutoff = time.time() - 24 * 3600
-        log_errors = 0
-        header_ts = None
-        try:
-            with open(_BACKUP_LOG, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    m = re.match(
-                        r"=== Backup (?:started|completed): "
-                        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
-                    if m:
-                        try:
-                            from datetime import datetime
-                            header_ts = datetime.strptime(
-                                m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
-                        except Exception:
-                            pass
-                        continue
-                    if "ERROR" in line and header_ts is not None \
-                            and header_ts >= cutoff:
-                        log_errors += 1
-        except OSError:
-            pass
-        checks["log_clean_24h"] = (log_errors == 0)
-        # 3. ¿cron presente en crontab?
-        cron_present = False
-        try:
-            r = subprocess.run(["crontab", "-l"], capture_output=True,
-                               text=True, timeout=10)
-            cron_present = (r.returncode == 0
-                            and "hermes-backup" in (r.stdout or ""))
-        except Exception:
-            pass
-        checks["cron_present"] = cron_present
-        # 4. ¿repo < límite? (raw-data: lo que el bucket almacena de verdad;
-        # dominado por state.db — el umbral de 100MB de la spec es antiguo)
-        stats, err2 = _run_restic(["stats", "--mode", "raw-data", "--json"])
-        repo_mb = None
-        if isinstance(stats, dict) \
-                and isinstance(stats.get("total_size"), (int, float)):
-            repo_mb = round(stats["total_size"] / (1024 * 1024), 1)
-        checks["repo_size_ok"] = bool(
-            repo_mb is not None and repo_mb < _BACKUP_REPO_SIZE_LIMIT_MB)
+        """4 checks (snapshot fresco, log limpio 24h, cron, tamano repo) con
+        fail-open: cada check degrada solo si su fuente falla."""
+        fresh, last_time, age = _bw_backup_check_snapshot()
+        log_errors = _bw_backup_check_log()
+        cron_present = _bw_backup_check_cron()
+        repo_ok, repo_mb = _bw_backup_check_repo()
+        checks = {"last_snapshot_fresh": fresh,
+                  "log_clean_24h": (log_errors == 0),
+                  "cron_present": cron_present,
+                  "repo_size_ok": repo_ok}
         payload = {"healthy": all(checks.values()),
                    "checks": checks,
                    "last_snapshot": last_time,
@@ -1619,34 +1727,9 @@ class HermesBridge(BaseHTTPRequestHandler):
         if cur == "ready":
             moved = True
         elif cur == "triage":
-            out = self._run(["hermes", "kanban", "specify", task_id,
-                             "--author", "mediator", "--json"], timeout=150)
-            if out.startswith("ERROR:"):
-                move_err = f"specify failed: {out[:200]}"
-            else:
-                t2 = _find_task(task_id) or {}
-                if t2.get("status") == "todo":
-                    out2 = self._run(["hermes", "kanban", "promote", task_id,
-                                      "approved via bridge /approve-task", "--json"])
-                    if not out2.startswith("ERROR:"):
-                        t3 = _find_task(task_id) or {}
-                        moved = (t3.get("status") == "ready")
-                        if not moved:
-                            move_err = "promote did not reach ready"
-                    else:
-                        move_err = f"promote failed: {out2[:200]}"
-                else:
-                    move_err = "specify did not reach todo"
+            moved, move_err = _bw_approve_triage_move(task_id, self._run)
         elif cur in ("todo", "blocked"):
-            out = self._run(["hermes", "kanban", "promote", task_id,
-                             "approved via bridge /approve-task", "--json"])
-            if out.startswith("ERROR:"):
-                move_err = f"promote failed: {out[:200]}"
-            else:
-                t2 = _find_task(task_id) or {}
-                moved = (t2.get("status") == "ready")
-                if not moved:
-                    move_err = "promote did not reach ready"
+            moved, move_err = _bw_approve_promote_move(task_id, self._run)
         else:
             return self._send_json({"task_id": task_id, "moved": False,
                                     "stamped": False,
