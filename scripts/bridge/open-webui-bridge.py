@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Hermes Bridge API — expone operaciones de Hermes para Open WebUI.
 
+v1.12.0 — t_f5838b27 (MEDIATOR 2026-09-18): gobernanza — métricas Prometheus
+      de objetivos en /metrics-prometheus (_metrics_prom_objectives):
+      hermes_objective_nice / _efficiency / _budget_daily /
+      _budget_baseline / _budget_adjustment_pct / _governance (0..3) /
+      _preset{preset=...} / _lifecycle_last_run. Fuente: la última entrada
+      kind=objective_lifecycle por objetivo en
+      ~/.hermes/logs/objective-lifecycle.jsonl (fail-open, log ausente ->
+      series ausentes). GET /objectives ya expone los campos desde v1.8.0.
+
 v1.11.0 — t_69ed5eea (MEDIATOR 2026-09-18): gobernanza P3 — hardening de
       los endpoints de la v1.8.0 tras fallar la verificación live:
       POST /update-objective — UPDATE parcial: solo id es obligatorio sobre
@@ -855,7 +864,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.11.0",
+    "info": {"title": "Hermes Bridge", "version": "1.12.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -1645,12 +1654,87 @@ def _metrics_prom_gpu(buf, emitted):
                emitted)
 
 
+# ---------------------------------------------------------------------------
+# Métricas Prometheus de gobernanza de objetivos (t_f5838b27 §9/#10). Fuente:
+# la última entrada kind=objective_lifecycle por objetivo en
+# logs/objective-lifecycle.jsonl (escrita cada hora por
+# scripts/objective-lifecycle.py, que cada entrada lleva la instantánea
+# nice/budget/preset). Fail-open: log ausente o corrupto -> sin métricas.
+# ---------------------------------------------------------------------------
+
+def _objective_lifecycle_last_per_objective():
+    """Última entrada objective_lifecycle por objetivo (dict oid -> entry)."""
+    path = os.path.join(HERMES_HOME, "logs", "objective-lifecycle.jsonl")
+    out = {}
+    try:
+        for row in _read_jsonl(path):
+            if isinstance(row, dict) and \
+                    row.get("kind") == "objective_lifecycle" and \
+                    row.get("objective"):
+                out[row["objective"]] = row
+    except Exception:
+        return {}
+    return out
+
+
+_GOVERNANCE_CODE = {"static": 0, "responsive": 1, "elastic": 2, "dynamic": 3}
+
+
+def _metrics_prom_objectives(buf, emitted):
+    """Gobernanza por objetivo: nice/efficiency/budget/preset/governance."""
+    rows = _objective_lifecycle_last_per_objective()
+    if not rows:
+        return
+    _pm_series(buf, "hermes_objective_nice", "gauge",
+               "Unix nice per objective (lower = higher priority)",
+               [({"objective": oid}, e.get("nice", 0))
+                for oid, e in sorted(rows.items())], emitted)
+    _pm_series(buf, "hermes_objective_efficiency", "gauge",
+               "24h efficiency ratio from the last lifecycle evaluation",
+               [({"objective": oid}, e.get("efficiency"))
+                for oid, e in sorted(rows.items())
+                if e.get("efficiency") is not None], emitted)
+    _pm_series(buf, "hermes_objective_budget_daily", "gauge",
+               "Effective daily budget from the last lifecycle entry",
+               [({"objective": oid}, e.get("budget_daily"))
+                for oid, e in sorted(rows.items())
+                if e.get("budget_daily") is not None], emitted)
+    _pm_series(buf, "hermes_objective_budget_baseline", "gauge",
+               "User-approved daily budget baseline",
+               [({"objective": oid}, e.get("budget_baseline"))
+                for oid, e in sorted(rows.items())
+                if e.get("budget_baseline") is not None], emitted)
+    _pm_series(buf, "hermes_objective_budget_adjustment_pct", "gauge",
+               "Accumulated budget adjustment percent vs baseline",
+               [({"objective": oid}, e.get("budget_adjustment_pct"))
+                for oid, e in sorted(rows.items())
+                if e.get("budget_adjustment_pct") is not None], emitted)
+    _pm_series(buf, "hermes_objective_governance", "gauge",
+               "Governance mode (0=static 1=responsive 2=elastic 3=dynamic)",
+               [({"objective": oid},
+                 _GOVERNANCE_CODE.get((e.get("governance") or "").lower()))
+                for oid, e in sorted(rows.items())
+                if (e.get("governance") or "").lower() in _GOVERNANCE_CODE],
+               emitted)
+    _pm_series(buf, "hermes_objective_preset", "gauge",
+               "Active preset (value always 1; label carries the preset id)",
+               [({"objective": oid, "preset": e.get("preset_id") or "normal"}, 1)
+                for oid, e in sorted(rows.items())], emitted)
+    last_ts = max((e.get("ts_epoch") for e in rows.values()
+                   if e.get("ts_epoch") is not None), default=None)
+    if last_ts:
+        _pm_series(buf, "hermes_objective_lifecycle_last_run", "gauge",
+                   "Epoch seconds of the last lifecycle evaluation",
+                   [(None, last_ts)], emitted)
+
+
 def _metrics_prom_text():
     buf, emitted = [], set()
     _metrics_prom_tasks(buf, emitted)
     _metrics_prom_history(buf, emitted)
     _metrics_prom_crons(buf, emitted)
     _metrics_prom_gpu(buf, emitted)
+    _metrics_prom_objectives(buf, emitted)
     # El propio bridge, autoobservado (estilo process_*/up)
     _pm_series(buf, "hermes_bridge_up", "gauge",
                "Bridge reachable (always 1 when this line is served)",
@@ -2473,7 +2557,7 @@ class HermesBridge(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Hermes Bridge API v1.10 on http://0.0.0.0:{PORT}")
+    print(f"Hermes Bridge API v1.12 on http://0.0.0.0:{PORT}")
     HTTPServer(("0.0.0.0", PORT), HermesBridge).serve_forever()
 
 

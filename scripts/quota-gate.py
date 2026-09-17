@@ -1704,10 +1704,14 @@ def compute_objectives_snapshot(kanban_db_path: str | None = None,
     """Snapshot de solo lectura de las filas activas de approved_objectives.
 
     Returns a list of dicts (id, name, status, budget_daily, spent_today,
-    description, success_criterion) sorted by id, ACTIVE rows only — the
-    creator must never seed work under a non-active objective.  Errors are
-    non-fatal (empty list + warning); the creator's prompt documents the
-    self-serve sqlite3 fallback.
+    nice, focus_until, description, success_criterion) sorted by
+    nice ASC then id — Unix nice semantics: the lower the nice, the
+    higher the priority, so the autonomous task creator sees its
+    highest-priority objectives FIRST (t_f5838b27 §8; the prompt tells
+    the creator to work the list top-down). ACTIVE rows only — the
+    creator must never seed work under a non-active objective.  Errors
+    are non-fatal (empty list + warning); the creator's prompt
+    documents the self-serve sqlite3 fallback.
     """
     if warnings is None:
         warnings = []
@@ -1723,8 +1727,9 @@ def compute_objectives_snapshot(kanban_db_path: str | None = None,
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT id, name, status, budget_daily, spent_today, "
-            "description, success_criterion FROM approved_objectives "
-            "WHERE status = 'active' ORDER BY id"
+            "nice, focus_until, description, success_criterion "
+            "FROM approved_objectives "
+            "WHERE status = 'active' ORDER BY nice ASC, id"
         ).fetchall()
         conn.close()
     except Exception as exc:
@@ -1738,6 +1743,8 @@ def compute_objectives_snapshot(kanban_db_path: str | None = None,
             "status": row["status"],
             "budget_daily": row["budget_daily"] or 0.0,
             "spent_today": row["spent_today"] or 0.0,
+            "nice": row["nice"] if row["nice"] is not None else 0,
+            "focus_until": row["focus_until"],
             "description": row["description"],
             "success_criterion": row["success_criterion"],
         })

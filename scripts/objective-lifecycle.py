@@ -446,6 +446,15 @@ def evaluate_objective(conn: sqlite3.Connection, row: sqlite3.Row,
         "last_adjusted": prior.get("last_adjusted"),
         "cooldown_ok": True, "evaluated": False, "actions": [],
         "diagnostics": {}, "alarms": [],
+        # t_f5838b27 §14: objective state snapshot per entry — the
+        # hermes-objective-lifecycle OO stream becomes the dashboard's
+        # nice/budget/preset time series (nice resets included).
+        "nice": row["nice"] if row["nice"] is not None else 0,
+        "budget_daily": row["budget_daily"],
+        "budget_baseline": row["budget_baseline"],
+        "budget_adjustment_pct": row["budget_adjustment_pct"],
+        "preset_id": row["preset_id"] or "normal",
+        "focus_until": row["focus_until"],
     }
     updates: list[tuple[str, tuple]] = []
 

@@ -607,6 +607,125 @@ def build_alerts_screen(hermes_home=None) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# GOBERNANZA (t_f5838b27 §8): objective-lifecycle alarms + last adjustments.
+# cron-alarms.jsonl lines from cron == "objective-lifecycle" (EFFICIENCY_LOW
+# trips, cap saturation). Only fresh lines (last 24h) render; a section with
+# no signal stays silent (watchdog pattern).
+# ---------------------------------------------------------------------------
+
+def _objective_lifecycle_alarm_rows(hermes_home=None, max_age_s=86400.0,
+                                    limit=6) -> list:
+    """Recent objective-lifecycle alarm lines from cron-alarms.jsonl."""
+    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
+    path = base / "logs" / "cron-alarms.jsonl"
+    cutoff = time.time() - max_age_s
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("cron") != "objective-lifecycle":
+                    continue
+                if not row.get("objective"):
+                    continue  # health-check liveness lines have no objective;
+                    # cron health has its own screen — engine alarms only here
+                ts = _parse_ts_safe(row.get("ts"))
+                if ts is None or ts < cutoff:
+                    continue
+                out.append((ts, row))
+    except OSError:
+        return []
+    out.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in out[:limit]]
+
+
+def _parse_ts_safe(value):
+    """Best-effort timestamp parse for alarm lines; None when unparseable."""
+    if not value or not isinstance(value, str):
+        return None
+    v = value.strip().strip("[]")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(v[:19], fmt).timestamp()
+        except ValueError:
+            continue
+    try:
+        return dt.datetime.fromisoformat(
+            v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def build_governance_screen(hermes_home=None) -> str:
+    """GOBERNANZA section: lifecycle alarms + per-objective nice/budget state.
+
+    Alarm lines come from cron-alarms.jsonl (cron == 'objective-lifecycle').
+    Nice/budget/adjustment state comes from approved_objectives (read-only);
+    only objectives with an active auto-loop render (governance != static).
+    Empty string when there are no recent alarms AND no governed objectives
+    (watchdog pattern: no signal, no section)."""
+    rows = _objective_lifecycle_alarm_rows(hermes_home)
+    objectives = _governed_objective_rows(hermes_home)
+    if not rows and not objectives:
+        return ""
+    lines = ["GOBERNANZA:"]
+    for a in rows:
+        detail = (a.get("detail") or "").strip()
+        lines.append(f"  ⚠ {a.get('objective', '?')}: {a.get('status')} "
+                     f"— {detail[:110]}")
+    for o in objectives:
+        adj = o["budget_adjustment_pct"] or 0.0
+        fu = ""
+        if o["focus_until"]:
+            try:
+                remain = o["focus_until"] - time.time()
+                if remain > 0:
+                    fu = f" focus {_fmt_dur(remain / 3600)}"
+                else:
+                    fu = " focus expirado"
+            except (TypeError, ValueError, OSError):
+                fu = ""
+        lines.append(
+            f"  {o['id']:<14} nice={o['nice'] if o['nice'] is not None else 0} "
+            f"gov={o['governance'] or 'static'} "
+            f"ajuste presupuesto={adj:+.0f}%{fu}")
+    return "\n".join(lines)
+
+
+def _governed_objective_rows(hermes_home=None) -> list:
+    """Active objectives with governance != 'static' (read-only)."""
+    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
+    db = base / "kanban.db"
+    if not db.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            cols = {r[1] for r in con.execute(
+                "PRAGMA table_info(approved_objectives)")}
+            need = {"nice", "focus_until", "governance",
+                    "budget_adjustment_pct"}
+            if not need <= cols:
+                return []
+            return con.execute(
+                "SELECT id, nice, focus_until, governance, "
+                "budget_adjustment_pct FROM approved_objectives "
+                "WHERE status='active' AND governance != 'static' "
+                "ORDER BY nice ASC, id").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
 def _fmt_dur(hours: float) -> str:
     if hours < 1:
         return f"{int(hours * 60)}m"
@@ -942,6 +1061,7 @@ def build_screen(hermes_home=None) -> str:
         build_board_screen(hermes_home),
         build_efficiency_screen(hermes_home),
         build_objectives_screen(hermes_home),
+        build_governance_screen(hermes_home),
         build_approval_screen(hermes_home),
         build_alerts_screen(hermes_home),
         build_flight_report(hermes_home),

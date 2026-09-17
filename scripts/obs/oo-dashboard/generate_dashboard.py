@@ -248,6 +248,109 @@ def _build_row5(panels, i_ref):  # <35 lines
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# GOBERNANZA tab (t_f5838b27 §10): objective governance panels. Source is the
+# hermes-objective-lifecycle log stream (shipped by log-shipper.py; OO
+# sanitizes the dash) — each entry carries the per-objective state snapshot
+# (nice, budget_daily, budget_baseline, budget_adjustment_pct, preset_id,
+# efficiency) written by scripts/objective-lifecycle.py.
+# ---------------------------------------------------------------------------
+
+def _build_governance_tab(panels, i_ref):  # <45 lines
+    panels.append(
+        _panel(
+            "g01", "area", "Nice por objetivo",
+            "Unix nice per governed objective (lower = higher priority)",
+            0, 0, 12, 7,
+            i_ref[0],
+            _hist("t", "objective, MAX(nice) AS nice",
+                  stream="hermes_objective_lifecycle", interval="15 minutes",
+                  group="objective"),
+            "hermes_objective_lifecycle", "logs",
+            [_axis("t", "t")], [_axis("nice", "nice")],
+            breakdown=[_axis("objective", "objective")],
+        )
+    )
+    i_ref[0] += 1
+    panels.append(
+        _panel(
+            "g02", "bar", "Presupuesto efectivo vs baseline (USD)",
+            "budget_daily vs budget_baseline, latest per objective",
+            12, 0, 12, 7,
+            i_ref[0],
+            "SELECT objective, MAX(budget_daily) AS efectivo, "
+            "MAX(budget_baseline) AS baseline "
+            "FROM \"hermes_objective_lifecycle\" GROUP BY objective",
+            "hermes_objective_lifecycle", "logs",
+            [_axis("objective", "objective")],
+            [_axis("efectivo", "efectivo"), _axis("baseline", "baseline")],
+            unit="USD",
+        )
+    )
+    i_ref[0] += 1
+    panels.append(
+        _panel(
+            "g03", "area", "Efficiency por objetivo",
+            "24h efficiency ratio from the lifecycle evaluation window",
+            0, 7, 12, 7,
+            i_ref[0],
+            _hist("t", "objective, MAX(efficiency) AS eff",
+                  stream="hermes_objective_lifecycle", interval="15 minutes",
+                  group="objective"),
+            "hermes_objective_lifecycle", "logs",
+            [_axis("t", "t")], [_axis("eff", "eff")],
+            breakdown=[_axis("objective", "objective")],
+        )
+    )
+    i_ref[0] += 1
+    panels.append(
+        _panel(
+            "g04", "table", "Preset y ajuste (últimas evaluaciones)",
+            "preset_id / governance / budget_adjustment_pct, latest first",
+            12, 7, 12, 7,
+            i_ref[0],
+            "SELECT _timestamp, objective, preset_id, governance, "
+            "budget_adjustment_pct FROM \"hermes_objective_lifecycle\" "
+            "ORDER BY _timestamp DESC LIMIT 40",
+            "hermes_objective_lifecycle", "logs",
+            [_axis("objective", "objective")],
+            [_axis("preset_id", "preset_id"),
+             _axis("budget_adjustment_pct", "ajuste %")],
+        )
+    )
+    i_ref[0] += 1
+    panels.append(
+        _panel(
+            "g05", "area", "Ajustes de presupuesto (%)",
+            "budget_adjustment_pct over time (ratchet moves are visible)",
+            0, 14, 12, 6,
+            i_ref[0],
+            _hist("t", "objective, MAX(budget_adjustment_pct) AS pct",
+                  stream="hermes_objective_lifecycle", interval="15 minutes",
+                  group="objective"),
+            "hermes_objective_lifecycle", "logs",
+            [_axis("t", "t")], [_axis("pct", "pct")],
+            breakdown=[_axis("objective", "objective")], unit="percent",
+        )
+    )
+    i_ref[0] += 1
+    panels.append(
+        _panel(
+            "g06", "table", "Últimos diagnósticos",
+            "latest evaluation note per objective (cause diagnosis)",
+            12, 14, 12, 6,
+            i_ref[0],
+            "SELECT objective, note, efficiency, state, _timestamp "
+            "FROM \"hermes_objective_lifecycle\" "
+            "ORDER BY _timestamp DESC LIMIT 30",
+            "hermes_objective_lifecycle", "logs",
+            [_axis("objective", "objective")],
+            [_axis("note", "note"), _axis("efficiency", "eff")],
+        )
+    )
+    i_ref[0] += 1
+
+
 def build(dashboard_id=""):
     panels = []
     ref = [0]
@@ -257,16 +360,24 @@ def build(dashboard_id=""):
     _build_row3(panels, ref)
     _build_row4(panels, ref)
     _build_row5(panels, ref)
+    gov_panels = []
+    gov_ref = [0]
+    _build_governance_tab(gov_panels, gov_ref)
     return {
         "version": 8,
         "dashboardId": dashboard_id,
         "title": "Hermes Overview",
         "description": ("Unified Hermes plane: board, budget, GPU, cron "
-                         "health, OTLP traces (t_88753960)") ,
+                         "health, OTLP traces (t_88753960) + objective "
+                         "governance tab (t_f5838b27)"),
         "role": "",
         "owner": "",
         "created": "2026-09-15T00:00:00Z",
-        "tabs": [{"tabId": "tab-1", "name": "Overview", "panels": panels}],
+        "tabs": [
+            {"tabId": "tab-1", "name": "Overview", "panels": panels},
+            {"tabId": "tab-2", "name": "Objective Governance",
+             "panels": gov_panels},
+        ],
     }
 
 if __name__ == "__main__":
