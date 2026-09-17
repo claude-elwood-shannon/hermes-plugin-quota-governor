@@ -46,6 +46,7 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 HERMES_SRC = os.environ.get(
     "HERMES_SRC", os.path.expanduser("~/.hermes/hermes-agent"))
@@ -182,6 +183,39 @@ def human_gate_pending(db_path, task_id: str) -> bool:
         return False
 
 
+def _handle_row(db_path, task_id: str, title: str, body: str, now: str,
+                promoted: int, execute: bool,
+                decide: Callable[[dict], None]) -> int:
+    """Decide one triage row, log it; return the updated promotion count."""
+    promotable, reason = evaluate(title, body)
+    if not promotable:
+        decide({"ts": now, "task": task_id, "action": "kept-in-triage",
+                "reason": reason})
+    elif human_gate_pending(db_path, task_id):
+        decide({"ts": now, "task": task_id, "action": "kept-in-triage",
+                "reason": f"{title[:40]}: block_loop needs_input sin "
+                          "comentario humano (gate del core)"})
+    elif promoted >= MAX_PER_TICK:
+        decide({"ts": now, "task": task_id, "action": "cap-reached",
+                "reason": f"{MAX_PER_TICK}/tick — proximo tick"})
+    elif already_promoted(task_id):
+        decide({"ts": now, "task": task_id, "action": "kept-in-triage",
+                "reason": "ya promocionada por este puente (ledger)"})
+    elif not execute:
+        decide({"ts": now, "task": task_id, "action": "would-promote",
+                "reason": reason, "title": title})
+        promoted += 1
+    elif promote_via_core(db_path, task_id):
+        decide({"ts": now, "task": task_id, "action": "promoted",
+                "reason": reason, "title": title})
+        print(f"TRIAGE-BRIDGE: {task_id} -> todo ({title})")
+        promoted += 1
+    else:
+        decide({"ts": now, "task": task_id, "action": "specify-rejected",
+                "reason": "core rechazo (not in triage o human-gate pendiente)"})
+    return promoted
+
+
 def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
     """Core loop. Returns list of decision entries (for tests and reporting)."""
     now = now or datetime.now(timezone.utc).isoformat()
@@ -201,37 +235,8 @@ def run(db_path=KANBAN_DB, execute: bool = False, now: str | None = None):
 
     promoted = 0
     for task_id, title, body in rows:
-        promotable, reason = evaluate(title, body)
-        if not promotable:
-            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
-                    "reason": reason})
-            continue
-        if human_gate_pending(db_path, task_id):
-            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
-                    "reason": f"{title[:40]}: block_loop needs_input sin "
-                              "comentario humano (gate del core)"})
-            continue
-        if promoted >= MAX_PER_TICK:
-            decide({"ts": now, "task": task_id, "action": "cap-reached",
-                    "reason": f"{MAX_PER_TICK}/tick — proximo tick"} )
-            continue
-        if already_promoted(task_id):
-            decide({"ts": now, "task": task_id, "action": "kept-in-triage",
-                    "reason": "ya promocionada por este puente (ledger)"})
-            continue
-        if not execute:
-            decide({"ts": now, "task": task_id, "action": "would-promote",
-                    "reason": reason, "title": title})
-            promoted += 1
-            continue
-        if promote_via_core(db_path, task_id):
-            decide({"ts": now, "task": task_id, "action": "promoted",
-                    "reason": reason, "title": title})
-            print(f"TRIAGE-BRIDGE: {task_id} -> todo ({title})")
-            promoted += 1
-        else:
-            decide({"ts": now, "task": task_id, "action": "specify-rejected",
-                    "reason": "core rechazo (not in triage o human-gate pendiente)"})
+        promoted = _handle_row(db_path, task_id, title, body, now,
+                               promoted, execute, decide)
     return decisions
 
 
