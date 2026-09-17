@@ -270,8 +270,8 @@ def log_stamp(plan: Dict[str, Any], log_path: str) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """CLI: dry-run by default prints the stamp plan; --execute applies stamps under the status-guarded CAS and logs them. Exit 0 on success (incl. no-op), 1 on catastrophic error."""
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser: dry-run by default, --execute applies."""
     ap = argparse.ArgumentParser(
         description="Stamp abandoned: on archived lost tasks whose work was "
                     "superseded (OBJ-08 detector convention). Dry-run by default.")
@@ -281,34 +281,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--db", default=KANBAN_DB, help="kanban.db path override")
     ap.add_argument("--log", default=STAMP_LOG, help="JSONL stamp-log path override")
     ap.add_argument("--verbose", action="store_true", help="also print non-candidates")
-    args = ap.parse_args(argv)
+    return ap
 
-    if not os.path.isfile(args.db):
-        print(f"ERROR: kanban.db not found at {args.db}", file=sys.stderr)
-        return 1
+
+def _scan_plans(args: argparse.Namespace) -> Optional[List[Dict[str, Any]]]:
+    """Find stamp candidates, filtered by --only; None signals a fatal scan error."""
     only = {s.strip() for s in (args.only or "").split(",") if s.strip()}
     try:
         plans = find_candidates(args.db)
     except sqlite3.Error as exc:
         print(f"ERROR: cannot read {args.db}: {exc}", file=sys.stderr)
-        return 1
+        return None
     if only:
         plans = [p for p in plans if p["id"] in only]
         if args.verbose:
             print(f"VERBOSE: --only filter: {len(plans)} plan(s) match")
+    return plans
 
-    if not plans:
-        if args.verbose:
-            print("VERBOSE: no superseded lost tasks to stamp")
-        return 0
 
-    if not args.execute:
-        for p in plans:
-            print(f"DRY-RUN: stamp {p['id']} ({p['objective']}) "
-                  f"superseded-by {','.join(p['superseded_by'])}")
-            print(f"  header line: {p['stamp']}")
-        return 0
+def _print_dry_run(plans: List[Dict[str, Any]]) -> None:
+    """Print the dry-run stamp plan: one decision line and the header line per plan."""
+    for p in plans:
+        print(f"DRY-RUN: stamp {p['id']} ({p['objective']}) "
+              f"superseded-by {','.join(p['superseded_by'])}")
+        print(f"  header line: {p['stamp']}")
 
+
+def _apply_plans(plans: List[Dict[str, Any]], args: argparse.Namespace) -> int:
+    """Apply the stamp plans under the status-guarded CAS and log each applied stamp; return the count applied."""
     conn = sqlite3.connect(args.db)
     applied = 0
     try:
@@ -322,6 +322,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "(task changed under us)", file=sys.stderr)
     finally:
         conn.close()
+    return applied
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI: dry-run by default prints the stamp plan; --execute applies stamps under the status-guarded CAS and logs them. Exit 0 on success (incl. no-op), 1 on catastrophic error."""
+    args = _build_parser().parse_args(argv)
+    if not os.path.isfile(args.db):
+        print(f"ERROR: kanban.db not found at {args.db}", file=sys.stderr)
+        return 1
+    plans = _scan_plans(args)
+    if plans is None:
+        return 1
+    if not plans:
+        if args.verbose:
+            print("VERBOSE: no superseded lost tasks to stamp")
+        return 0
+    if not args.execute:
+        _print_dry_run(plans)
+        return 0
+    applied = _apply_plans(plans, args)
     if args.verbose:
         print(f"VERBOSE: {len(plans)} plan(s), {applied} applied")
     return 0
