@@ -300,6 +300,55 @@ def _day_verdict_phase(snaps, ledger_entries, res_new, now_iso):
     return day_verdicts(snaps, all_res, existing_days, now_iso)
 
 
+def _emit_phase(new_records):
+    """Append new ledger records and write the consolidated verdict file."""
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        for r in new_records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    _write_verdict_file()
+
+
+def _write_verdict_file():
+    """Recompute OK/FAIL/OPEN totals from the whole ledger into the
+    verifier's verdict JSON."""
+    verdict_path = Path(os.path.expanduser(
+        "~/.hermes/quota-governor/backtest-f2-verdict.json"))
+    ok = fail = open_cnt = 0
+    for r in read_jsonl(LEDGER):
+        if r.get("kind") == "day":
+            ver = r.get("verdict")
+            if ver == "OK":
+                ok += r.get("n_ok", 0)
+            elif ver == "FAIL":
+                fail += r.get("n_fail", 0)
+            elif ver == "OPEN":
+                open_cnt += r.get("n_open", 0)
+    precision_ratio = None
+    if ok + fail > 0:
+        precision_ratio = ok / (ok + fail)
+    verdict = {
+        "precision_ratio": precision_ratio,
+        "n_ok": ok,
+        "n_fail": fail,
+        "n_open": open_cnt,
+        "computed_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "source": "forecast-backtest.jsonl",
+    }
+    verdict_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(verdict_path, "w", encoding="utf-8") as f:
+        json.dump(verdict, f, ensure_ascii=False, indent=2)
+
+
+def _print_phase(day_new):
+    """Announce new FAIL day verdicts on stdout."""
+    for r in day_new:
+        if r["verdict"] == "FAIL":
+            print(f"backtest-f2: FAIL {r['prov']} {r['day']} — "
+                  f"{r['n_fail']} snapshot(s) over {TOL_PCT}% error "
+                  f"(worst {r['worst_error_pct']}%)")
+
+
 def main():
     now_epoch = time.time()
     new_records = []
@@ -324,42 +373,8 @@ def main():
     new_records.extend(day_new)
 
     if new_records:
-        LEDGER.parent.mkdir(parents=True, exist_ok=True)
-        with open(LEDGER, "a", encoding="utf-8") as f:
-            for r in new_records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        # --- generate consolidated verdict file for the verifier ---
-        verdict_path = Path(os.path.expanduser("~/.hermes/quota-governor/backtest-f2-verdict.json"))
-        ok = fail = open_cnt = 0
-        for r in read_jsonl(LEDGER):
-            if r.get("kind") == "day":
-                ver = r.get("verdict")
-                if ver == "OK":
-                    ok += r.get("n_ok", 0)
-                elif ver == "FAIL":
-                    fail += r.get("n_fail", 0)
-                elif ver == "OPEN":
-                    open_cnt += r.get("n_open", 0)
-        precision_ratio = None
-        if ok + fail > 0:
-            precision_ratio = ok / (ok + fail)
-        verdict = {
-            "precision_ratio": precision_ratio,
-            "n_ok": ok,
-            "n_fail": fail,
-            "n_open": open_cnt,
-            "computed_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            "source": "forecast-backtest.jsonl",
-        }
-        verdict_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(verdict_path, "w", encoding="utf-8") as f:
-            json.dump(verdict, f, ensure_ascii=False, indent=2)
-
-    for r in day_new:
-        if r["verdict"] == "FAIL":
-            print(f"backtest-f2: FAIL {r['prov']} {r['day']} — "
-                  f"{r['n_fail']} snapshot(s) over {TOL_PCT}% error "
-                  f"(worst {r['worst_error_pct']}%)")
+        _emit_phase(new_records)
+    _print_phase(day_new)
     return 0
 
 
