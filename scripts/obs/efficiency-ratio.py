@@ -291,6 +291,34 @@ def _is_anchor(run: str) -> bool:
                                    re.search(r"\.[a-z]", run)))
 
 
+def _criterion_units(cn: str):
+    """(anchors, words) — evidence-bearing units of a normalized criterion:
+    path-like anchor runs, and standalone [a-z0-9]{4,} words not inside any
+    anchor."""
+    anchors = {a for a in ANCHOR_RE.findall(cn) if _is_anchor(a)}
+    anchor_parts = set()
+    for a in anchors:
+        anchor_parts.update(t for t in re.findall(r"[a-z0-9]{4,}", a)
+                            if t not in _STOPWORDS)
+    words = {t for t in re.findall(r"[a-z0-9]{4,}", cn)
+             if t not in _STOPWORDS and t not in anchor_parts}
+    return anchors, words
+
+
+def _anchor_hit(out: str, a: str) -> bool:
+    """A criterion anchor counts as hit when the output quotes the full run
+    or its basename (>=5 chars)."""
+    if a in out:
+        return True
+    tail = a.rsplit("/", 1)[-1]
+    return tail != a and len(tail) >= 5 and tail in out
+
+
+def _coverage_ok(total: int, hits: int) -> bool:
+    """ceil(total/3) coverage threshold, never below 1."""
+    return hits >= max(1, -(-total // 3))
+
+
 def criterion_evidenced(criterion: str, output_text: str) -> bool:
     """Honest single-part evidence: output carries a completion word AND
     evidences the criterion. Matching is anchor-first (OBJ-METRICS
@@ -327,30 +355,15 @@ def criterion_evidenced(criterion: str, output_text: str) -> bool:
     if not COMPLETION_RE.search(out):
         return False
     cn = _norm(criterion)
-    anchors = {a for a in ANCHOR_RE.findall(cn) if _is_anchor(a)}
-    anchor_parts = set()
-    for a in anchors:
-        anchor_parts.update(t for t in re.findall(r"[a-z0-9]{4,}", a)
-                            if t not in _STOPWORDS)
-    words = {t for t in re.findall(r"[a-z0-9]{4,}", cn)
-             if t not in _STOPWORDS and t not in anchor_parts}
+    anchors, words = _criterion_units(cn)
     a_total, w_total = len(anchors), len(words)
     if a_total == 0 and w_total == 0:
         return False
-
-    def anchor_hit(a: str) -> bool:
-        if a in out:
-            return True
-        tail = a.rsplit("/", 1)[-1]
-        return tail != a and len(tail) >= 5 and tail in out
-
-    a_hits = sum(1 for a in anchors if anchor_hit(a))
-    w_hits = sum(1 for t in words if t in out)
     if a_total:
-        need_a = max(1, -(-a_total // 3))   # ceil(anchors/3)
-        return a_hits >= need_a
-    need_w = max(1, -(-w_total // 3))       # ceil(words/3)
-    return w_hits >= need_w
+        a_hits = sum(1 for a in anchors if _anchor_hit(out, a))
+        return _coverage_ok(a_total, a_hits)
+    w_hits = sum(1 for t in words if t in out)
+    return _coverage_ok(w_total, w_hits)
 
 
 def collect_output_text(db_path: Path, task_id: str, result_text: str,
@@ -499,58 +512,69 @@ def verdict_for(ratio):
     return "CRITICO"
 
 
+def _window_stats(db: Path, rows: list, w: int, now: float,
+                  include_runs: bool = True) -> dict:
+    """Verified/budget/spend aggregate for one window (raises on bad sources
+    like read_trace/verified_done_tasks)."""
+    v_ids, b_ids, verifier = verified_done_tasks(db, w, now, include_runs)
+    strict, total = window_spend(rows, w, now, db)
+    return {"verified": len(v_ids), "budget_done": len(b_ids),
+            "strict_usd": strict, "total_usd": total,
+            "verifier": verifier, "verified_ids": v_ids}
+
+
+def _ratio_base(w: dict):
+    """(base_usd, base_mode, ratio, veredicto) for one window aggregate."""
+    strict, total = w["strict_usd"], w["total_usd"]
+    if strict > 0:
+        base, mode = strict, "strict"
+    elif total > 0:
+        base, mode = total, "proxy-total-24h"
+    else:
+        base, mode = 0.0, "none"
+    ratio = round(w["verified"] / base, 2) if base > 0 else None
+    return base, mode, ratio, verdict_for(ratio)
+
+
+def _window_entry(w: dict) -> dict:
+    """Flat output fields for one window aggregate."""
+    base, mode, ratio, verdict = _ratio_base(w)
+    return {"gasto_usd": round(base, 6),
+            "gasto_strict_usd": round(w["strict_usd"], 6),
+            "gasto_total_usd": round(w["total_usd"], 6),
+            "base_mode": mode, "ratio": ratio, "veredicto": verdict}
+
+
+def _na_entry(now: float, exc: Exception) -> dict:
+    """Fail-open N/A entry for unreadable sources (never aborts the cron)."""
+    return {"ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
+            "tareas_verificadas": None, "gasto_usd": None,
+            "gasto_strict_usd": None, "gasto_total_usd": None,
+            "base_mode": None, "ratio": None, "veredicto": "N/A",
+            "error": f"cannot compute: {exc}"}
+
+
 def compute(now: float | None = None, include_runs: bool = True) -> dict:
     now = time.time() if now is None else float(now)
     db = kanban_db_path()
     trace_file = trace_path()
     try:
         rows = read_trace(trace_file)
-        windows = {}
-        for label, w in WINDOWS.items():
-            v_ids, b_ids, verifier = verified_done_tasks(db, w, now,
-                                                         include_runs)
-            strict, total = window_spend(rows, w, now, db)
-            windows[label] = {"verified": len(v_ids), "budget_done": len(b_ids),
-                              "strict_usd": strict, "total_usd": total,
-                              "verifier": verifier, "verified_ids": v_ids}
+        windows = {label: _window_stats(db, rows, w, now, include_runs)
+                   for label, w in WINDOWS.items()}
     except (OSError, sqlite3.Error) as exc:
-        return {"ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
-                "tareas_verificadas": None, "gasto_usd": None,
-                "gasto_strict_usd": None, "gasto_total_usd": None,
-                "base_mode": None, "ratio": None, "veredicto": "N/A",
-                "error": f"cannot compute: {exc}"}
+        return _na_entry(now, exc)
 
     w24, w7 = windows["24h"], windows["7d"]
-
-    def build(w):
-        strict, total = w["strict_usd"], w["total_usd"]
-        if strict > 0:
-            base, mode = strict, "strict"
-        elif total > 0:
-            base, mode = total, "proxy-total-24h"
-        else:
-            base, mode = 0.0, "none"
-        ratio = round(w["verified"] / base, 2) if base > 0 else None
-        return base, mode, ratio, verdict_for(ratio)
-
-    base24, mode24, ratio24, ver24 = build(w24)
-    base7, mode7, ratio7, ver7 = build(w7)
-
-    out = {
-        "ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
-        "tareas_verificadas": w24["verified"],
-        "tareas_budget_done_24h": w24["budget_done"],
-        "gasto_usd": round(base24, 6),
-        "gasto_strict_usd": round(w24["strict_usd"], 6),
-        "gasto_total_usd": round(w24["total_usd"], 6),
-        "base_mode": mode24,
-        "ratio": ratio24, "veredicto": ver24,
-        "verifier": w24["verifier"],
-        "tareas_verificadas_7d": w7["verified"],
-        "gasto_usd_7d": round(base7, 6),
-        "base_mode_7d": mode7,
-        "ratio_7d": ratio7, "veredicto_7d": ver7,
-    }
+    e24, e7 = _window_entry(w24), _window_entry(w7)
+    out = {"ts": _iso(now), "kind": "efficiency_ratio", "window": "24h",
+           "tareas_verificadas": w24["verified"],
+           "tareas_budget_done_24h": w24["budget_done"]}
+    out.update(e24)
+    out["verifier"] = w24["verifier"]
+    out["tareas_verificadas_7d"] = w7["verified"]
+    out.update(gasto_usd_7d=e7["gasto_usd"], base_mode_7d=e7["base_mode"],
+               ratio_7d=e7["ratio"], veredicto_7d=e7["veredicto"])
     return out
 
 
