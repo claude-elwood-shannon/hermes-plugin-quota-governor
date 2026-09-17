@@ -252,7 +252,7 @@ def is_budget_task(body: str, db_path: Path | None = None) -> bool:
     return bool(_objective_res(target)[1].search(body or ""))
 
 
-def declared_criterion(body: str):
+def declared_criterion(body: str) -> tuple[str | None, str | None]:
     """(kind, text) — ('tag'|'prose', criterion) or (None, None).
 
     The `success:` tag is searched in the WHOLE body (house convention:
@@ -391,7 +391,7 @@ def collect_output_text(db_path: Path, task_id: str, result_text: str,
 
 
 def verified_done_tasks(db_path: Path, window_s: int, now: float,
-                        include_runs: bool = True):
+                        include_runs: bool = True) -> tuple[list[str], list[str], str]:
     """Return (verified_ids, budget_done_ids, verifier_mode) for the window."""
     cutoff = now - window_s
     verifier = "full" if _load_tick_body_parts() else "limited"
@@ -440,7 +440,7 @@ def verified_done_tasks(db_path: Path, window_s: int, now: float,
 # Spend side
 # ---------------------------------------------------------------------------
 
-def read_trace(path: Path):
+def read_trace(path: Path) -> list[dict]:
     rows = []
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -476,7 +476,8 @@ def objective_of_row(row: dict, db_path: Path, body_objective: dict) -> str:
     return obj or "unattributed"
 
 
-def window_spend(rows, window_s: int, now: float, db_path: Path):
+def window_spend(rows: list[dict], window_s: int, now: float,
+                 db_path: Path) -> tuple[float, float]:
     """Return (strict_usd, total_usd) for the window."""
     cutoff = now - window_s
     strict = total = 0.0
@@ -500,7 +501,7 @@ def window_spend(rows, window_s: int, now: float, db_path: Path):
 # Verdicts + emission
 # ---------------------------------------------------------------------------
 
-def verdict_for(ratio):
+def verdict_for(ratio: float | None) -> str:
     if ratio is None:
         return "SIN GASTO"
     if ratio >= 5.0:
@@ -592,7 +593,7 @@ def append_metrics(entry: dict, path: Path) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="P4 efficiency ratio (zero tokens, read-only).")
     ap.add_argument("--dry-run", action="store_true",
