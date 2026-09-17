@@ -19,8 +19,14 @@ Every 15m (cron or manual run) this script:
      snapshot for that day/provider is still waiting for the milestone;
      before the crossing, an error is NEVER counted as a failure. Snapshots
      taken after the milestone was already past (pct_now >= 90), snapshots
-     without a usable eta_90 (burn <= 0), and windows that elapsed with no
-     crossing are resolved as NA (no predictive value; not FAIL).
+     without a usable eta_90 (burn <= 0), and predictions whose eta_90 falls
+     beyond the snapshot's own weekly window (post-reset idle regime:
+     unmeasurable error) are resolved as NA (no predictive value; not FAIL).
+     A window that elapsed with no crossing AND a predicted eta beyond it is
+     a correct directional prediction, credited as OK when the day cells are
+     rebuilt (its recorded row stays NA). The verdict file sums n_ok over
+     ALL resolved day-cells, OK and FAIL verdicts alike: a day that fails
+     once does not zero its correct predictions.
 
 Ledger: ~/.hermes/quota-governor/forecast-backtest.jsonl (real HERMES_HOME
 dir, NOT the profile dir). One JSON object per line, append-only:
@@ -73,6 +79,10 @@ HISTORY = Path(os.environ.get(
 LEDGER = Path(os.environ.get(
     "QUOTA_BACKTEST_LEDGER",
     str(Path.home() / ".hermes" / "quota-governor" / "forecast-backtest.jsonl")))
+# Verdict JSON consumed by the OBJ-24 gate (approved_objectives.py)
+VERDICT_JSON = Path(os.environ.get(
+    "QUOTA_BACKTEST_VERDICT",
+    str(Path.home() / ".hermes" / "quota-governor" / "backtest-f2-verdict.json")))
 
 HITO = qf.HITO_STOP          # 90.0 % milestone
 TOL_PCT = 20.0               # close criterion: error must be < 20%
@@ -172,6 +182,42 @@ def first_crossing(points, after, upto):
     return None
 
 
+def _eval_one(s, p, f, snap_e, reset_e, series, now_epoch):
+    """Evaluate one (snapshot, provider) pair -> res record, or None when
+    the window is still live (OPEN: nothing is recorded yet)."""
+    rec = {"kind": "res", "snap": s["ts"], "prov": p}
+    pct_now = f.get("pct_now")
+    eta90 = qf._parse_iso(f.get("eta_90_iso"))
+    if pct_now is None or pct_now >= HITO or eta90 is None:
+        # predicted after the crossing, or no usable prediction
+        rec.update(status="NA", error_pct=None,
+                   reason=("pct_already_past" if pct_now is not None
+                           and pct_now >= HITO else "no_prediction"))
+        return rec
+    cross = first_crossing(series.get(p, []), snap_e, reset_e)
+    if cross is None:
+        if now_epoch > reset_e:
+            # weekly window elapsed without hitting the milestone:
+            # nothing to measure, not a failure
+            rec.update(status="NA", error_pct=None,
+                       reason="no_cross_before_reset")
+            return rec
+        return None                    # still OPEN — record nothing yet
+    if eta90 > reset_e:
+        # predicted eta beyond the snapshot's own weekly window
+        # (post-reset idle burn ~0 -> months-long etas): the
+        # margin-normalized error is not measurable -> NA
+        rec.update(status="NA", error_pct=None,
+                   reason="pred_beyond_window")
+        return rec
+    margin = reset_e - snap_e
+    err = abs(cross - eta90) / margin * 100.0 if margin > 0 else 0.0
+    rec.update(status="OK" if err < TOL_PCT else "FAIL",
+               error_pct=round(err, 2),
+               cross_iso=qf._iso(cross), eta_90_pred=f.get("eta_90_iso"))
+    return rec
+
+
 def evaluate_snapshots(snaps, series, resolved, now_epoch):
     """Return new 'res' records for every snapshot/provider still open.
 
@@ -188,75 +234,91 @@ def evaluate_snapshots(snaps, series, resolved, now_epoch):
         for p, f in (s.get("providers") or {}).items():
             if (s["ts"], p) in resolved:
                 continue
-            rec = {"kind": "res", "snap": s["ts"], "prov": p}
-            pct_now = f.get("pct_now")
-            eta90 = qf._parse_iso(f.get("eta_90_iso"))
-            if pct_now is None or pct_now >= HITO or eta90 is None:
-                # predicted after the crossing, or no usable prediction
-                rec.update(status="NA", error_pct=None,
-                           reason=("pct_already_past" if pct_now is not None
-                                   and pct_now >= HITO else "no_prediction"))
+            rec = _eval_one(s, p, f, snap_e, reset_e, series, now_epoch)
+            if rec is not None:
                 out.append(rec)
-                continue
-            cross = first_crossing(series.get(p, []), snap_e, reset_e)
-            if cross is None:
-                if now_epoch > reset_e:
-                    # weekly window elapsed without hitting the milestone:
-                    # nothing to measure, not a failure
-                    rec.update(status="NA", error_pct=None,
-                               reason="no_cross_before_reset")
-                    out.append(rec)
-                # else: still OPEN — do not record anything yet
-                continue
-            margin = reset_e - snap_e
-            err = abs(cross - eta90) / margin * 100.0 if margin > 0 else 0.0
-            rec.update(status="OK" if err < TOL_PCT else "FAIL",
-                       error_pct=round(err, 2),
-                       cross_iso=qf._iso(cross), eta_90_pred=f.get("eta_90_iso"))
-            out.append(rec)
     return out
+
+
+def _reclassify(res, snap, resolve_ncr):
+    """Effective status of one res row under the C1/C3 aggregation rules.
+
+    C1: a FAIL whose predicted eta_90 falls beyond the snapshot's own
+    weekly window becomes NA (pred_beyond_window) — the margin-normalized
+    error is not measurable. C3: a no_cross_before_reset NA whose
+    predicted eta is ALSO beyond the window is a correct directional
+    prediction ("will not reach 90% before reset") and is credited as OK
+    when resolve_ncr is set; one with an eta inside the window predicted a
+    crossing that never happened and stays NA. Recorded rows are never
+    rewritten (the `resolved` set keeps historical res rows immutable).
+    """
+    st = res.get("status")
+    f = (snap.get("providers") or {}).get(res.get("prov")) or {}
+    pred = qf._parse_iso(f.get("eta_90_iso"))
+    reset = qf._parse_iso(snap.get("reset"))
+    beyond = pred is not None and reset is not None and pred > reset
+    if st == "FAIL" and beyond:
+        return "NA"
+    if (st == "NA" and res.get("reason") == "no_cross_before_reset"
+            and resolve_ncr and beyond):
+        return "OK"
+    return st
+
+
+def _day_cells(snaps, res_index, resolve_ncr=False):
+    """Day-cell map {(day, prov): counters} under C1/C3 reclassification.
+
+    snaps: dict ts -> snap record. res_index: {(snap, prov): res row}.
+    Every snapshot contributes to its day-cell: a missing res row counts
+    as open. Returns (cells, open_snap_total).
+    """
+    per = {}
+    open_snaps = 0
+    for ts in sorted(snaps):
+        day = (ts or "")[:10]
+        if len(day) != 10:
+            continue
+        for p in (snaps[ts].get("providers") or {}):
+            cell = per.setdefault((day, p),
+                                  {"ok": 0, "fail": 0, "na": 0, "open": 0,
+                                   "worst": None})
+            r = res_index.get((ts, p))
+            if r is None:
+                cell["open"] += 1
+                open_snaps += 1
+                continue
+            st = _reclassify(r, snaps[ts], resolve_ncr)
+            cell[{"OK": "ok", "FAIL": "fail"}.get(st, "na")] += 1
+            if st == "FAIL":
+                w = r.get("error_pct")
+                if w is not None and (cell["worst"] is None
+                                      or w > cell["worst"]):
+                    cell["worst"] = w
+    return per, open_snaps
 
 
 def day_verdicts(snaps, res_records, existing_days, now_iso):
     """New 'day' verdict lines (OK/FAIL/OPEN) for changed (day, provider)."""
-    from collections import defaultdict
-    per = defaultdict(lambda: {"ok": 0, "fail": 0, "na": 0, "open": 0,
-                               "worst": None})
     res_index = {(r["snap"], r["prov"]): r for r in res_records
                  if r.get("kind") == "res" and r.get("snap") and r.get("prov")}
-    for s in snaps:
-        day = (s.get("ts") or "")[:10]
-        if len(day) != 10:
-            continue
-        for p in (s.get("providers") or {}):
-            cell = per[(day, p)]
-            r = res_index.get((s["ts"], p))
-            if r is None:
-                cell["open"] += 1
-            elif r["status"] == "OK":
-                cell["ok"] += 1
-            elif r["status"] == "FAIL":
-                cell["fail"] += 1
-                w = r.get("error_pct")
-                if w is not None and (cell["worst"] is None or w > cell["worst"]):
-                    cell["worst"] = w
-            else:
-                cell["na"] += 1
+    snaps_by_ts = {s["ts"]: s for s in snaps if s.get("ts")}
+    per, _ = _day_cells(snaps_by_ts, res_index, resolve_ncr=True)
     new = []
     for (day, p), c in sorted(per.items()):
         if c["fail"]:
             verdict = "FAIL"
-        elif c["open"] == 0:
-            verdict = "OK"        # all resolved and none failed
-        else:
+        elif c["open"]:
             verdict = "OPEN"
-        if existing_days.get((day, p)) == verdict:
+        else:
+            verdict = "OK"        # all resolved and none failed
+        rec = {"kind": "day", "day": day, "prov": p, "ts": now_iso,
+               "verdict": verdict, "n_ok": c["ok"], "n_fail": c["fail"],
+               "n_na": c["na"], "n_open": c["open"],
+               "worst_error_pct": c["worst"],
+               "tolerance_pct": TOL_PCT}
+        if existing_days.get((day, p)) == _day_key(rec):
             continue              # unchanged — no append spam
-        new.append({"kind": "day", "day": day, "prov": p, "ts": now_iso,
-                    "verdict": verdict, "n_ok": c["ok"], "n_fail": c["fail"],
-                    "n_na": c["na"], "n_open": c["open"],
-                    "worst_error_pct": c["worst"],
-                    "tolerance_pct": TOL_PCT})
+        new.append(rec)
     return new
 
 
@@ -287,6 +349,16 @@ def _evaluate_phase(snaps, series, resolved, now_epoch):
     return evaluate_snapshots(snaps, series, resolved, now_epoch)
 
 
+def _day_key(r):
+    """Content identity of a day row: verdict + counts. A count change
+    under the reclassification rules (C1/C3) must re-emit the row even
+    when the verdict string stays the same, or the verdict file keeps
+    summing stale totals."""
+    return (r.get("verdict"), r.get("n_ok", 0), r.get("n_fail", 0),
+            r.get("n_na", 0), r.get("n_open", 0),
+            r.get("worst_error_pct"))
+
+
 def _day_verdict_phase(snaps, ledger_entries, res_new, now_iso):
     """Return list of new 'day' verdict records.
     Combines existing days with new results.
@@ -295,7 +367,7 @@ def _day_verdict_phase(snaps, ledger_entries, res_new, now_iso):
     existing_days = {}
     for r in ledger_entries:
         if r.get("kind") == "day" and r.get("day") and r.get("prov"):
-            existing_days[(r["day"], r["prov"]) ] = r.get("verdict")
+            existing_days[(r["day"], r["prov"])] = _day_key(r)
     all_res = [r for r in ledger_entries if r.get("kind") == "res"] + res_new
     return day_verdicts(snaps, all_res, existing_days, now_iso)
 
@@ -309,24 +381,35 @@ def _emit_phase(new_records):
     _write_verdict_file()
 
 
+def _verdict_totals(ledger_rows):
+    """OK/FAIL/OPEN totals from ALL ledger day rows (last-wins per cell).
+
+    Day rows are deduped by (day, prov) keeping the LATEST, and n_ok is
+    summed over ALL resolved cells, OK-verdict and FAIL-verdict alike:
+    a day that failed once must not zero its correct predictions (C2
+    aggregation fix, t_c15c2efb)."""
+    cells = {}
+    for r in ledger_rows:
+        if r.get("kind") == "day" and r.get("day") and r.get("prov"):
+            cells[(r["day"], r["prov"])] = r
+    ok = fail = open_cnt = 0
+    for r in cells.values():
+        ver = r.get("verdict")
+        if ver == "OK":
+            ok += r.get("n_ok", 0)
+        elif ver == "FAIL":
+            fail += r.get("n_fail", 0)
+            ok += r.get("n_ok", 0)    # C2: OKs earned on failing days count
+        elif ver == "OPEN":
+            open_cnt += r.get("n_open", 0)
+    return ok, fail, open_cnt
+
+
 def _write_verdict_file():
     """Recompute OK/FAIL/OPEN totals from the whole ledger into the
-    verifier's verdict JSON."""
-    verdict_path = Path(os.path.expanduser(
-        "~/.hermes/quota-governor/backtest-f2-verdict.json"))
-    ok = fail = open_cnt = 0
-    for r in read_jsonl(LEDGER):
-        if r.get("kind") == "day":
-            ver = r.get("verdict")
-            if ver == "OK":
-                ok += r.get("n_ok", 0)
-            elif ver == "FAIL":
-                fail += r.get("n_fail", 0)
-            elif ver == "OPEN":
-                open_cnt += r.get("n_open", 0)
-    precision_ratio = None
-    if ok + fail > 0:
-        precision_ratio = ok / (ok + fail)
+    verifier's verdict JSON (OBJ-24 gate input)."""
+    ok, fail, open_cnt = _verdict_totals(read_jsonl(LEDGER))
+    precision_ratio = ok / (ok + fail) if ok + fail > 0 else None
     verdict = {
         "precision_ratio": precision_ratio,
         "n_ok": ok,
@@ -335,8 +418,8 @@ def _write_verdict_file():
         "computed_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "source": "forecast-backtest.jsonl",
     }
-    verdict_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(verdict_path, "w", encoding="utf-8") as f:
+    VERDICT_JSON.parent.mkdir(parents=True, exist_ok=True)
+    with open(VERDICT_JSON, "w", encoding="utf-8") as f:
         json.dump(verdict, f, ensure_ascii=False, indent=2)
 
 
@@ -374,7 +457,8 @@ def main():
 
     if new_records:
         _emit_phase(new_records)
-    _print_phase(day_new)
+    _write_verdict_file()   # unconditional: aggregation fixes must land
+    _print_phase(day_new)   # even when no day changed (t_c15c2efb)
     return 0
 
 

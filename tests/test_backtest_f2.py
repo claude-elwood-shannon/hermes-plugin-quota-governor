@@ -73,9 +73,11 @@ class Base(unittest.TestCase):
         self.fc = self.tmp / "forecast.json"
         self.hist = self.tmp / "metrics.jsonl"
         self.ledger = self.tmp / "backtest.jsonl"
+        self.verdict = self.tmp / "verdict.json"
         bf.FORECAST = self.fc
         bf.HISTORY = self.hist
         bf.LEDGER = self.ledger
+        bf.VERDICT_JSON = self.verdict
 
     def run_main(self):
         rc = bf.main()
@@ -301,6 +303,190 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(series["pr-ollama"], [(
             bf.qf._parse_iso("2026-09-08T00:00:00Z"), 11.0)])
         self.assertEqual(series["pr-nanogpt"], [])
+
+
+class TestReclassification(Base):
+    """C1/C2/C3 (t_c15c2efb): pred-beyond-window NA, no-cross directional
+    credit, and OK-earnings counted on failing days in the verdict file."""
+
+    def _seed_ledger(self, lines):
+        self.ledger.write_text(
+            "\n".join(json.dumps(r) for r in lines) + "\n")
+
+    def _write_empty_sources(self):
+        self.fc.write_text("{}")
+        self.hist.write_text("")
+
+    def test_evaluate_fail_beyond_window_becomes_na(self):
+        # C1: real crossing happened, but the predicted eta_90 falls beyond
+        # the snapshot's own weekly reset -> NA pred_beyond_window, not FAIL
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 5 * DAY
+        cross = t0 + 2 * DAY
+        far_eta = reset + 400 * DAY          # predicted beyond the window
+        self.fc.write_text(forecast_of(t0, reset, "pr-ollama", 80.0, far_eta))
+        key_o = bf.qf.METRICAS_WEEKLY["pr-ollama"]
+        hist = rows_ramp(key_o, t0, cross, 80.0, 90.0) + \
+               rows_ramp(key_o, cross + 900, cross + DAY, 90.2, 95.0)
+        self.hist.write_text("\n".join(json.dumps(r) for r in hist) + "\n")
+        self.run_main()
+        res = self.by_kind("res")
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["status"], "NA")
+        self.assertEqual(res[0]["reason"], "pred_beyond_window")
+        # a NA does not fail its day
+        self.assertEqual(self.by_kind("day")[0]["verdict"], "OK")
+
+    def test_evaluate_fail_inside_window_stays_fail(self):
+        # mode B: crossing inside the window, eta beyond it -> the NA rule
+        # must NOT swallow it: still FAIL (with the crossing recorded)
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 5 * DAY
+        cross = t0 + 2 * DAY
+        # predict way late (inside the window but far off the crossing)
+        eta_pred = cross + 2 * DAY
+        self.fc.write_text(forecast_of(t0, reset, "pr-ollama", 80.0, eta_pred))
+        key_o = bf.qf.METRICAS_WEEKLY["pr-ollama"]
+        hist = rows_ramp(key_o, t0, cross, 80.0, 90.0) + \
+               rows_ramp(key_o, cross + 900, cross + DAY, 90.2, 95.0)
+        self.hist.write_text("\n".join(json.dumps(r) for r in hist) + "\n")
+        self.run_main()
+        res = self.by_kind("res")
+        self.assertEqual(res[0]["status"], "FAIL")
+        day = self.by_kind("day")[0]
+        self.assertEqual(day["verdict"], "FAIL")
+
+    def test_day_row_credits_no_cross_beyond_window(self):
+        # C3: elapsed window, predicted eta beyond it -> correct directional
+        # prediction; the day row credits it (n_ok) while the res row stays NA
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 2 * DAY
+        far_eta = reset + 90 * DAY
+        self._write_empty_sources()
+        self._seed_ledger([
+            snap(t0, reset, "pr-ollama", 20.0, far_eta),
+            {"kind": "res", "snap": iso(t0), "prov": "pr-ollama",
+             "status": "NA", "error_pct": None,
+             "reason": "no_cross_before_reset"},
+        ])
+        self.run_main()
+        day = self.by_kind("day")
+        self.assertEqual(len(day), 1)
+        self.assertEqual(day[0]["verdict"], "OK")
+        self.assertEqual(day[0]["n_ok"], 1)
+        self.assertEqual(day[0]["n_na"], 0)   # credited: moved out of NA
+
+    def test_day_row_no_cross_inside_window_not_credited(self):
+        # the parent's claim was wrong for 39/111 rows: a no_cross NA whose
+        # predicted eta is INSIDE the window predicted a crossing that never
+        # happened -> stays NA, earns nothing
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 2 * DAY
+        eta_in_window = t0 + DAY
+        self._write_empty_sources()
+        self._seed_ledger([
+            snap(t0, reset, "pr-ollama", 50.0, eta_in_window),
+            {"kind": "res", "snap": iso(t0), "prov": "pr-ollama",
+             "status": "NA", "error_pct": None,
+             "reason": "no_cross_before_reset"},
+        ])
+        self.run_main()
+        day = self.by_kind("day")[0]
+        self.assertEqual(day["verdict"], "OK")   # NA is not a failure
+        self.assertEqual(day["n_ok"], 0)
+        self.assertEqual(day["n_na"], 1)
+        v = json.loads(self.verdict.read_text())
+        self.assertEqual(v["n_ok"], 0)
+
+    def test_verdict_counts_oks_on_failing_days(self):
+        # C2: 2 OK + 1 FAIL on one day -> verdict FAIL but precision gets
+        # all 3: a failing day no longer zeroes its correct predictions
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 6 * DAY
+        cross = t0 + 3 * DAY
+        late_eta = cross + 2 * DAY               # real FAIL (>20% of margin)
+        self._write_empty_sources()
+        ok1 = snap(t0, reset, "pr-ollama", 70.0, cross)
+        ok2 = snap(t0 + 60, reset, "pr-ollama", 75.0, cross - 600)
+        bad = snap(t0 + 120, reset, "pr-ollama", 80.0, late_eta)
+        res_rows = []
+        for s, eta, st in ((ok1, cross, "OK"), (ok2, cross - 600, "OK"),
+                           (bad, late_eta, "FAIL")):
+            res_rows.append({
+                "kind": "res", "snap": s["ts"], "prov": "pr-ollama",
+                "status": st, "error_pct": 1.0 if st == "OK" else 45.0,
+                "cross_iso": iso(cross), "eta_90_pred": iso(eta)})
+        self._seed_ledger([ok1, ok2, bad] + res_rows)
+        self.run_main()
+        day = self.by_kind("day")[0]
+        self.assertEqual(day["verdict"], "FAIL")
+        self.assertEqual(day["n_ok"], 2)
+        self.assertEqual(day["n_fail"], 1)
+        v = json.loads(self.verdict.read_text())
+        self.assertEqual(v["n_ok"], 2)
+        self.assertEqual(v["n_fail"], 1)
+        self.assertAlmostEqual(v["precision_ratio"], 2.0 / 3.0)
+
+    def test_verdict_dedupes_day_rows_last_wins(self):
+        # older day row for the same (day, prov) must not double count
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 2 * DAY
+        far_eta = reset + 90 * DAY
+        self._write_empty_sources()
+        old = {"kind": "day", "day": iso(t0)[:10], "prov": "pr-ollama",
+               "verdict": "OK", "n_ok": 99, "n_fail": 0, "n_na": 0,
+               "n_open": 0, "worst_error_pct": None}
+        self._seed_ledger([
+            old,
+            snap(t0, reset, "pr-ollama", 20.0, far_eta),
+            {"kind": "res", "snap": iso(t0), "prov": "pr-ollama",
+             "status": "NA", "error_pct": None,
+             "reason": "no_cross_before_reset"},
+        ])
+        self.run_main()
+        v = json.loads(self.verdict.read_text())
+        self.assertEqual(v["n_ok"], 1)     # latest row wins, not 99+1
+        self.assertEqual(v["n_fail"], 0)
+
+    def test_verdict_file_written_without_new_records(self):
+        # recompute is unconditional: identical re-run must still refresh
+        # the verdict file after an aggregation-rule change
+        t0 = int(time.time() - 10 * DAY)
+        reset = t0 + 2 * DAY
+        far_eta = reset + 90 * DAY
+        self._write_empty_sources()
+        self._seed_ledger([
+            snap(t0, reset, "pr-ollama", 20.0, far_eta),
+            {"kind": "res", "snap": iso(t0), "prov": "pr-ollama",
+             "status": "NA", "error_pct": None,
+             "reason": "no_cross_before_reset"},
+            {"kind": "day", "day": iso(t0)[:10], "prov": "pr-ollama",
+             "verdict": "OK", "n_ok": 1, "n_fail": 0, "n_na": 0,
+             "n_open": 0, "worst_error_pct": None},
+        ])
+        self.run_main()
+        # only the seeded day row remains: no duplicate appended...
+        self.assertEqual(len(self.by_kind("day")), 1)
+        v = json.loads(self.verdict.read_text())    # ...but the file landed
+        self.assertEqual(v["n_ok"], 1)
+
+    def test_verdict_file_never_written_to_real_home(self):
+        # the verdict path is tmp-redirected: the REAL home verdict file
+        # must be untouched even when main() writes it unconditionally
+        self._write_empty_sources()
+        real = Path.home() / ".hermes" / "quota-governor" / \
+            "backtest-f2-verdict.json"
+        try:
+            before = real.read_bytes()
+        except OSError:
+            before = None
+        self.run_main()
+        self.assertTrue(self.verdict.exists())
+        try:
+            after = real.read_bytes()
+        except OSError:
+            after = None
+        self.assertEqual(before, after)   # real file never touched
 
 
 if __name__ == "__main__":
