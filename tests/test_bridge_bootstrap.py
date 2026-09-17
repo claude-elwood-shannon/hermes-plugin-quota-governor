@@ -269,7 +269,7 @@ def test_bootstrap_ideas_explicitly_excluded(env):
 # ------------------------------------------------- OpenAPI contract
 
 def test_openapi_declares_bootstrap():
-    assert bridge.OPENAPI_SPEC["info"]["version"] == "1.10.0"
+    assert bridge.OPENAPI_SPEC["info"]["version"] == "1.11.0"
     entry = bridge.OPENAPI_SPEC["paths"]["/bootstrap"]["get"]
     assert entry["operationId"] == "get_bootstrap"
     assert entry["responses"]["200"]
@@ -278,4 +278,4 @@ def test_openapi_declares_bootstrap():
 def test_dispatcher_routes_bootstrap(env):
     code, body = req("/bootstrap")
     assert code == 200
-    assert body["health"]["bridge"]["spec_version"] == "1.10.0"
+    assert body["health"]["bridge"]["spec_version"] == "1.11.0"

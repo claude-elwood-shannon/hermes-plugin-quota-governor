@@ -171,7 +171,7 @@ class CreateTaskWiringTests(unittest.TestCase):
         props = (entry["post"]["requestBody"]["content"]["application/json"]
                  ["schema"]["properties"])
         self.assertIn("assignee", props)
-        self.assertEqual(bridge.OPENAPI_SPEC["info"]["version"], "1.10.0")
+        self.assertEqual(bridge.OPENAPI_SPEC["info"]["version"], "1.11.0")
 
     def test_spec_still_valid_json_shape(self):
         # smoke: the giant literal still parses and carries the new text

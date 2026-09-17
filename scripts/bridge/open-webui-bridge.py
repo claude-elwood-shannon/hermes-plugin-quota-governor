@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """Hermes Bridge API — expone operaciones de Hermes para Open WebUI.
 
+v1.11.0 — t_69ed5eea (MEDIATOR 2026-09-18): gobernanza P3 — hardening de
+      los endpoints de la v1.8.0 tras fallar la verificación live:
+      POST /update-objective — UPDATE parcial: solo id es obligatorio sobre
+                               un objetivo existente (nice, governance,
+                               preset_id, budget_baseline, focus_until sin
+                               name/budget_daily); CREATE mantiene name +
+                               budget_daily obligatorios
+      POST /update-preset    — los 5 presets del sistema (normal, aggressive,
+                               conservative, startup, protected) son de
+                               solo-lectura (403 al modificarlos) y GET
+                               /presets reaplica idempotentemente su sello
+                               is_system=1 (_preset_seal)
+      POST /update-preset    — en CREATE se insertan los params provistos
+                               (v1.8.0 los descartaba salvo name)
+
 t_62ab412b (MEDIATOR 2026-09-17, misma línea v1.9): el POST /create-task ya
      no hardcodea pr-ollama como assignee. Sin `assignee` en el body del
      POST elige el primer profile de PROFILE_PREFERENCE (pr-ollama,
@@ -214,6 +229,36 @@ def _preset_list():
         con.close()
 
 
+_PRESET_SEAL_SQL = (
+    "UPDATE adjustment_presets SET is_system=1, updated_by='mediator-seal' "
+    "WHERE id=? AND (is_system IS NULL OR is_system != 1)")
+
+
+def _preset_seal():
+    """t_69ed5eea: sello idempotente is_system=1 en los 5 presets base.
+
+    P1 los insertó con todas las columnas NULL; sin el sello, la regla
+    'sistema no modificable' era inaplicable. Falla en silencio (best-
+    effort): la lectura /presets no puede morir por el sello. NO crea la
+    tabla: si adjustment_presets no existe, /presets debe seguir
+    devolviendo 503 (contrato v1.8.0).
+    """
+    import sqlite3
+    if not os.path.exists(_AO_DB):
+        return
+    con = None
+    try:
+        con = sqlite3.connect(_AO_DB, timeout=5)
+        for pid in _PRESET_SYSTEM_IDS:
+            con.execute(_PRESET_SEAL_SQL, (pid,))
+        con.commit()
+    except sqlite3.Error:
+        pass  # fail-open: el handler degradará al error 503/500 de siempre
+    finally:
+        if con is not None:
+            con.close()
+
+
 _PRESET_REAL_FIELDS = (
     "nice_step", "nice_cap_high", "nice_cap_low",
     "budget_step_pct", "budget_cap_high_pct", "budget_cap_low_pct",
@@ -221,6 +266,13 @@ _PRESET_REAL_FIELDS = (
 _PRESET_INT_FIELDS = (
     "eval_frequency_min", "cooldown_min", "consecutive_high",
     "consecutive_low", "is_system", "is_active")
+# t_69ed5eea: los 5 presets del sistema llevan is_system=1 (sello
+# idempotente) y son de solo-lectura para POST /update-preset.
+_PRESET_SYSTEM_IDS = ("normal", "aggressive", "conservative",
+                      "startup", "protected")
+_PRESET_OPTIONAL_FIELDS = ("description",) + _PRESET_REAL_FIELDS \
+    + _PRESET_INT_FIELDS
+_PRESET_ALL_FIELDS = ("name",) + _PRESET_OPTIONAL_FIELDS
 
 
 def _bw_preset_validate(data):
@@ -248,7 +300,13 @@ def _bw_preset_validate(data):
 
 
 def _preset_upsert(data):
-    """POST /update-preset: INSERT o UPDATE de los campos provistos only."""
+    """POST /update-preset: INSERT o UPDATE de los campos provistos only.
+
+    t_69ed5eea: en CREATE los params provistos se insertan (antes se
+    descartaban salvo name); los presets del sistema (_PRESET_SYSTEM_IDS,
+    is_system=1) son de solo-lectura: su UPDATE se rechaza con 403 y el
+    sello is_system=1 se reaplica idempotentemente en cada arranque.
+    """
     import sqlite3
     import time as _t
     pid, err = _bw_preset_validate(data)
@@ -261,14 +319,16 @@ def _preset_upsert(data):
     try:
         con = sqlite3.connect(_AO_DB)
         con.execute(_PRESET_DDL)
-        row = con.execute("SELECT id FROM adjustment_presets WHERE id=?",
-                          (pid,)).fetchone()
+        row = con.execute("SELECT id, is_system FROM adjustment_presets "
+                          "WHERE id=?", (pid,)).fetchone()
         if row:
+            if row[1] == 1 or pid in _PRESET_SYSTEM_IDS:
+                con.close()
+                return 403, {
+                    "error": f"preset {pid!r} is_system=1: read-only; "
+                             "create a custom preset instead"}
             sets, vals = ["updated_at=?", "updated_by=?"], [now, "mediator"]
-            for f in ("name", "description") + _PRESET_REAL_FIELDS + (
-                    "eval_frequency_min", "cooldown_min",
-                    "consecutive_high", "consecutive_low",
-                    "is_system", "is_active"):
+            for f in _PRESET_ALL_FIELDS:
                 if f in data and data[f] is not None:
                     sets.append(f"{f}=?")
                     vals.append(data[f])
@@ -278,10 +338,15 @@ def _preset_upsert(data):
             action = "updated"
         else:
             name = (data.get("name") or pid).strip()
-            con.execute(
-                "INSERT INTO adjustment_presets (id, name, created_at, "
-                "updated_at, updated_by) VALUES (?,?,?,?,?)",
-                (pid, name, now, now, "mediator"))
+            cols = ["id", "name", "created_at", "updated_at", "updated_by"]
+            vals = [pid, name, now, now, "mediator"]
+            for f in _PRESET_OPTIONAL_FIELDS:
+                if f in data and data[f] is not None:
+                    cols.append(f)
+                    vals.append(data[f])
+            marks = ",".join("?" * len(cols))
+            con.execute(f"INSERT INTO adjustment_presets ({', '.join(cols)}) "
+                        f"VALUES ({marks})", vals)
             action = "created"
         con.commit()
         con.row_factory = sqlite3.Row
@@ -328,19 +393,44 @@ def _bw_ao_validate(data):
 
     Devuelve (oid, name, budget_daily, status, governance, preset_id,
     focus_until, err); err es None cuando el payload es válido, o el dict
-    de error 400 (id/name requeridos, budget numérico no bool, status
-    dentro de _AO_VALID_STATUSES, nice entero no bool,
-    budget_baseline/budget_adjustment_pct/focus_until numéricos no bool,
-    governance dentro de _AO_GOVERNANCE_MODES, preset_id existente en
-    adjustment_presets). No toca disco.
+    de error 400. No toca disco salvo la lectura de existencia.
+
+    t_69ed5eea: UPDATE parcial — solo id es obligatorio cuando el objetivo
+    ya existe (nice/governance/etc. sin name/budget_daily); CREATE exige
+    además name y budget_daily numérico. En UPDATE, name y budget_daily
+    deben ir juntos si se provee cualquiera de los dos.
     """
+    import sqlite3
     oid = (data.get("id") or "").strip()
     name = (data.get("name") or "").strip()
     budget = data.get("budget_daily")
-    if not oid or not name or not isinstance(budget, (int, float)) \
-            or isinstance(budget, bool):
+    if not oid:
         return None, None, None, None, None, None, None, {
-            "error": "id, name and numeric budget_daily are required"}
+            "error": "id is required"}
+    is_new = True
+    if os.path.exists(_AO_DB):
+        try:
+            con = sqlite3.connect(f"file:{_AO_DB}?mode=ro", uri=True)
+            try:
+                is_new = con.execute(
+                    "SELECT 1 FROM approved_objectives WHERE id=?",
+                    (oid,)).fetchone() is None
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass  # fail-open: sin tabla se trata como CREATE
+    if is_new:
+        if not name or not isinstance(budget, (int, float)) \
+                or isinstance(budget, bool):
+            return None, None, None, None, None, None, None, {
+                "error": "id, name and numeric budget_daily are required "
+                         "to create a new objective"}
+    elif (name or budget is not None) and not (
+            name and isinstance(budget, (int, float))
+            and not isinstance(budget, bool)):
+        return None, None, None, None, None, None, None, {
+            "error": "name and numeric budget_daily must be provided "
+                     "together"}
     status = (data.get("status") or "active").strip()
     if status not in _AO_VALID_STATUSES:
         return None, None, None, None, None, None, None, {
@@ -765,7 +855,7 @@ _SNIFF_BYTES = 8192
 
 OPENAPI_SPEC = {
     "openapi": "3.0.0",
-    "info": {"title": "Hermes Bridge", "version": "1.10.0",
+    "info": {"title": "Hermes Bridge", "version": "1.11.0",
              "description": "Bridge to Hermes Agent kanban and observability"},
     "servers": [{"url": f"http://localhost:{PORT}"}],
     "paths": {
@@ -789,7 +879,7 @@ OPENAPI_SPEC = {
         "/approve-task": {"post": {"summary": "Atomically approve a triage task (move to ready + stamp approval)", "description": "Moves triage->todo (specify) then todo->ready (promote), then stamps an [APPROVAL: approved <ts>] comment. Reports moved/stamped booleans per step; non-transactional (a failed comment can be retried).", "operationId": "approve_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}, "note": {"type": "string", "description": "Optional approval note"}}, "required": ["task_id"]}}}}, "responses": {"200": {"description": "Approval result", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/verify-task": {"post": {"summary": "Verify task success criterion against evidence", "description": "Reads a completed task's body, extracts the declared success criterion, searches for evidence of fulfillment, and returns a verdict (PASS|FAIL|INCONCLUSIVE|NO_CRITERION|NOT_DONE).", "operationId": "verify_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}}}, "responses": {"200": {"description": "Verification result", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/objectives": {"get": {"summary": "Get approved objectives inventory", "description": "Returns all approved objectives with their status, budget, and spending. Filter by status with optional parameter.", "operationId": "get_objectives", "parameters": [{"name": "status", "in": "query", "required": False, "schema": {"type": "string"}}], "responses": {"200": {"description": "Objectives list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
-        "/update-objective": {"post": {"summary": "Create or update an approved objective", "description": "Inserts a new objective or updates an existing one. Used by mediator to manage the objectives inventory.", "operationId": "update_objective", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "budget_daily": {"type": "number"}, "description": {"type": "string"}, "success_criterion": {"type": "string"}, "status": {"type": "string", "default": "active"}}, "required": ["id", "name", "budget_daily"]}}}}, "responses": {"200": {"description": "Objective created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/update-objective": {"post": {"summary": "Create or update an approved objective", "description": "Inserts a new objective or updates PROVIDED fields only (t_69ed5eea: partial updates — id alone suffices for an existing objective; name and budget_daily are required together only when creating). P1 governance fields: nice, focus_until, budget_baseline, budget_adjustment_pct, governance (static|responsive|dynamic), preset_id (must exist in adjustment_presets).", "operationId": "update_objective", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "budget_daily": {"type": "number"}, "description": {"type": "string"}, "success_criterion": {"type": "string"}, "status": {"type": "string", "default": "active"}, "nice": {"type": "integer"}, "focus_until": {"type": "number"}, "budget_baseline": {"type": "number"}, "budget_adjustment_pct": {"type": "number"}, "governance": {"type": "string", "enum": ["static", "responsive", "dynamic"]}, "preset_id": {"type": "string"}}, "required": ["id"]}}}}, "responses": {"200": {"description": "Objective created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"description": "Invalid payload"}}}},
         # ---- t_6c5233a8: backup monitoring (read-only) ----
         "/backup/snapshots": {"get": {"summary": "Get recent backup snapshots", "description": "Returns recent restic snapshots. Does not expose credentials or repository URL.", "operationId": "get_backup_snapshots", "responses": {"200": {"description": "Snapshots list", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/backup/stats": {"get": {"summary": "Get backup repository stats", "description": "Returns restic repo size and file count. Does not expose credentials.", "operationId": "get_backup_stats", "responses": {"200": {"description": "Repo stats", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
@@ -803,10 +893,10 @@ OPENAPI_SPEC = {
                     "operationId": "list_presets",
                     "responses": {"200": {"description": "Presets list", "content": {"application/json": {"schema": {"type": "object"}}}}, "503": {"description": "kanban.db missing or table absent"}}}},
         "/update-preset": {"post": {"summary": "Create or update an adjustment preset",
-                    "description": "Inserts a new preset or updates PROVIDED fields only (name, description, nice_step, nice_cap_high/low, budget_step_pct, budget_cap_high/low_pct, eval_frequency_min, cooldown_min, trigger_eff_high/low, consecutive_high/low, is_system, is_active).",
+                    "description": "Inserts a new preset or updates PROVIDED fields only (name, description, nice_step, nice_cap_high/low, budget_step_pct, budget_cap_high/low_pct, eval_frequency_min, cooldown_min, trigger_eff_high/low, consecutive_high/low, is_system, is_active). System presets (normal, aggressive, conservative, startup, protected; is_system=1) are read-only: attempts return 403 — create a custom preset instead.",
                     "operationId": "update_preset",
                     "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "description": {"type": "string"}, "nice_step": {"type": "number"}, "nice_cap_high": {"type": "number"}, "nice_cap_low": {"type": "number"}, "budget_step_pct": {"type": "number"}, "budget_cap_high_pct": {"type": "number"}, "budget_cap_low_pct": {"type": "number"}, "eval_frequency_min": {"type": "integer"}, "cooldown_min": {"type": "integer"}, "trigger_eff_high": {"type": "number"}, "trigger_eff_low": {"type": "number"}, "consecutive_high": {"type": "integer"}, "consecutive_low": {"type": "integer"}, "is_system": {"type": "integer"}, "is_active": {"type": "integer"}}, "required": ["id"]}}}},
-                    "responses": {"200": {"description": "Preset created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"description": "Invalid payload"}, "500": {"description": "kanban.db not found"}}}},
+                    "responses": {"200": {"description": "Preset created or updated", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"description": "Invalid payload"}, "403": {"description": "System preset is read-only (is_system=1)"}, "500": {"description": "kanban.db not found"}}}},
         # ---- t_0c6a7847 v1.7: idea parking lot (~/.hermes/data/ideas/) ----
         "/save-idea": {"post": {"summary": "Save a brainstorm idea to the parking lot",
                     "description": "Persists an idea as a JSON file under ~/.hermes/data/ideas/. Ideas are NOT kanban tasks: they are a parking lot consulted by the mediator when needed. Creates the directory on first save.",
@@ -2023,7 +2113,12 @@ class HermesBridge(BaseHTTPRequestHandler):
                                          _BOOTSTRAP_LOG_LINES)}})
 
     def _handle_presets(self) -> None:
-        """GET /presets — adjustment_presets inventory (P1 schema)."""
+        """GET /presets — adjustment_presets inventory (P1 schema).
+
+        t_69ed5eea: antes de leer reaplica idempotentemente el sello
+        is_system=1 en los 5 presets base (ver _preset_seal()).
+        """
+        _preset_seal()
         rows = _preset_list()
         if rows is None:
             self._send_json({"error": "adjustment_presets unavailable "

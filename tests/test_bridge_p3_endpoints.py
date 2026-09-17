@@ -208,6 +208,46 @@ class P3(unittest.TestCase):
         self.assertEqual(code, 200, str(data))
         self.assertNotIn("governance", data["preset"])
 
+    # ---- t_69ed5eea v1.11.0: CREATE persiste params + sistema RO -----
+
+    def test_4b_preset_create_with_params(self):
+        # v1.8.0 descartaba los params provistos en CREATE (solo id/name)
+        code, data = self._post("/update-preset", {
+            "id": "turbo2", "name": "turbo2", "nice_step": 7,
+            "nice_cap_high": 21, "nice_cap_low": -21,
+            "budget_step_pct": 0.15, "eval_frequency_min": 45,
+            "cooldown_min": 90, "consecutive_high": 4,
+            "is_system": 0, "is_active": 1})
+        self.assertEqual(code, 200, str(data))
+        self.assertEqual(data["action"], "created")
+        p = data["preset"]
+        self.assertEqual(p["nice_step"], 7)
+        self.assertEqual(p["nice_cap_high"], 21)
+        self.assertEqual(p["nice_cap_low"], -21)
+        self.assertEqual(p["budget_step_pct"], 0.15)
+        self.assertEqual(p["eval_frequency_min"], 45)
+        self.assertEqual(p["cooldown_min"], 90)
+        self.assertEqual(p["consecutive_high"], 4)
+        self.assertEqual(p["is_system"], 0)
+
+    def test_4c_system_preset_readonly(self):
+        # t_69ed5eea: los 5 presets del sistema son de solo-lectura (403)
+        for pid in ("normal", "aggressive", "conservative", "startup",
+                    "protected"):
+            code, data = self._post("/update-preset",
+                                    {"id": pid, "name": "hacked"})
+            self.assertEqual(code, 403, f"{pid}: {data}")
+        # y el sello is_system=1 se reaplica idempotentemente en GET
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE adjustment_presets SET is_system=NULL "
+                    "WHERE id='normal'")
+        con.commit()
+        con.close()
+        code, data = self._get("/presets")
+        self.assertEqual(code, 200)
+        row = [p for p in data["presets"] if p["id"] == "normal"][0]
+        self.assertEqual(row["is_system"], 1)
+
     # ---- POST /update-objective extended -----------------------------
 
     def test_5_objective_create_with_p1_fields(self):
@@ -267,6 +307,49 @@ class P3(unittest.TestCase):
             "id": "OBJ-BAD", "name": "n", "budget_daily": 0.1,
             "preset_id": "ghost"})
         self.assertEqual(code, 400)
+
+    # ---- t_69ed5eea v1.11.0: UPDATE parcial de objetivos -------------
+
+    def test_7b_objective_partial_update(self):
+        # criterio de éxito del card: nice + governance SIN name/budget
+        code, data = self._post("/update-objective", {
+            "id": "OBJ-TEST", "nice": -3, "governance": "responsive"})
+        self.assertEqual(code, 200, str(data))
+        self.assertEqual(data["action"], "updated")
+        o = data["objective"]
+        self.assertEqual(o["nice"], -3)
+        self.assertEqual(o["governance"], "responsive")
+        # housekeeping intocable: name/budget/status/preset persisten
+        self.assertEqual(o["name"], "test2")
+        self.assertEqual(o["budget_daily"], 0.20)
+        self.assertEqual(o["status"], "paused")
+        self.assertEqual(o["preset_id"], "conservative")
+        # budget_baseline también actualizable en parcial
+        code, data = self._post("/update-objective", {
+            "id": "OBJ-TEST", "budget_baseline": 0.30,
+            "focus_until": 1790000000.0})
+        self.assertEqual(code, 200, str(data))
+        self.assertEqual(data["objective"]["budget_baseline"], 0.30)
+        self.assertEqual(data["objective"]["focus_until"], 1790000000.0)
+        # crear sin name/budget sigue en 400
+        code, data = self._post("/update-objective", {
+            "id": "OBJ-NEW1", "nice": 5})
+        self.assertEqual(code, 400, str(data))
+        self.assertIn("create a new objective", data["error"])
+        # crear con name pero sin budget también
+        code, data = self._post("/update-objective", {
+            "id": "OBJ-NEW2", "name": "x", "nice": 5})
+        self.assertEqual(code, 400, str(data))
+        # UPDATE con name sin budget (o viceversa) -> 400 (van juntos)
+        code, data = self._post("/update-objective", {
+            "id": "OBJ-TEST", "name": "solo-name"})
+        self.assertEqual(code, 400, str(data))
+        code, data = self._post("/update-objective", {
+            "id": "OBJ-TEST", "budget_daily": 0.30})
+        self.assertEqual(code, 400, str(data))
+        # sin id -> 400
+        code, data = self._post("/update-objective", {"nice": 1})
+        self.assertEqual(code, 400, str(data))
 
     def test_8_ensure_columns_alter(self):
         # fresh legacy-shaped table in a second db -> ensure adds 6 columns
