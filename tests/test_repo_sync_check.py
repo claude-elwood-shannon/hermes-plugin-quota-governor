@@ -463,6 +463,24 @@ class TestBuildSyncBody(unittest.TestCase):
         self.assertIn("git push", body)
         self.assertIn("ProxyCommand", body)
 
+    def test_mandates_syntax_gate_before_commit(self):
+        """t_cec89d77: step 2 must run scripts/sync_gate.py pre-commit.
+
+        The 2026-09-15 incident (f92b3d2) committed SyntaxError WIP and
+        propagated it to deployed copies because no gate ran first.
+        """
+        body = build_sync_body(
+            [{"status": " M", "path": "scripts/foo.py"}], []
+        )
+        self.assertIn("sync_gate.py", body)
+        self.assertIn("GATE DE SINTAXIS OBLIGATORIO", body)
+        # gate comes BEFORE the commit step in the numbered instructions
+        self.assertLess(
+            body.index("sync_gate.py"), body.index("commit -m"),
+            "the gate must precede the commit instruction",
+        )
+        self.assertIn("NO commitear", body)
+
 
 class TestMainDryRun(unittest.TestCase):
     """Tests for main() in dry-run mode (no --execute)."""

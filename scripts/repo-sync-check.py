@@ -38,6 +38,10 @@ Safety properties (mirrors diagnose-crash.py):
   - Fail-safe config: a corrupt/malformed repo-watch.json aborts with no tasks
     created; a bad/disabled repo entry is skipped, never fatal.
   - Push failure handling: task body includes backoff retry instructions.
+  - Pre-commit syntax gate (t_cec89d77): the task body's step 2 mandates
+    scripts/sync_gate.py (py_compile every touched *.py, bash -n every
+    *.sh) BEFORE the sync commit. Exit 1 = no commit, no push, no
+    propagation to deployed copies, alert lists the broken files.
 
 Usage:
   python3 repo-sync-check.py              # dry-run, prints decisions to stdout
@@ -608,25 +612,37 @@ def _sync_body_instructions(repo_label: str, remote: str, branch: str) -> str:
         "## Instrucciones\n\n"
         "1. Revisar los cambios con `git status` y `git diff` en "
         f"{repo_label}\n"
-        "2. Si hay cambios sin commitear que tocan codigo del plugin:\n"
+        "2. GATE DE SINTAXIS OBLIGATORIO (t_cec89d77 — ANTES de commitear):\n"
+        f"   python3 {repo_label}/scripts/sync_gate.py\n"
+        "   Valida py_compile cada *.py tocado y bash -n cada *.sh.\n"
+        "   - Exit 0: continuar con el paso 3.\n"
+        "   - Exit 1: NO commitear, NO pushear, NO propagar a copias "
+        "desplegadas. El output lista los ficheros rotos (alerta). "
+        "Repararlos o restaurarlos desde HEAD "
+        "(git checkout HEAD -- <fichero>) y volver a ejecutar el gate "
+        "hasta exit 0. Si el WIP roto no es tuyo, no lo toques: bloquea "
+        "con kanban_block.\n"
+        "3. Si hay cambios sin commitear que tocan codigo del plugin:\n"
         "   - Commitear con el nombre/email del usuario (NUNCA inventar datos):\n"
         "     git -c user.name='Claude Elwood Shannon' "
         "-c user.email='claude.el.shannon@proton.me' commit -m '<msg>'\n"
         "   - Excluir archivos de entorno/ruido (.worktrees/, __pycache__/, etc.)\n"
-        f"3. Pushear a {remote}/{branch} (Tor via SSH ProxyCommand ya configurado):\n"
+        f"4. Pushear a {remote}/{branch} (Tor via SSH ProxyCommand ya configurado):\n"
         f"   git push {remote} {branch}\n"
         "   (El SSH config usa ProxyCommand nc -x 127.0.0.1:9050 para github.com)\n"
         "   NOTA: NO usar 'torify git push' — causa doble proxy y falla.\n"
-        "4. Si el push falla (Tor/red), reintentar con backoff:\n"
+        "   Solo propagar a copias desplegadas contenido ya commiteado y "
+        "validado por el gate del paso 2.\n"
+        "5. Si el push falla (Tor/red), reintentar con backoff:\n"
         "   - Esperar 30s, reintentar\n"
         "   - Esperar 2min, reintentar\n"
         "   - Esperar 5min, reintentar\n"
         "   - Si despues de 3 intentos falla, documentar el error y bloquear "
         "la tarea con kanban_block(reason='Push failed: <error>')\n"
-        f"5. Verificar que {remote}/{branch} coincide con local:\n"
+        f"6. Verificar que {remote}/{branch} coincide con local:\n"
         f"   git fetch {remote} && git rev-list --count {remote}/{branch}..{branch}\n"
         "   Debe ser 0.\n"
-        "6. Dejar evidencia: output de git push y git log en el summary.\n"
+        "7. Dejar evidencia: output de git push y git log en el summary.\n"
     )
 
 def _resolve_assignee(cfg):
