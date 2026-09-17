@@ -217,6 +217,47 @@ def check_max_active_objectives(kanban_db: str) -> GuardrailResult:
     return result
 
 
+def _path_is_allowed(expanded: str) -> bool:
+    """Whether an expanded, normalized path is within an allowed prefix."""
+    for prefix in ALLOWED_PATH_PREFIXES:
+        if expanded.startswith(os.path.normpath(prefix)):
+            return True
+    return False
+
+
+def _path_is_system(expanded: str) -> bool:
+    """Whether an expanded path matches a known system/blacklisted path."""
+    for sys_path in SYSTEM_FILE_BLACKLIST:
+        if expanded.startswith(sys_path) or expanded.endswith(sys_path):
+            return True
+    return False
+
+
+def _collect_paths(text: str) -> set:
+    """All file paths mentioned in the text (any PATH_PATTERNS form)."""
+    found_paths = set()
+    for pattern in PATH_PATTERNS:
+        for match in pattern.finditer(text):
+            path = match.group(1)
+            if path:
+                found_paths.add(path)
+    return found_paths
+
+
+def _file_scope_violation(path: str, expanded: str) -> Violation:
+    """Classify one out-of-scope path as GR4 (system file) or GR2 (other)."""
+    if _path_is_system(expanded):
+        return Violation(
+            id="GR4",
+            message=f"Objective touches system file: {path}",
+        )
+    return Violation(
+        id="GR2",
+        message=f"Objective touches file outside allowed scope: {path} "
+                f"(only {PLUGIN_REPO} and {HERMES_HOME} are allowed)",
+    )
+
+
 def check_file_scope(text: str) -> GuardrailResult:
     """GR2/GR3/GR11: No touching files outside allowed paths.
 
@@ -225,49 +266,13 @@ def check_file_scope(text: str) -> GuardrailResult:
     """
     result = GuardrailResult()
 
-    # Collect all paths mentioned in the text
-    found_paths = set()
-    for pattern in PATH_PATTERNS:
-        for match in pattern.finditer(text):
-            path = match.group(1)
-            if path:
-                found_paths.add(path)
+    for path in _collect_paths(text):
+        # Expand ~ paths, then normalize for prefix comparison
+        expanded = os.path.normpath(os.path.expanduser(path))
 
-    # Expand ~ paths for comparison
-    for path in found_paths:
-        expanded = os.path.expanduser(path)
-        # Normalize for prefix comparison
-        expanded = os.path.normpath(expanded)
-
-        # Check if it's within an allowed prefix
-        allowed = False
-        for prefix in ALLOWED_PATH_PREFIXES:
-            if expanded.startswith(os.path.normpath(prefix)):
-                allowed = True
-                break
-
-        if not allowed:
-            # Check if it's a known system path
-            is_system = False
-            for sys_path in SYSTEM_FILE_BLACKLIST:
-                if expanded.startswith(sys_path) or expanded.endswith(sys_path):
-                    is_system = True
-                    break
-
-            if is_system:
-                result.allowed = False
-                result.violations.append(Violation(
-                    id="GR4",
-                    message=f"Objective touches system file: {path}",
-                ))
-            else:
-                # Outside allowed paths but not a system file
-                result.allowed = False
-                result.violations.append(Violation(
-                    id="GR2",
-                    message=f"Objective touches file outside allowed scope: {path} "
-                            f"(only {PLUGIN_REPO} and {HERMES_HOME} are allowed)",
-                ))
+        if not _path_is_allowed(expanded):
+            result.allowed = False
+            result.violations.append(_file_scope_violation(path, expanded))
 
     return result
 
@@ -448,6 +453,12 @@ def check_os_files(text: str) -> GuardrailResult:
 # Main validation
 # ---------------------------------------------------------------------------
 
+def _merge_result(combined: GuardrailResult, result: GuardrailResult) -> None:
+    """Merge one check's violations and warnings into the combined result."""
+    combined.violations.extend(result.violations)
+    combined.warnings.extend(result.warnings)
+
+
 def validate_objective(
     title: str,
     body: str,
@@ -469,59 +480,99 @@ def validate_objective(
     full_text = f"{title}\n{body}"
 
     # GR1: Max active objectives (dynamic)
-    r = check_max_active_objectives(kanban_db)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_max_active_objectives(kanban_db))
     # GR2/GR3/GR11: File scope (static)
-    r = check_file_scope(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_file_scope(full_text))
     # GR4: System files (static)
-    r = check_system_files(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_system_files(full_text))
     # GR5: Credentials (static, warning)
-    r = check_credentials(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_credentials(full_text))
     # GR6: Daily proposal limit (dynamic)
-    r = check_daily_proposal_limit(state_file)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_daily_proposal_limit(state_file))
     # GR7: config.yaml (static, warning)
-    r = check_config_yaml(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_config_yaml(full_text))
     # GR8: Triage-only (no-op, enforced at creation)
-    r = check_triage_only()
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_triage_only())
     # GR9: Package install (static, warning)
-    r = check_package_install(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_package_install(full_text))
     # GR10: Other repos (static)
-    r = check_other_repos(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
-
+    _merge_result(combined, check_other_repos(full_text))
     # GR11: OS files (static)
-    r = check_os_files(full_text)
-    combined.violations.extend(r.violations)
-    combined.warnings.extend(r.warnings)
+    _merge_result(combined, check_os_files(full_text))
 
     # Allowed only if no violations
     combined.allowed = len(combined.violations) == 0
 
     return combined
+
+
+def _already_recorded_today(state_path: str, today: str, title: str) -> bool:
+    """Dedup: whether an entry with the same title was already recorded
+    today (unreadable/garbage lines are skipped, I/O errors fail open)."""
+    if not os.path.exists(state_path):
+        return False
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if (entry.get("date", "") == today
+                            and entry.get("title", "") == title):
+                        return True
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+def _pattern_kind_from_title(title: str) -> str:
+    """Derive a pattern_kind from the title for cross-path dedup with
+    objective-proposer.py (which uses kind:suffix pattern_keys)."""
+    kind_match = re.match(r"OBJ-\d+:\s*(.+?)(?:\s*[\(\—]|$)", title)
+    if kind_match:
+        return kind_match.group(1).strip().lower().replace(" ", "_")
+    return title[:40]
+
+
+def _proposal_entry(
+    title: str,
+    result: GuardrailResult,
+    pattern_kind: str,
+    today: str,
+    task_id: Optional[str] = None,
+) -> dict:
+    """Build the JSONL entry for a recorded proposal."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "date": today,
+        "title": title,
+        "pattern_kind": pattern_kind,
+        "allowed": result.allowed,
+        "violations": [{"id": v.id, "message": v.message} for v in result.violations],
+        "warnings": [{"id": w.id, "message": w.message} for w in result.warnings],
+        "requires_human_approval": result.requires_human_approval,
+        # Include evidence/pattern_key for cross-path dedup with objective-proposer.
+        # Without this, _already_proposed() can't match entries from validate-guardrails
+        # against entries from objective-proposer, causing duplicate proposals.
+        "evidence": title,  # title is the best available proxy here
+        "pattern_key": f"{pattern_kind}:{title[:80]}",
+    }
+    if task_id:
+        entry["task_id"] = task_id
+    return entry
+
+
+def _append_entry(state_path: str, entry: dict) -> None:
+    """Append one entry as a JSON line; I/O errors are swallowed (fail open)."""
+    try:
+        with open(state_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 def record_proposal(
@@ -543,52 +594,13 @@ def record_proposal(
 
     # Dedup: check if an entry with the same title was already recorded today.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        if (entry.get("date", "") == today
-                                and entry.get("title", "") == title):
-                            # Already recorded this exact proposal today — skip.
-                            return
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            pass
+    if _already_recorded_today(state_path, today, title):
+        # Already recorded this exact proposal today — skip.
+        return
 
-    # Derive a pattern_kind from the title for cross-path dedup with
-    # objective-proposer.py (which uses kind:suffix pattern_keys).
-    kind_match = re.match(r"OBJ-\d+:\s*(.+?)(?:\s*[\(\—]|$)", title)
-    pattern_kind = kind_match.group(1).strip().lower().replace(" ", "_") if kind_match else title[:40]
-
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "date": today,
-        "title": title,
-        "pattern_kind": pattern_kind,
-        "allowed": result.allowed,
-        "violations": [{"id": v.id, "message": v.message} for v in result.violations],
-        "warnings": [{"id": w.id, "message": w.message} for w in result.warnings],
-        "requires_human_approval": result.requires_human_approval,
-        # Include evidence/pattern_key for cross-path dedup with objective-proposer.
-        # Without this, _already_proposed() can't match entries from validate-guardrails
-        # against entries from objective-proposer, causing duplicate proposals.
-        "evidence": title,  # title is the best available proxy here
-        "pattern_key": f"{pattern_kind}:{title[:80]}",
-    }
-    if task_id:
-        entry["task_id"] = task_id
-
-    try:
-        with open(state_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except OSError:
-        pass
+    pattern_kind = _pattern_kind_from_title(title)
+    entry = _proposal_entry(title, result, pattern_kind, today, task_id=task_id)
+    _append_entry(state_path, entry)
 
 
 # ---------------------------------------------------------------------------
