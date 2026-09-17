@@ -144,6 +144,7 @@ AUDIT_MARKER = "[done-verify]"
 
 
 def get_hermes_home() -> Path:
+    """Profile home (HERMES_HOME env or ~/.hermes); base for the cola-viva ledger."""
     val = os.environ.get("HERMES_HOME", "").strip()
     return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
@@ -166,6 +167,7 @@ def _get_hermes_root() -> Path:
 
 
 def kanban_db_path(hermes_home=None) -> Path:
+    """Kanban DB path: HERMES_KANBAN_DB env override, else <home>/kanban.db."""
     env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if env_db:
         return Path(env_db).expanduser().resolve()
@@ -175,6 +177,7 @@ def kanban_db_path(hermes_home=None) -> Path:
 
 
 def ledger_path(hermes_home=None) -> Path:
+    """Shared cola-viva ledger path: <home>/quota-governor/cola-viva.jsonl."""
     base = Path(hermes_home) if hermes_home else get_hermes_home()
     return base / "quota-governor" / "cola-viva.jsonl"
 
@@ -322,6 +325,7 @@ def parts_label(nums: list) -> str:
 
 
 def first_tag(body: str, tag: str) -> str:
+    """First token of a header tag value ('cost:tiny (todo local...)' -> 'tiny'); '' if absent."""
     m = TAG_RE[tag].search(body or "")
     if not m:
         return ""
@@ -330,6 +334,7 @@ def first_tag(body: str, tag: str) -> str:
 
 
 def is_clase_c(body: str) -> bool:
+    """True when the body carries the 'clase:C' marker (auto-successor eligible)."""
     return bool(CLASE_C_RE.search(body or ""))
 
 
@@ -517,6 +522,7 @@ def _cli(*args, timeout=60):
 
 
 def create_task(title: str, body: str, assignee: str) -> str | None:
+    """Create a kanban task via CLI; returns the new task id, or None on failure."""
     r = _cli("create", title, "--assignee", assignee, "--workspace", "scratch",
              "--body", body, "--json")
     if r.returncode != 0:
@@ -529,6 +535,7 @@ def create_task(title: str, body: str, assignee: str) -> str | None:
 
 
 def comment_task(task_id: str, text: str) -> bool:
+    """Post a comment via the CLI as 'tick-body-parts'; True on exit code 0."""
     return _cli("comment", task_id, text,
                 "--author", "tick-body-parts").returncode == 0
 
@@ -635,6 +642,7 @@ def cascade_step(db_path, ledger, execute: bool = False,
 
 
 def main(argv=None) -> int:
+    """CLI entry: --scan prints the findings table; otherwise runs one step."""
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     p.add_argument("--execute", action="store_true",
                    help="actually create/comment (default: dry-run)")

@@ -109,6 +109,7 @@ def _cli(*args, timeout=60) -> subprocess.CompletedProcess:
 
 
 def stop_signal_active(root: Path | None = None) -> bool:
+    """True when the DIRECCION-STOP signal file exists under <root>/quota-governor/."""
     base = Path(root) if root else Path.home() / ".hermes"
     return (base / "quota-governor" / "STOP").exists()
 
@@ -120,6 +121,7 @@ def _connect(db_path: Path):
 
 
 def header_of(body: str) -> str:
+    """First block of non-empty lines of a body (everything before the first blank line)."""
     lines = []
     for line in (body or "").splitlines():
         if not line.strip():
@@ -129,6 +131,7 @@ def header_of(body: str) -> str:
 
 
 def has_human_gate(title: str, body: str) -> bool:
+    """True when the [human-gate] marker appears in the title or the body header."""
     return "[human-gate]" in (title or "") or "[human-gate]" in header_of(body or "")
 
 
@@ -153,6 +156,7 @@ def blocked_since_map(db_path: Path) -> dict[str, float]:
 
 
 def blocked_reason(db_path: Path, task_id: str) -> str:
+    """Reason of the latest blocked event, falling back to the last failed run's error."""
     con = _connect(db_path)
     try:
         row = con.execute(
@@ -202,6 +206,7 @@ def dependency_ids(db_path: Path, task_id: str) -> list[str]:
 
 
 def parent_status(db_path: Path, parent_id: str) -> str | None:
+    """Status of the given task, or None when the id does not exist."""
     con = _connect(db_path)
     try:
         row = con.execute("SELECT status FROM tasks WHERE id=?",
@@ -285,6 +290,7 @@ def r6_escalation(db_path: Path, task_id: str, current_reason: str) -> str | Non
 
 
 def remediation_attempt_count(db_path: Path, task_id: str, remedy: str) -> int:
+    """Number of R6 attempt comments recorded for this remedy (R1-R3) on the task."""
     con = _connect(db_path)
     try:
         row = con.execute(
@@ -328,6 +334,7 @@ def _route_to_triage(task_id: str, comment: str, db_path: Path) -> tuple[bool, s
 
 def triage_comment(minutes: int, cls: str, root_cause: str,
                    attempted: str, result: str, why: str) -> str:
+    """Build the structured [TTL-BLOCKED] comment posted when a task moves to triage."""
     return (
         f"{TRIAGE_MARK} Movida a triage automático.\n"
         f"Tiempo en blocked: {minutes}m\n"
@@ -623,6 +630,10 @@ def process_blocked(db_path: Path, task_id: str, model_override: str,
 
 def run(execute: bool = False, now: float | None = None,
         db_path: Path | None = None, root: Path | None = None) -> list[TtlResult]:
+    """Scan every blocked task; classify, auto-remediate or route to triage.
+    Returns one TtlResult per task; with execute=False every verdict is
+    a dry-* verdict and no mutation happens.
+    """
     now = time.time() if now is None else float(now)
     root = root or Path.home() / ".hermes"
     db_path = db_path or root / "kanban.db"
@@ -664,6 +675,7 @@ def run(execute: bool = False, now: float | None = None,
 
 
 def main(argv=None) -> int:
+    """CLI entry: one dry-run pass by default; --execute applies the mutations."""
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     p.add_argument("--execute", action="store_true",
                    help="aplicar mutaciones (sin esto: dry-run)")
