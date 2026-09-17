@@ -115,7 +115,7 @@ bridge exposes — everything else is read-only.
 
 | # | Endpoint | Body fields | Description |
 |---|----------|-------------|-------------|
-| 1 | `POST /create-task` | `title` (req), `body` (req), `tags` (default `mediator-prompt`), `triage` (bool, default false) | Create a kanban task (`--created-by mediator`, default assignee `pr-ollama`). `triage: true` lands it in triage instead of ready. |
+| 1 | `POST /create-task` | `title` (req), `body` (req), `tags` (default `mediator-prompt`), `assignee` (optional override), `triage` (bool, default false) | Create a kanban task (`--created-by mediator`). Assignee: explicit `assignee` wins; otherwise first profile without a quota-governor STOP file, in order `pr-ollama`, `pr-nanogpt`, `pr-opencode`, `pr-vllm`; all stopped → `pr-ollama` (fail-open). `triage: true` lands it in triage instead of ready. |
 | 2 | `POST /move-task` | `task_id` (req), `status` (req: `todo` or `ready`) | Restricted transitions only: `triage→todo` via `specify` (LLM spec-writer, 150 s timeout), `todo/blocked→ready` via `promote`. Other pairs → 409. Returns `{moved, current_status, new_status, steps[]}`. |
 | 3 | `POST /comment-task` | `task_id` (req), `comment` (req) | Append a comment to a task; response includes `ok` (true when the CLI confirms `Comment added`). |
 | 4 | `POST /approve-task` | `task_id` (req), `note` (optional) | Atomic-in-intent approval: moves the task to `ready` from `triage` (specify+promote), `todo`, or `blocked`, then stamps `[APPROVAL: approved <utc-ts>] <note>` as a comment. `{moved, stamped}` reported per step; non-transactional — a failed stamp can be retried without re-moving (already-`ready` counts as moved). 409 for other statuses. |
@@ -222,4 +222,7 @@ pointing at `http://192.168.1.57:9120`; raw `curl` works identically.
 | v1.4 | Backup monitoring: `/backup/snapshots`, `/backup/stats`, `/backup/log`, `/backup/health` (read-only, redacted) |
 | v1.5 | Modular capabilities: `/capabilities`, `/capabilities/<name>[/hosts\|/status]` (read-only) |
 | v1.6 | `GET /metrics-prometheus` (Prometheus text 0.0.4, pull-only) |
-| next | `GET /bootstrap` (consolidated context — task `t_a003af3e`) |
+| v1.7 | Idea parking lot: `POST /save-idea`, `GET /ideas` (`t_0c6a7847`) |
+| v1.8 | Governance P3: `GET /presets`, `POST /update-preset`, extended `/update-objective` (`t_d8df248b`) |
+| v1.9 | Bootstrap `GET /bootstrap` (`t_a003af3e`); `POST /create-task` picks the assignee by quota: first profile without a quota-governor STOP file (`pr-ollama` → `pr-nanogpt` → `pr-opencode` → `pr-vllm`); explicit `assignee` body field overrides; all stopped → `pr-ollama` fail-open (`t_62ab412b`) |
+| next | (empty — nothing scheduled) |

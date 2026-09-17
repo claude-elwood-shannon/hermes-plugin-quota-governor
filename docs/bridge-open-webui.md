@@ -100,10 +100,12 @@ POST (write side, JSON body):
 
 | endpoint | body |
 |----------|------|
-| `/create-task` | `{"title", "body", "tags"?, "triage"?}` → creates kanban task (default assignee `pr-ollama`, `--created-by mediator`; `triage:true` lands it in triage) |
+| `/create-task` | `{"title", "body", "tags"?, "assignee"?, "triage"?}` → creates kanban task (`--created-by mediator`; `triage:true` lands it in triage). Assignee: explicit `assignee` wins; otherwise first profile without a quota-governor STOP file (`pr-ollama` → `pr-nanogpt` → `pr-opencode` → `pr-vllm`); all stopped → `pr-ollama` fail-open — v1.9 |
 | `/move-task` | `{"task_id", "status"}` → move task (ready/triage/blocked/archived/done) |
 | `/comment-task` | `{"task_id", "comment"}` → append comment to the task body |
 | `/save-idea` | `{"title", "body", "tags"?}` → park a brainstorm idea as JSON under `~/.hermes/data/ideas/` (dir created on first save) — v1.7 |
+| `/update-preset` | `{"preset_id", ...fields}` → create/update an adjustment preset (only provided fields) — v1.8 |
+| `/update-objective` | `{"name", ...fields}` → create/update an objective; also accepts `nice`, `budget_baseline`, `budget_adjustment_pct`, `governance`, `preset_id` — v1.8 |
 
 GET `/ideas` (v1.7) returns the parked ideas, newest first:
 

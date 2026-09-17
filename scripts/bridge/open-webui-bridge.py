@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Hermes Bridge API — expone operaciones de Hermes para Open WebUI.
 
+t_62ab412b (MEDIATOR 2026-09-17, misma línea v1.9): el POST /create-task ya
+     no hardcodea pr-ollama como assignee. Sin `assignee` en el body del
+     POST elige el primer profile de PROFILE_PREFERENCE (pr-ollama,
+     pr-nanogpt, pr-opencode, pr-vllm) SIN stop-file de quota-governor
+     (~/.hermes/profiles/<profile>/quota-governor/STOP: el plugin lo escribe
+     al agotar quota y el cron deja de despachar ese profile). Un `assignee`
+     explícito en el body tiene prioridad (override). Si TODOS los profiles
+     tienen stop-file → pr-ollama (fail-open, igual que el comportamiento
+     histórico). Endpoints/flags intactos.
+
 v1.9.0 — t_a003af3e (MEDIATOR 2026-09-17): bootstrap — contexto inicial
       consolidado en una sola llamada (punto de partida único para cualquier
       mediador):
@@ -404,6 +414,52 @@ PLUGIN_REPO = os.environ.get("BRIDGE_PLUGIN_REPO") or os.path.dirname(
 PORT = 9120
 MAX_FILE_BYTES = 100 * 1024  # 100 KB por fichero
 KANBAN_DB = os.path.join(HERMES_HOME, "kanban.db")
+
+# t_62ab412b v1.9: selección de assignee por quota para POST /create-task.
+# Un profile está FUERA de quota cuando su quota-governor ha escrito el
+# stop-file (el plugin lo crea al agotar sesión/semana/balance y el cron
+# deja de despacharle; convención del plugin: quota_governor.get_state_dir()).
+# Cada profile corre con HERMES_HOME=~/.hermes/profiles/<profile>, así que el
+# stop-file vive en ~/.hermes/profiles/<profile>/quota-governor/STOP.
+# Orden de preferencia: pr-ollama es el tier gratis, pr-nanogpt el primero
+# con balance; el resto son fallback. Sin stop-file en ninguno → pr-ollama
+# (fail-open: la tarea entra igual, aunque no se despache de inmediato).
+PROFILE_PREFERENCE = ("pr-ollama", "pr-nanogpt", "pr-opencode", "pr-vllm")
+
+
+def _profile_has_quota(profile, hermes_home=None):
+    """True si el profile NO tiene el stop-file de quota-governor.
+
+    Fail-open: profile inválido → False; cualquier error de acceso a la
+    ruta (OSError) → True (elegible, no bloqueamos create-task por I/O).
+    """
+    home = hermes_home if hermes_home is not None else HERMES_HOME
+    if not isinstance(profile, str) or not profile:
+        return False
+    stop = os.path.join(home, "profiles", profile, "quota-governor", "STOP")
+    try:
+        return not os.path.exists(stop)
+    except OSError:
+        return True  # fail-open
+
+
+def choose_assignee(explicit=None, hermes_home=None):
+    """Assignee para POST /create-task (t_62ab412b).
+
+    1. Un `assignee` explícito en el body del POST tiene prioridad (override
+       del usuario).
+    2. Sin él, primer profile de PROFILE_PREFERENCE sin stop-file de quota.
+    3. Fail-open: pr-ollama (el default histórico) si todos están parados.
+    """
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    home = hermes_home if hermes_home is not None else HERMES_HOME
+    for profile in PROFILE_PREFERENCE:
+        if _profile_has_quota(profile, home):
+            return profile
+    return PROFILE_PREFERENCE[0]
+
+
 # t_0c6a7847 v1.7: idea parking lot — los archivos de ideas viven fuera del
 # bootstrap (no son tareas kanban); el directorio se crea al primer POST.
 IDEAS_DIR = os.path.join(HERMES_HOME, "data", "ideas")
@@ -469,7 +525,7 @@ OPENAPI_SPEC = {
         "/efficiency": {"get": {"summary": "Get efficiency ratio", "description": "Returns last 3 lines of efficiency-ratio.log", "operationId": "get_efficiency", "responses": {"200": {"description": "Efficiency ratio", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_e81f0811: /file (preservado intacto) ----
         "/file": {"get": {"summary": "Read a system file", "description": "Reads a file from the Hermes system (scripts, config, docs, logs). Paths are restricted to ~/.hermes/ and the plugin repo. Security: credentials, secrets, SSH keys, and system paths are blocked.", "operationId": "get_file", "parameters": [{"name": "path", "in": "query", "required": True, "schema": {"type": "string"}, "description": "Relative path to file (e.g. scripts/ttl_blocked.py, config.yaml)"}], "responses": {"200": {"description": "File content", "content": {"application/json": {"schema": {"type": "object"}}}}, "404": {"description": "File not found"}, "403": {"description": "Path not allowed"}, "400": {"description": "Binary file"}}}},
-        "/create-task": {"post": {"summary": "Create a kanban task", "description": "Creates a task in the Hermes kanban board. Default status ready, assignee pr-ollama.", "operationId": "create_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"title": {"type": "string"}, "body": {"type": "string"}, "tags": {"type": "string", "default": "mediator-prompt"}, "triage": {"type": "boolean", "default": False, "description": "Create in triage instead of ready"}}, "required": ["title", "body"]}}}}, "responses": {"200": {"description": "Task created", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+        "/create-task": {"post": {"summary": "Create a kanban task", "description": "Creates a task in the Hermes kanban board. Default status ready. Assignee: an explicit `assignee` in the body wins; otherwise the first profile WITHOUT a quota-governor STOP file in preference order pr-ollama, pr-nanogpt, pr-opencode, pr-vllm; falls back to pr-ollama when every profile is stopped (fail-open).", "operationId": "create_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"title": {"type": "string"}, "body": {"type": "string"}, "tags": {"type": "string", "default": "mediator-prompt"}, "assignee": {"type": "string", "description": "Explicit assignee override (profile name); omit for automatic quota-based selection"}, "triage": {"type": "boolean", "default": False, "description": "Create in triage instead of ready"}}, "required": ["title", "body"]}}}}, "responses": {"200": {"description": "Task created", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/move-task": {"post": {"summary": "Move task between specific status pairs", "description": "triage->todo via specify; todo/blocked->ready via promote. Other pairs refused (the hermes CLI has no generic move).", "operationId": "move_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}, "status": {"type": "string", "description": "Target status: todo (from triage) or ready (from todo/blocked)"}}, "required": ["task_id", "status"]}}}}, "responses": {"200": {"description": "Task moved", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         "/comment-task": {"post": {"summary": "Add a comment to a task", "description": "Adds a comment to a kanban task.", "operationId": "comment_task", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"task_id": {"type": "string"}, "comment": {"type": "string"}}, "required": ["task_id", "comment"]}}}}, "responses": {"200": {"description": "Comment added", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
         # ---- t_3cafd196: 6 herramientas de gobernanza ----
@@ -1861,8 +1917,11 @@ class HermesBridge(BaseHTTPRequestHandler):
             tags = data.get("tags", "mediator-prompt")
             use_triage = data.get("triage", False)
             full_body = f"[tags: {tags}]\n\n{body}" if tags else body
+            # t_62ab412b v1.9: assignee explícito tiene prioridad; si no,
+            # el primer profile sin stop-file de quota (fail-open: pr-ollama).
+            assignee = choose_assignee(data.get("assignee"))
             cmd = ["hermes", "kanban", "create", title, "--body", full_body,
-                   "--assignee", "pr-ollama", "--created-by", "mediator", "--json"]
+                   "--assignee", assignee, "--created-by", "mediator", "--json"]
             if use_triage:
                 cmd.append("--triage")
             self._send_json({"result": self._run(cmd)})
