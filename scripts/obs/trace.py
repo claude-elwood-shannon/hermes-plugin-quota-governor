@@ -120,23 +120,28 @@ def get_hermes_home() -> Path:
 
 
 def state_dir(hermes_home=None) -> Path:
+    """Quota-governor state dir under `hermes_home` (default: active HERMES_HOME)."""
     base = Path(hermes_home) if hermes_home else get_hermes_home()
     return base / "quota-governor"
 
 
 def obs_dir(hermes_home=None) -> Path:
+    """Observability dir (<state_dir>/obs)."""
     return state_dir(hermes_home) / "obs"
 
 
 def trace_path(hermes_home=None) -> Path:
+    """JSONL trace file path (obs/trace.jsonl)."""
     return obs_dir(hermes_home) / "trace.jsonl"
 
 
 def cursor_path(hermes_home=None) -> Path:
+    """Per-collector cursor file (obs/trace-cursor.json)."""
     return obs_dir(hermes_home) / "trace-cursor.json"
 
 
 def model_cost_path(hermes_home=None) -> Path:
+    """Model price ledger path (quota-governor/model-cost.json)."""
     return state_dir(hermes_home) / "model-cost.json"
 
 
@@ -894,6 +899,7 @@ def _otel(r: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
+    """Run the CLI: collect (all collectors), doctor, or retention (--dry-run honored)."""
     import argparse
     p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -56,11 +56,13 @@ NON_CONSUMABLE_ANNOTATIONS = (
 
 
 def get_hermes_home() -> Path:
+    """Active HERMES_HOME as an absolute Path, else ~/.hermes."""
     val = os.environ.get("HERMES_HOME", "").strip()
     return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
 
 def default_queue_path() -> Path:
+    """Queue file: $AUTOQUEUE_FILE, else <HERMES_HOME>/data/autoqueue.md."""
     val = os.environ.get("AUTOQUEUE_FILE", "").strip()
     if val:
         return Path(val).expanduser()
@@ -68,12 +70,14 @@ def default_queue_path() -> Path:
 
 
 def default_queue_dir() -> Path:
+    """Base dir for queue artifacts: $HERMES_HOME, else ~/.hermes."""
     val = os.environ.get("HERMES_HOME", "").strip()
     base = Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
     return base
 
 
 def default_ledger_path() -> Path:
+    """Append-only ledger of consumed seeds under the quota-governor dir."""
     return default_queue_dir() / "quota-governor" / "autoqueue-consumes.jsonl"
 
 
@@ -281,6 +285,7 @@ def consumir_semilla(execute: bool = False, ruta: Path | None = None,
 # --------------------------------------------------------------------------- #
 
 def main(argv: list | None = None) -> int:
+    """Run the CLI: consume one seed (dry-run unless --execute), honoring --file for the queue path."""
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__.split("Usage:")[0].strip())
     parser.add_argument("--execute", action="store_true",

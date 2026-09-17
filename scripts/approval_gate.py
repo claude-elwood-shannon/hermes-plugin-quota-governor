@@ -94,6 +94,7 @@ OPEN_STATUSES = {"triage", "todo", "ready", "running", "blocked"}
 
 
 def kanban_db_path() -> Path:
+    """Resolve the kanban board DB: $AG_KANBAN_DB, or the first existing default under HERMES_HOME."""
     env = os.environ.get("AG_KANBAN_DB", "").strip()
     if env:
         return Path(env)
@@ -110,6 +111,7 @@ def _norm(text: str) -> str:
 
 
 def fingerprint(title: str, clase: str, objective: str, criterion: str) -> str:
+    """Return the dedup signature (16 hex chars) for the normalized title/class/objective/criterion tuple."""
     raw = "|".join((_norm(title), _norm(clase), _norm(objective),
                     _norm(criterion)))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
@@ -126,6 +128,7 @@ def _connect_ro(db: Path):
 
 
 def fetch_task(db: Path, task_id: str) -> Optional[dict]:
+    """Return {id, title, body, status} for `task_id`, or None when absent or the DB is unreadable."""
     try:
         con = _connect_ro(db)
         row = con.execute(
@@ -164,6 +167,7 @@ def package_missing(body: str) -> list:
 
 
 def stamp_state(body: str) -> str:
+    """Return the lowercase [APPROVAL: <state>] stamp found in `body`, or 'none' when unstamped."""
     m = STAMP_RE.search(body or "")
     return m.group(1).lower() if m else "none"
 
@@ -173,6 +177,7 @@ def stamp_state(body: str) -> str:
 # ---------------------------------------------------------------------------
 
 def proposal_signature(task: dict) -> Optional[str]:
+    """Return the dedup signature of a task dict, or None for untagged proposals (no objective in the body)."""
     body = task.get("body") or ""
     m_obj = PACKAGE_FIELDS[6][1].search(body)
     m_cls = PACKAGE_FIELDS[5][1].search(body)
@@ -450,6 +455,7 @@ def _cli_pending(db: Path, as_json: bool) -> int:
 
 
 def main(argv=None) -> int:
+    """Run the CLI: --verify, --dedup-scan, --apply, or the default pending-proposals listing."""
     ap = _build_arg_parser()
     args = ap.parse_args(argv)
     db = Path(args.db) if args.db else kanban_db_path()

@@ -63,14 +63,17 @@ def _usd2(v) -> str:
 # ---------------------------------------------------------------------------
 
 def read_trace(hermes_home=None) -> list:
+    """Trace rows as dicts; fail-open (empty list) via morning-screen's reader."""
     return ms._read_jsonl(ms.trace_path(hermes_home))
 
 
 def metrics_path(hermes_home=None) -> Path:
+    """Metrics history file (quota-governor/metrics-history.jsonl)."""
     return ms.state_dir(hermes_home) / "metrics-history.jsonl"
 
 
 def read_metrics(hermes_home=None) -> list:
+    """Metrics history rows as dicts; fail-open (empty list)."""
     return ms._read_jsonl(metrics_path(hermes_home))
 
 
@@ -298,6 +301,7 @@ footer code{background:var(--card);padding:1px 5px;border-radius:4px}
 """.strip()
 
 def sparkline(values, w=170.0, h=36.0) -> str:
+    """Render `values` as an inline SVG polyline; empty string when there are no values."""
     vals = []
     for v in values:
         try:
@@ -573,6 +577,7 @@ def write_dashboard(hermes_home=None, out=None, now=None) -> Path:
 # ---------------------------------------------------------------------------
 
 def make_server(port: int, hermes_home=None) -> http.server.ThreadingHTTPServer:
+    """Bind a ThreadingHTTPServer on 127.0.0.1:<port> that regenerates the page on every request."""
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             route = self.path.split("?", 1)[0]
@@ -599,6 +604,7 @@ def make_server(port: int, hermes_home=None) -> http.server.ThreadingHTTPServer:
 # ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
+    """Run the CLI: --serve [port] to serve live, else write the page (default obs/dashboard.html) and print its path."""
     ap = argparse.ArgumentParser(
         description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--serve", nargs="?", const=DEFAULT_PORT, type=int,

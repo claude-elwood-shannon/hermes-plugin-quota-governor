@@ -54,12 +54,14 @@ DEFAULT_URL = "http://192.168.1.32:8000/v1/chat/completions"
 
 
 def log_path() -> Path:
+    """Audit log path: $VLLM_INVOKE_LOG, else ~/.hermes/logs/vllm-invoke.jsonl."""
     return Path(os.environ.get(
         "VLLM_INVOKE_LOG",
         os.path.expanduser("~/.hermes/logs/vllm-invoke.jsonl")))
 
 
 def log_call(entry: dict) -> None:
+    """Append one JSON line to the audit log; never raises (observability must not break the tool)."""
     try:
         path = log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +72,7 @@ def log_call(entry: dict) -> None:
 
 
 def fail(code: int, msg: str, entry: dict) -> int:
+    """Stamp the entry with `code`, log it, print `msg` to stderr, and return `code`."""
     entry["exit_code"] = code
     log_call(entry)
     print(msg, file=sys.stderr)
@@ -173,6 +176,7 @@ def _process_response(body, args, entry):
 
 
 def main(argv=None) -> int:
+    """Run the CLI: load the prompt, call the local vLLM endpoint, and log/print per the exit-code contract."""
     ap = argparse.ArgumentParser(description="Delegate a subtask to local vLLM.")
     ap.add_argument("--prompt", default="")
     ap.add_argument("--prompt-file", default="")
@@ -205,8 +209,7 @@ def main(argv=None) -> int:
         "ts": _now(),
         "task_id": args.task_id,
         "model": args.model or None,
-        "prompt_tokens": None,
-        "completion_tokens": None,
+        "prompt_tokens": None, "completion_tokens": None,
         "latency_ms": None,
         "exit_code": None,
         "hint_followed": bool(args.hint),
